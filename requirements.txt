@@ -1,0 +1,21 @@
+# Windows API
+pywin32>=306
+pyvda>=0.3.2
+
+# System
+psutil>=5.9.8
+keyboard>=0.13.5
+requests>=2.31.0
+
+# UI
+Pillow>=10.2.0
+pystray>=0.19.5
+
+# Config
+tomli>=2.0.1
+tomli-w>=1.0.0
+
+# Dev/Testing
+pytest>=8.0.0
+black>=24.1.1
+ruff>=0.2.0

@@ -1,0 +1,29 @@
+# WorkSpace Manager — Default Configuration
+# Override by creating config/local.toml (never committed to git)
+
+[app]
+name        = "WorkSpace"
+version     = "0.1.0"
+data_dir    = "%APPDATA%/WorkSpace"      # resolved at runtime
+log_level   = "INFO"
+
+[hotkeys]
+new_session     = "ctrl+win+d"   # intercept after new desktop opens
+toggle_hud      = "win+grave"    # win + ` to show/hide floating HUD
+restore_last    = "win+shift+r"  # restore most recent session
+
+[capture]
+poll_interval_sec   = 5          # how often to snapshot open windows
+chrome_debug_port   = 9222       # CDP port; launch Chrome with --remote-debugging-port=9222
+idle_threshold_sec  = 300        # mark session as idle after 5 min of no changes
+
+[ui]
+hud_position        = "bottom-right"   # bottom-right | bottom-left | top-right | top-left
+hud_opacity         = 0.92
+spotlight_width     = 600
+theme               = "dark"           # dark | light (light TBD)
+tray_icon           = true
+
+[db]
+filename    = "sessions.db"
+max_backups = 5                  # rolling SQLite backups on startup
