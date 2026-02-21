@@ -96,6 +96,16 @@ class Database:
         now = datetime.now().isoformat()
         try:
             with self.transaction() as conn:
+                # Check if session already exists for this desktop
+                existing = conn.execute(
+                    "SELECT * FROM sessions WHERE desktop_id = ?", 
+                    (session.desktop_id,)
+                ).fetchone()
+                
+                if existing:
+                    logger.warning(f"Session already exists for desktop {session.desktop_id[:8]}")
+                    return self._row_to_session(existing)
+                
                 cur = conn.execute(
                     "INSERT INTO sessions (name, desktop_id, status, created_at, updated_at) VALUES (?,?,?,?,?)",
                     (session.name, session.desktop_id, session.status.value, now, now)
@@ -133,11 +143,89 @@ class Database:
         try:
             with self.transaction() as conn:
                 conn.executemany(
-                    "INSERT INTO captured_windows (session_id, snapshot_id, hwnd, process_name, window_title, app_type, exe_path, cmd_args) VALUES (?,?,?,?,?,?,?,?)",
-                    [(w.session_id, w.snapshot_id, w.hwnd, w.process_name, w.window_title, w.app_type.value, w.exe_path, json.dumps(w.cmd_args)) for w in windows]
+                    "INSERT INTO captured_windows (session_id, snapshot_id, hwnd, process_name, window_title, app_type, exe_path, working_dir, cmd_args) VALUES (?,?,?,?,?,?,?,?,?)",
+                    [(w.session_id, w.snapshot_id, w.hwnd, w.process_name, w.window_title, w.app_type.value, w.exe_path, w.working_dir, json.dumps(w.cmd_args)) for w in windows]
                 )
         except Exception as e:
             logger.error(f"Failed to save windows: {e}")
+
+    def save_tabs(self, tabs: list[ChromeTab]):
+        try:
+            with self.transaction() as conn:
+                conn.executemany(
+                    "INSERT INTO chrome_tabs (session_id, snapshot_id, window_id, tab_id, url, title, is_pinned, is_active) VALUES (?,?,?,?,?,?,?,?)",
+                    [(t.session_id, t.snapshot_id, t.window_id, t.tab_id, t.url, t.title, int(t.is_pinned), int(t.is_active)) for t in tabs]
+                )
+        except Exception as e:
+            logger.error(f"Failed to save tabs: {e}")
+
+    def get_latest_snapshot_id(self, session_id: int) -> Optional[int]:
+        try:
+            row = self._conn.execute(
+                "SELECT id FROM snapshots WHERE session_id=? ORDER BY captured_at DESC LIMIT 1",
+                (session_id,)
+            ).fetchone()
+            return row["id"] if row else None
+        except Exception as e:
+            logger.error(f"Failed to get latest snapshot: {e}")
+            return None
+
+    def get_windows_for_snapshot(self, snapshot_id: int) -> list[CapturedWindow]:
+        import json
+        try:
+            rows = self._conn.execute(
+                "SELECT * FROM captured_windows WHERE snapshot_id=?", 
+                (snapshot_id,)
+            ).fetchall()
+            return [
+                CapturedWindow(
+                    id=r["id"],
+                    session_id=r["session_id"],
+                    snapshot_id=r["snapshot_id"],
+                    hwnd=r["hwnd"],
+                    process_name=r["process_name"],
+                    window_title=r["window_title"],
+                    app_type=AppType(r["app_type"]),
+                    exe_path=r["exe_path"],
+                    working_dir=r["working_dir"],
+                    cmd_args=json.loads(r["cmd_args"] or "[]"),
+                    restore_cmd=r.get("restore_cmd")
+                ) for r in rows
+            ]
+        except Exception as e:
+            logger.error(f"Failed to get windows: {e}")
+            return []
+
+    def get_tabs_for_snapshot(self, snapshot_id: int) -> list[ChromeTab]:
+        try:
+            rows = self._conn.execute(
+                "SELECT * FROM chrome_tabs WHERE snapshot_id=?",
+                (snapshot_id,)
+            ).fetchall()
+            return [
+                ChromeTab(
+                    id=r["id"],
+                    session_id=r["session_id"],
+                    snapshot_id=r["snapshot_id"],
+                    window_id=r["window_id"],
+                    tab_id=r["tab_id"],
+                    url=r["url"],
+                    title=r["title"],
+                    is_pinned=bool(r["is_pinned"]),
+                    is_active=bool(r["is_active"])
+                ) for r in rows
+            ]
+        except Exception as e:
+            logger.error(f"Failed to get tabs: {e}")
+            return []
+
+    def delete_session(self, session_id: int):
+        try:
+            with self.transaction() as conn:
+                conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+            logger.info(f"Deleted session {session_id}")
+        except Exception as e:
+            logger.error(f"Failed to delete session: {e}")
 
     def _row_to_session(self, row) -> Session:
         return Session(
@@ -147,8 +235,12 @@ class Database:
             status=SessionStatus(row["status"]),
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
+            last_snapshot=datetime.fromisoformat(row["last_snapshot"]) if row["last_snapshot"] else None,
+            total_duration=row["total_duration"],
+            notes=row["notes"] or ""
         )
 
     def close(self):
         if self._conn:
             self._conn.close()
+            logger.info("Database closed")

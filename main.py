@@ -1,111 +1,86 @@
-"""
-WorkSpace Manager - Entry Point
-Simple test version to verify setup works.
-"""
+"""WorkSpace Manager - Full Application."""
 
 import sys
 import logging
 from pathlib import Path
+import tkinter as tk
 
-# Setup basic logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(levelname)s | %(message)s'
-)
-logger = logging.getLogger("workspace")
+from src.utils.logger import setup_logging
+from src.utils.config import load_config, resolve_path
+from src.db.database import Database
+from src.core.daemon import WorkSpaceDaemon
+from src.ui.spotlight import SpotlightPrompt
+
+logger = logging.getLogger("workspace.main")
+
 
 def main():
-    print("=" * 60)
-    print("🗂  WorkSpace Manager - Test Mode")
-    print("=" * 60)
-    print()
+    # Setup logging
+    log_dir = Path.home() / "AppData" / "Roaming" / "WorkSpace" / "logs"
+    setup_logging(log_dir, level="INFO")
+    logger.info("WorkSpace starting")
+
+    # Load config
+    config = load_config()
+
+    # Database
+    data_dir = Path(resolve_path(config.get("app", {}).get("data_dir", "%APPDATA%/WorkSpace")))
+    db_path = data_dir / config.get("db", {}).get("filename", "sessions.db")
+    db = Database(db_path)
+    db.connect()
+
+    # Daemon
+    daemon = WorkSpaceDaemon(db, config)
+
+    # Simple UI for testing
+    root = tk.Tk()
+    root.title("WorkSpace Manager")
+    root.geometry("400x300")
+
+    tk.Label(root, text="🗂 WorkSpace", font=("Arial", 20, "bold")).pack(pady=20)
+    tk.Label(root, text="Session Manager Running", font=("Arial", 12)).pack()
+    tk.Label(root, text="Press Ctrl+Win+D on a new desktop", font=("Arial", 9), fg="gray").pack()
     
-    # Test 1: Check Python version
-    print("✓ Python version:", sys.version.split()[0])
+    sessions_label = tk.Label(root, text="Sessions: 0", font=("Arial", 10))
+    sessions_label.pack(pady=10)
     
-    # Test 2: Try importing models
-    try:
-        from src.db.models import Session, SessionStatus
-        from datetime import datetime
+    # List of session names
+    sessions_list = tk.Text(root, height=8, width=50, font=("Arial", 9))
+    sessions_list.pack(pady=10, padx=20)
+
+    def update_sessions():
+        sessions = daemon.get_all_sessions()
+        sessions_label.config(text=f"Sessions: {len(sessions)}")
         
-        session = Session(
-            id=None,
-            name="Test Session",
-            desktop_id="test-guid",
-            status=SessionStatus.ACTIVE,
-            created_at=datetime.now(),
-            updated_at=datetime.now()
-        )
-        print("✓ Database models work")
-        print(f"  Created test session: '{session.name}'")
-    except Exception as e:
-        print(f"✗ Models failed: {e}")
-        return
-    
-    # Test 3: Try creating database
-    try:
-        from src.db.database import Database
+        # Update list
+        sessions_list.delete("1.0", tk.END)
+        for s in sessions:
+            sessions_list.insert(tk.END, f"• {s.name} ({s.status.value})\n")
         
-        db_path = Path.home() / "AppData" / "Roaming" / "WorkSpace" / "test.db"
-        db = Database(db_path)
-        db.connect()
-        
-        # Try creating a session
-        created = db.create_session(session)
-        print(f"✓ Database works")
-        print(f"  Session saved with ID: {created.id}")
-        
-        # Try reading it back
-        sessions = db.get_all_sessions()
-        print(f"  Sessions in DB: {len(sessions)}")
-        
+        root.after(2000, update_sessions)
+
+    def on_new_desktop(desktop_id: str):
+        def show_prompt():
+            SpotlightPrompt(
+                desktop_id=desktop_id,
+                on_confirm=lambda name, did: daemon.create_session(name, did),
+                on_cancel=lambda did: daemon.cancel_session(did)
+            )
+        root.after(0, show_prompt)
+
+    daemon.on_new_desktop_detected(on_new_desktop)
+    daemon.start()
+    update_sessions()
+
+    def shutdown():
+        daemon.stop()
         db.close()
-        
-        # Cleanup test db
-        if db_path.exists():
-            db_path.unlink()
-            db_path.parent.rmdir() if not list(db_path.parent.iterdir()) else None
-            
-    except Exception as e:
-        print(f"✗ Database failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return
+        root.quit()
+
+    root.protocol("WM_DELETE_WINDOW", shutdown)
     
-    # Test 4: Check Windows APIs (if available)
-    print()
-    print("Checking Windows APIs:")
-    try:
-        import win32gui
-        print("  ✓ win32gui available")
-    except ImportError:
-        print("  ✗ win32gui not installed (pip install pywin32)")
-    
-    try:
-        import pyvda
-        print("  ✓ pyvda available")
-    except ImportError:
-        print("  ✗ pyvda not installed (pip install pyvda)")
-    
-    try:
-        import psutil
-        print("  ✓ psutil available")
-    except ImportError:
-        print("  ✗ psutil not installed")
-    
-    try:
-        import keyboard
-        print("  ✓ keyboard available")
-    except ImportError:
-        print("  ✗ keyboard not installed")
-    
-    print()
-    print("=" * 60)
-    print("✓ Core functionality verified!")
-    print("=" * 60)
-    print()
-    print("Next step: Install dependencies with:")
-    print("  pip install -r requirements.txt")
+    logger.info("UI ready - press Ctrl+Win+D to create a session")
+    root.mainloop()
 
 
 if __name__ == "__main__":
