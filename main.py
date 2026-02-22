@@ -41,8 +41,8 @@ class HotkeyBridge(QObject):
     def _listen(self):
         try:
             import keyboard
-            # Win+` to toggle HUD
-            keyboard.add_hotkey("windows+`", self.hud_toggle_requested.emit)
+            # Ctrl+Alt+W to toggle HUD  (Win+` conflicts with Windows Terminal Quake Mode)
+            keyboard.add_hotkey("ctrl+alt+w", self.hud_toggle_requested.emit)
             # Win+Shift+S to force snapshot
             keyboard.add_hotkey("windows+shift+s", self.snapshot_requested.emit)
             keyboard.wait()
@@ -164,10 +164,13 @@ class WorkSpaceApp:
         self.spotlight.session_confirmed.connect(self._on_session_named)
         self.spotlight.session_cancelled.connect(self._on_session_cancelled)
 
-        # HUD actions
+        # HUD restore/delete — both go through the same central _on_restore
         self.hud.restore_requested.connect(self._on_restore)
         self.hud.delete_requested.connect(lambda _: self.main_window.refresh())
         self.hud.open_dashboard.connect(self._show_dashboard)
+
+        # Dashboard restore — also goes through central _on_restore
+        self.main_window.restore_requested.connect(self._on_restore)
 
         # Hotkeys
         self.hotkeys.hud_toggle_requested.connect(self.hud.toggle)
@@ -222,17 +225,45 @@ class WorkSpaceApp:
         )
 
     def _on_restore(self, session_id: int):
-        """User clicked restore in HUD — launch everything."""
+        """
+        Handles restore from BOTH the dashboard and the HUD.
+        1. Tells the daemon to suppress the next new-desktop Spotlight prompt.
+        2. Calls restore which creates a new virtual desktop then launches apps.
+        3. Registers the new desktop with the daemon so it tracks the session.
+        """
+        # Tell daemon to skip the Spotlight prompt for the desktop restore will create
+        self.daemon.suppress_next_new_desktop()
+
         import restore as restorer
         result = restorer.restore_session(session_id)
+
         session = db.get_session(session_id)
         name = session["name"] if session else "session"
-        self.tray.showMessage(
-            "Session Restored",
-            f"Reopened {result['total']} item(s) for \"{name}\"",
-            QSystemTrayIcon.MessageIcon.Information,
-            2500
-        )
+
+        if result["new_desktop"]:
+            # Register the restored session with the daemon on its new desktop
+            import db as _db
+            updated = _db.get_session(session_id)
+            if updated and updated.get("virtual_desktop_id"):
+                self.daemon.register_session(session_id, updated["virtual_desktop_id"])
+
+        total = result["total"]
+        if total > 0:
+            self.tray.showMessage(
+                "Session Restored",
+                f"↩ \"{name}\" — {total} item(s) reopened on new desktop",
+                QSystemTrayIcon.MessageIcon.Information,
+                3000
+            )
+        else:
+            self.tray.showMessage(
+                "Session Restored",
+                f"↩ \"{name}\" — new desktop created (no saved apps to reopen)",
+                QSystemTrayIcon.MessageIcon.Information,
+                3000
+            )
+
+        self.main_window.show_toast("↩", f"Restored on new desktop · {total} item(s)")
         self.main_window.refresh()
 
     def _show_dashboard(self):

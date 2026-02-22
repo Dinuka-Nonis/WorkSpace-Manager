@@ -396,7 +396,7 @@ class HUDWindow(QWidget):
 
         fl.addStretch()
 
-        kbd = QLabel("Win+`")
+        kbd = QLabel("Ctrl+Alt+W")
         kbd.setStyleSheet(f"""
             color: {MUTED};
             background: rgba(255,255,255,0.06);

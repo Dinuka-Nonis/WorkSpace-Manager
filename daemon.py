@@ -50,6 +50,7 @@ class WorkSpaceDaemon(QObject):
         self._active_desktop_id: str | None = snap.get_current_desktop_id()
         self._session_map: dict[str, int] = {}  # desktop_id -> session_id
         self._last_snapshot: dict[int, float] = {}  # session_id -> timestamp
+        self._suppress_next_desktop = False  # set True during restore to skip Spotlight
 
         # Load existing desktop→session mappings from DB
         self._restore_desktop_map()
@@ -94,8 +95,15 @@ class WorkSpaceDaemon(QObject):
                 self._active_desktop_id = current_active
 
                 new_ids = current_ids - self._prev_desktop_ids
-                for desktop_id in new_ids:
-                    self.new_desktop_detected.emit(desktop_id)
+
+                if self._suppress_next_desktop:
+                    # This desktop was created by a restore — skip the Spotlight prompt.
+                    # We still update our tracking state normally.
+                    self._suppress_next_desktop = False
+                    print(f"[Daemon] Suppressed Spotlight for restore-created desktop(s): {new_ids}")
+                else:
+                    for desktop_id in new_ids:
+                        self.new_desktop_detected.emit(desktop_id)
 
             else:
                 # Detect desktop switch — pause old session, resume new one
@@ -118,6 +126,13 @@ class WorkSpaceDaemon(QObject):
             print(f"[Daemon] _poll_desktops error (non-fatal): {e}")
 
     # ── Session registration ──────────────────────────────────────────────────
+
+    def suppress_next_new_desktop(self):
+        """
+        Call this BEFORE programmatically creating a desktop (e.g. during restore)
+        so the Spotlight prompt does NOT appear for that machine-created desktop.
+        """
+        self._suppress_next_desktop = True
 
     def register_session(self, session_id: int, desktop_id: str):
         """Called after user names a new session in the spotlight."""

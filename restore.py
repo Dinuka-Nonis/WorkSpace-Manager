@@ -191,12 +191,42 @@ def restore_other_apps(windows: list[dict]) -> int:
     return opened
 
 
+# ─── DESKTOP CREATION ────────────────────────────────────────────────────────
+
+def create_restore_desktop() -> str | None:
+    """
+    Create a brand-new virtual desktop, switch to it, and return its ID.
+    All apps launched after this call will open on the new desktop.
+    Returns None if pyvda is unavailable or creation fails.
+    """
+    try:
+        import time
+        from pyvda import VirtualDesktop, get_virtual_desktops
+        VirtualDesktop.create()
+        time.sleep(0.6)                    # let Windows register the new desktop
+        desktops = get_virtual_desktops()
+        new_desktop = desktops[-1]         # newest is always last
+        new_desktop.go()                   # switch focus to it
+        time.sleep(0.4)                    # let the switch complete
+        return str(new_desktop.id)
+    except Exception as e:
+        print(f"[Restore] Could not create new desktop: {e}")
+        return None
+
+
 # ─── MAIN RESTORE ─────────────────────────────────────────────────────────────
 
 def restore_session(session_id: int) -> dict:
     """
-    Full session restore. Returns a summary dict of what was reopened.
+    Full session restore.
+    1. Creates a new virtual desktop and switches to it.
+    2. Launches all saved apps/tabs on the new desktop.
+    3. Returns a summary dict of what was reopened.
     """
+    # Step 1 — create a fresh desktop (apps launched below will open here)
+    new_desktop_id = create_restore_desktop()
+
+    # Step 2 — relaunch everything
     windows = db.get_windows(session_id)
     tabs_opened = restore_chrome_tabs(session_id)
     vscode_opened = restore_vscode_windows(windows)
@@ -204,10 +234,24 @@ def restore_session(session_id: int) -> dict:
     terminal_opened = restore_terminals(windows)
     other_opened = restore_other_apps(windows)
 
-    # Mark session as active again
+    # Step 3 — mark session active and update its desktop ID
     db.update_session_status(session_id, "active")
+    if new_desktop_id:
+        import sqlite3
+        from datetime import datetime
+        # Update the desktop ID so the daemon tracks it correctly on the new desktop
+        try:
+            import db as _db
+            with _db.get_conn() as conn:
+                conn.execute(
+                    "UPDATE sessions SET virtual_desktop_id=?, updated_at=? WHERE id=?",
+                    (new_desktop_id, datetime.now().isoformat(), session_id)
+                )
+        except Exception as e:
+            print(f"[Restore] Could not update desktop ID: {e}")
 
     return {
+        "new_desktop": new_desktop_id is not None,
         "tabs": tabs_opened,
         "vscode": vscode_opened,
         "pdfs": pdf_opened,

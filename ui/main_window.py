@@ -311,6 +311,7 @@ class MainWindow(QMainWindow):
     """
     Full WorkSpace Manager dashboard window.
     """
+    restore_requested = pyqtSignal(int)   # emitted when user confirms restore dialog
     def __init__(self):
         super().__init__()
         self._setup_window()
@@ -413,7 +414,7 @@ class MainWindow(QMainWindow):
         hl.addStretch()
 
         # Hotkey hints
-        for key, hint in [("Ctrl+Win+D", "New Session"), ("Win+`", "Toggle HUD")]:
+        for key, hint in [("Ctrl+Win+D", "New Session"), ("Ctrl+Alt+W", "Toggle HUD")]:
             k = QLabel(key)
             k.setStyleSheet(f"""
                 color: {MUTED};
@@ -544,24 +545,26 @@ class MainWindow(QMainWindow):
             return
 
         preview = restorer.get_restore_preview(session_id)
-        if not preview:
-            self.show_toast("ℹ️", "No saved state to restore yet.")
-            return
 
-        # Confirm dialog
+        # Build dialog text — don't block restore even if nothing was captured yet
+        if preview:
+            detail = "\n".join(preview)
+        else:
+            detail = "⚠️ No apps or tabs were captured for this session yet.\n\nA new virtual desktop will still be created for you."
+
         msg = QMessageBox(self)
         msg.setWindowTitle("Restore Session")
         msg.setText(f"Restore  \"{session['name']}\"?")
-        msg.setInformativeText("\n".join(preview))
+        msg.setInformativeText(detail)
         msg.setStandardButtons(
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel
         )
         msg.setDefaultButton(QMessageBox.StandardButton.Ok)
         msg.button(QMessageBox.StandardButton.Ok).setText("↩  Restore")
         if msg.exec() == QMessageBox.StandardButton.Ok:
-            result = restorer.restore_session(session_id)
-            self.show_toast("↩", f"Restored {result['total']} item(s)")
-            self.refresh()
+            # Emit restore_requested so main.py can suppress the Spotlight prompt
+            # for the new desktop that restore creates
+            self.restore_requested.emit(session_id)
 
     def _on_delete(self, session_id: int):
         session = db.get_session(session_id)
