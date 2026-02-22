@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WorkSpace Manager</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    width: 300px;
+    background: #0e0e16;
+    color: #e8e8f0;
+    font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+    font-size: 13px;
+  }
+
+  .header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 14px 16px 12px;
+    border-bottom: 1px solid #1e1e2e;
+    background: #111118;
+  }
+  .header-icon {
+    width: 28px; height: 28px;
+    background: linear-gradient(135deg, #7c6af7, #a78bfa);
+    border-radius: 7px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px;
+  }
+  .header h1 { font-size: 13px; font-weight: 700; }
+  .header .version {
+    margin-left: auto;
+    font-size: 9px; font-weight: 700;
+    color: #a78bfa;
+    background: rgba(124,106,247,0.1);
+    border: 1px solid rgba(124,106,247,0.2);
+    border-radius: 8px;
+    padding: 1px 7px;
+    font-family: monospace;
+  }
+
+  .status-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 16px;
+    border-bottom: 1px solid #1e1e2e;
+    font-size: 12px;
+  }
+  .dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: #6b6b80;
+    flex-shrink: 0;
+  }
+  .dot.connected { background: #4ade80; }
+  .status-text { color: #6b6b80; }
+  .status-text.connected { color: #4ade80; }
+  .session-name { color: #e8e8f0; font-weight: 600; }
+
+  .section-label {
+    font-size: 9px; font-weight: 700; letter-spacing: 2px;
+    color: #4a4a5a;
+    padding: 12px 16px 6px;
+    text-transform: uppercase;
+  }
+
+  #sessionsList { padding: 0 8px 8px; }
+
+  .session-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 10px;
+    border-radius: 9px;
+    cursor: pointer;
+    transition: background 0.15s;
+    border: 1px solid transparent;
+  }
+  .session-item:hover { background: rgba(124,106,247,0.1); border-color: rgba(124,106,247,0.2); }
+  .session-item.active { background: rgba(74,222,128,0.08); border-color: rgba(74,222,128,0.15); }
+
+  .session-icon { font-size: 16px; }
+  .session-info { flex: 1; }
+  .session-title { font-size: 12px; font-weight: 600; }
+  .session-meta { font-size: 10px; color: #6b6b80; margin-top: 1px; font-family: monospace; }
+  .session-check { color: #4ade80; font-size: 14px; }
+
+  .empty-state {
+    text-align: center;
+    padding: 24px 16px;
+    color: #4a4a5a;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+
+  .footer {
+    padding: 10px 16px;
+    border-top: 1px solid #1e1e2e;
+    display: flex; gap: 8px;
+  }
+  button {
+    flex: 1;
+    background: #1a1a24;
+    border: 1px solid #2a2a3a;
+    color: #e8e8f0;
+    border-radius: 8px;
+    padding: 7px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: inherit;
+    transition: all 0.15s;
+  }
+  button:hover { background: #22222f; border-color: #3a3a4a; }
+  button.accent {
+    background: #7c6af7;
+    border-color: transparent;
+    color: white;
+  }
+  button.accent:hover { background: #a78bfa; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-icon">⊞</div>
+  <h1>WorkSpace</h1>
+  <span class="version">v1.0</span>
+</div>
+
+<div class="status-row">
+  <div class="dot" id="statusDot"></div>
+  <span class="status-text" id="statusText">Connecting…</span>
+</div>
+
+<div class="section-label">Sessions</div>
+<div id="sessionsList">
+  <div class="empty-state">Loading sessions…</div>
+</div>
+
+<div class="footer">
+  <button id="snapshotBtn">📸 Snapshot Now</button>
+  <button class="accent" id="openDashBtn">⊞ Dashboard</button>
+</div>
+
+<script>
+  let sessions = [];
+  let activeSessionId = null;
+
+  async function init() {
+    const status = await chrome.runtime.sendMessage({ type: "get_session_status" });
+    updateStatus(status);
+    loadSessions();
+  }
+
+  function updateStatus(status) {
+    const dot = document.getElementById("statusDot");
+    const txt = document.getElementById("statusText");
+
+    if (status.connected) {
+      dot.classList.add("connected");
+      if (status.session_id) {
+        txt.textContent = "Tracking active";
+        txt.className = "status-text connected";
+        activeSessionId = status.session_id;
+      } else {
+        txt.textContent = "Connected · no active session";
+        txt.className = "status-text connected";
+      }
+    } else {
+      dot.classList.remove("connected");
+      txt.textContent = "WorkSpace app not running";
+      txt.className = "status-text";
+    }
+  }
+
+  function loadSessions() {
+    // Sessions are stored by the native host in a shared JSON file
+    // We use chrome.storage to get them (the background updates this)
+    chrome.storage.local.get("sessions", (data) => {
+      sessions = data.sessions || [];
+      renderSessions();
+    });
+  }
+
+  function renderSessions() {
+    const list = document.getElementById("sessionsList");
+    if (!sessions.length) {
+      list.innerHTML = '<div class="empty-state">No sessions yet.<br>Press Ctrl+Win+D on your PC<br>to create a new desktop session.</div>';
+      return;
+    }
+    list.innerHTML = sessions.map(s => `
+      <div class="session-item ${s.id === activeSessionId ? 'active' : ''}"
+           data-id="${s.id}">
+        <span class="session-icon">${s.icon || '🗂'}</span>
+        <div class="session-info">
+          <div class="session-title">${s.name}</div>
+          <div class="session-meta">${s.status} · ${s.updated_at || '—'}</div>
+        </div>
+        ${s.id === activeSessionId ? '<span class="session-check">✓</span>' : ''}
+      </div>
+    `).join('');
+
+    list.querySelectorAll(".session-item").forEach(el => {
+      el.addEventListener("click", () => {
+        const id = parseInt(el.dataset.id);
+        chrome.runtime.sendMessage({ type: "session_selected", session_id: id });
+        activeSessionId = id;
+        renderSessions();
+      });
+    });
+  }
+
+  document.getElementById("snapshotBtn").addEventListener("click", () => {
+    chrome.runtime.sendMessage({ type: "force_snapshot" }, () => {
+      document.getElementById("snapshotBtn").textContent = "✓ Done!";
+      setTimeout(() => { document.getElementById("snapshotBtn").textContent = "📸 Snapshot Now"; }, 1500);
+    });
+  });
+
+  document.getElementById("openDashBtn").addEventListener("click", () => {
+    // The native host can open the dashboard; use a native message
+    chrome.runtime.sendMessage({ type: "session_selected", session_id: activeSessionId });
+  });
+
+  init();
+</script>
+</body>
+</html>

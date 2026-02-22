@@ -1,86 +1,299 @@
-"""WorkSpace Manager - Full Application."""
+"""
+main.py — WorkSpace Manager entry point.
+Wires together: daemon, spotlight, HUD, main window, system tray.
+Run with:  python main.py
+"""
 
 import sys
-import logging
+import os
+import threading
 from pathlib import Path
-import tkinter as tk
 
-from src.utils.logger import setup_logging
-from src.utils.config import load_config, resolve_path
-from src.db.database import Database
-from src.core.daemon import WorkSpaceDaemon
-from src.ui.spotlight import SpotlightPrompt
+# ── Must be first ──────────────────────────────────────────────────────────
+os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
 
-logger = logging.getLogger("workspace.main")
+from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox
+from PyQt6.QtGui import (
+    QPainter, QColor, QPainterPath, QPixmap, QIcon, QLinearGradient, QFont
+)
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
 
+import db
+from daemon import WorkSpaceDaemon
+from ui.spotlight import SpotlightWindow
+from ui.hud import HUDWindow
+from ui.main_window import MainWindow
+from ui.styles import APP_STYLE, ACCENT, ACCENT2, BG, TEXT
+from snapshot import get_current_desktop_id
+
+
+# ── Hotkey setup ─────────────────────────────────────────────────────────────
+
+class HotkeyBridge(QObject):
+    """Runs the keyboard listener in a thread, emits Qt signals."""
+    hud_toggle_requested = pyqtSignal()
+    snapshot_requested = pyqtSignal()
+
+    def start_listening(self):
+        t = threading.Thread(target=self._listen, daemon=True)
+        t.start()
+
+    def _listen(self):
+        try:
+            import keyboard
+            # Win+` to toggle HUD
+            keyboard.add_hotkey("windows+`", self.hud_toggle_requested.emit)
+            # Win+Shift+S to force snapshot
+            keyboard.add_hotkey("windows+shift+s", self.snapshot_requested.emit)
+            keyboard.wait()
+        except Exception as e:
+            print(f"[Hotkey] Warning: {e}")
+            print("[Hotkey] Global hotkeys unavailable. Try running as administrator.")
+
+
+# ── Tray icon ─────────────────────────────────────────────────────────────────
+
+def make_tray_icon() -> QIcon:
+    """Generate a simple gradient icon for the system tray."""
+    px = QPixmap(64, 64)
+    px.fill(Qt.GlobalColor.transparent)
+    p = QPainter(px)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    path = QPainterPath()
+    path.addRoundedRect(4, 4, 56, 56, 14, 14)
+
+    grad = QLinearGradient(0, 0, 64, 64)
+    grad.setColorAt(0, QColor(ACCENT))
+    grad.setColorAt(1, QColor(ACCENT2))
+    p.fillPath(path, grad)
+
+    p.setPen(QColor("white"))
+    f = QFont("Segoe UI", 28)
+    f.setBold(True)
+    p.setFont(f)
+    from PyQt6.QtCore import QRect
+    p.drawText(QRect(0, 0, 64, 64), Qt.AlignmentFlag.AlignCenter, "⊞")
+    p.end()
+
+    return QIcon(px)
+
+
+# ── Main App Controller ───────────────────────────────────────────────────────
+
+class WorkSpaceApp:
+    """
+    Central controller: wires daemon, UI windows, tray, and hotkeys.
+    """
+
+    def __init__(self, app: QApplication):
+        self.app = app
+        db.init_db()
+
+        # Core components
+        self.daemon = WorkSpaceDaemon()
+        self.spotlight = SpotlightWindow()
+        self.hud = HUDWindow()
+        self.main_window = MainWindow()
+        self.hotkeys = HotkeyBridge()
+
+        # Tray
+        self.tray = QSystemTrayIcon(make_tray_icon(), app)
+        self._build_tray_menu()
+        self.tray.show()
+
+        # Connect signals
+        self._wire()
+
+        # Start daemon
+        self.daemon.start()
+
+        # Start hotkeys in background thread
+        self.hotkeys.start_listening()
+
+        # Show main window on first launch
+        self.main_window.show()
+
+        # Tray balloon
+        self.tray.showMessage(
+            "WorkSpace Manager",
+            "Running in the background. Press Win+` for the HUD.",
+            QSystemTrayIcon.MessageIcon.Information,
+            3000
+        )
+
+    def _build_tray_menu(self):
+        menu = QMenu()
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background: #111118;
+                border: 1px solid #2a2a3a;
+                border-radius: 10px;
+                padding: 6px;
+                color: #e8e8f0;
+                font-family: "Segoe UI Variable";
+                font-size: 13px;
+            }}
+            QMenu::item {{ padding: 7px 18px; border-radius: 6px; }}
+            QMenu::item:selected {{ background: rgba(124,106,247,0.15); color: #a78bfa; }}
+            QMenu::separator {{ height: 1px; background: #2a2a3a; margin: 4px 8px; }}
+        """)
+
+        open_act = menu.addAction("⊞  Open Dashboard")
+        open_act.triggered.connect(self._show_dashboard)
+
+        hud_act = menu.addAction("  Toggle HUD  (Win+`)")
+        hud_act.triggered.connect(self.hud.toggle)
+
+        snap_act = menu.addAction("📸  Snapshot Now")
+        snap_act.triggered.connect(self.daemon.force_snapshot)
+
+        menu.addSeparator()
+
+        quit_act = menu.addAction("✕  Quit WorkSpace")
+        quit_act.triggered.connect(self._quit)
+
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._on_tray_activated)
+
+    def _wire(self):
+        # Daemon → Spotlight
+        self.daemon.new_desktop_detected.connect(self._on_new_desktop)
+
+        # Spotlight → Daemon
+        self.spotlight.session_confirmed.connect(self._on_session_named)
+        self.spotlight.session_cancelled.connect(self._on_session_cancelled)
+
+        # HUD actions
+        self.hud.restore_requested.connect(self._on_restore)
+        self.hud.delete_requested.connect(lambda _: self.main_window.refresh())
+        self.hud.open_dashboard.connect(self._show_dashboard)
+
+        # Hotkeys
+        self.hotkeys.hud_toggle_requested.connect(self.hud.toggle)
+        self.hotkeys.snapshot_requested.connect(self.daemon.force_snapshot)
+
+        # Daemon → Main window refresh
+        self.daemon.snapshot_saved.connect(lambda _: None)  # refresh on demand
+
+    # ── Event Handlers ────────────────────────────────────────────────────────
+
+    def _on_new_desktop(self, desktop_id: str):
+        """New virtual desktop created — show spotlight to name the session."""
+        # Store desktop_id for when user confirms
+        self._pending_desktop_id = desktop_id
+        QTimer.singleShot(300, self.spotlight.show_prompt)
+
+    def _on_session_named(self, name: str):
+        """User confirmed a session name."""
+        desktop_id = getattr(self, "_pending_desktop_id", None)
+        if not desktop_id:
+            desktop_id = get_current_desktop_id()
+
+        # Pick an icon based on common keywords
+        icon = _pick_icon(name)
+        session_id = db.create_session(name, icon, desktop_id)
+
+        if desktop_id:
+            self.daemon.register_session(session_id, desktop_id)
+
+        self.tray.showMessage(
+            "Session Started",
+            f"{icon} \"{name}\" is now being tracked.",
+            QSystemTrayIcon.MessageIcon.Information,
+            2000
+        )
+        self.main_window.refresh()
+        self._pending_desktop_id = None
+
+    def _on_session_cancelled(self):
+        """User pressed Esc — don't save this desktop as a session."""
+        self._pending_desktop_id = None
+        self.tray.showMessage(
+            "WorkSpace",
+            "Session tracking skipped.",
+            QSystemTrayIcon.MessageIcon.NoIcon,
+            1500
+        )
+
+    def _on_restore(self, session_id: int):
+        """User clicked restore in HUD — launch everything."""
+        import restore as restorer
+        result = restorer.restore_session(session_id)
+        session = db.get_session(session_id)
+        name = session["name"] if session else "session"
+        self.tray.showMessage(
+            "Session Restored",
+            f"Reopened {result['total']} item(s) for \"{name}\"",
+            QSystemTrayIcon.MessageIcon.Information,
+            2500
+        )
+        self.main_window.refresh()
+
+    def _show_dashboard(self):
+        self.main_window.show()
+        self.main_window.raise_()
+        self.main_window.activateWindow()
+        self.main_window.refresh()
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self._show_dashboard()
+        elif reason == QSystemTrayIcon.ActivationReason.MiddleClick:
+            self.hud.toggle()
+
+    def _quit(self):
+        self.daemon.stop()
+        self.tray.hide()
+        self.app.quit()
+
+
+# ── Icon picker ───────────────────────────────────────────────────────────────
+
+def _pick_icon(name: str) -> str:
+    name_lower = name.lower()
+    rules = [
+        (["lab", "assignment", "hw", "homework"], "🔧"),
+        (["web", "frontend", "react", "vue", "html", "css"], "🌐"),
+        (["ml", "ai", "machine", "deep", "neural", "model"], "🤖"),
+        (["db", "database", "sql", "mongo"], "🗄"),
+        (["network", "socket", "tcp", "udp"], "🔌"),
+        (["os", "operating", "kernel", "system"], "💻"),
+        (["research", "paper", "thesis", "survey"], "📄"),
+        (["dsa", "algorithm", "data structure", "tree", "graph"], "🌳"),
+        (["security", "crypto", "cipher", "attack"], "🔐"),
+        (["design", "ui", "ux", "figma", "sketch"], "🎨"),
+        (["math", "calculus", "algebra", "proof"], "📐"),
+        (["finance", "invest", "stock", "trade"], "📈"),
+        (["video", "edit", "media", "content"], "🎬"),
+        (["game", "unity", "unreal", "godot"], "🎮"),
+    ]
+    for keywords, icon in rules:
+        if any(k in name_lower for k in keywords):
+            return icon
+    return "🗂"
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    # Setup logging
-    log_dir = Path.home() / "AppData" / "Roaming" / "WorkSpace" / "logs"
-    setup_logging(log_dir, level="INFO")
-    logger.info("WorkSpace starting")
+    # High-DPI support
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
+    app = QApplication(sys.argv)
+    app.setApplicationName("WorkSpace Manager")
+    app.setOrganizationName("WorkSpace")
+    app.setQuitOnLastWindowClosed(False)
+    app.setStyleSheet(APP_STYLE)
 
-    # Load config
-    config = load_config()
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        QMessageBox.critical(None, "WorkSpace", "System tray not available on this system.")
+        sys.exit(1)
 
-    # Database
-    data_dir = Path(resolve_path(config.get("app", {}).get("data_dir", "%APPDATA%/WorkSpace")))
-    db_path = data_dir / config.get("db", {}).get("filename", "sessions.db")
-    db = Database(db_path)
-    db.connect()
+    controller = WorkSpaceApp(app)  # noqa — keep reference alive
 
-    # Daemon
-    daemon = WorkSpaceDaemon(db, config)
-
-    # Simple UI for testing
-    root = tk.Tk()
-    root.title("WorkSpace Manager")
-    root.geometry("400x300")
-
-    tk.Label(root, text="🗂 WorkSpace", font=("Arial", 20, "bold")).pack(pady=20)
-    tk.Label(root, text="Session Manager Running", font=("Arial", 12)).pack()
-    tk.Label(root, text="Press Ctrl+Win+D on a new desktop", font=("Arial", 9), fg="gray").pack()
-    
-    sessions_label = tk.Label(root, text="Sessions: 0", font=("Arial", 10))
-    sessions_label.pack(pady=10)
-    
-    # List of session names
-    sessions_list = tk.Text(root, height=8, width=50, font=("Arial", 9))
-    sessions_list.pack(pady=10, padx=20)
-
-    def update_sessions():
-        sessions = daemon.get_all_sessions()
-        sessions_label.config(text=f"Sessions: {len(sessions)}")
-        
-        # Update list
-        sessions_list.delete("1.0", tk.END)
-        for s in sessions:
-            sessions_list.insert(tk.END, f"• {s.name} ({s.status.value})\n")
-        
-        root.after(2000, update_sessions)
-
-    def on_new_desktop(desktop_id: str):
-        def show_prompt():
-            SpotlightPrompt(
-                desktop_id=desktop_id,
-                on_confirm=lambda name, did: daemon.create_session(name, did),
-                on_cancel=lambda did: daemon.cancel_session(did)
-            )
-        root.after(0, show_prompt)
-
-    daemon.on_new_desktop_detected(on_new_desktop)
-    daemon.start()
-    update_sessions()
-
-    def shutdown():
-        daemon.stop()
-        db.close()
-        root.quit()
-
-    root.protocol("WM_DELETE_WINDOW", shutdown)
-    
-    logger.info("UI ready - press Ctrl+Win+D to create a session")
-    root.mainloop()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
