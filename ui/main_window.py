@@ -344,8 +344,9 @@ class MainWindow(QMainWindow):
         cl.setContentsMargins(32, 28, 32, 28)
         cl.setSpacing(20)
 
-        # Hero stats row
-        cl.addWidget(self._build_hero())
+        # Hero stats row — stored permanently, updated in-place by refresh()
+        hero, self._stat_labels = self._build_hero()
+        cl.addWidget(hero)
 
         # Section label
         sec_lbl = QLabel("ACTIVE & RECENT SESSIONS")
@@ -454,7 +455,8 @@ class MainWindow(QMainWindow):
 
         return bar
 
-    def _build_hero(self) -> QWidget:
+    def _build_hero(self) -> tuple[QWidget, dict]:
+        """Build the stats row. Returns (widget, labels_dict) for in-place updates."""
         hero = QWidget()
         hl = QHBoxLayout(hero)
         hl.setContentsMargins(0, 0, 0, 0)
@@ -466,17 +468,20 @@ class MainWindow(QMainWindow):
         total_time = sum(s.get("total_seconds", 0) for s in sessions)
         hours = total_time // 3600
 
-        for val, label, color in [
-            (str(total), "Total Sessions", ACCENT2),
-            (str(active), "Active Now", GREEN),
-            (f"{hours}h", "Total Time", AMBER),
+        labels = {}
+        for key, val, label, color in [
+            ("total", str(total), "Total Sessions", ACCENT2),
+            ("active", str(active), "Active Now", GREEN),
+            ("time", f"{hours}h", "Total Time", AMBER),
         ]:
-            card = self._stat_card(val, label, color)
+            card, val_lbl = self._stat_card(val, label, color)
             hl.addWidget(card)
+            labels[key] = val_lbl  # keep reference for direct updates
 
-        return hero
+        return hero, labels
 
-    def _stat_card(self, value: str, label: str, color: str) -> QWidget:
+    def _stat_card(self, value: str, label: str, color: str) -> tuple[QWidget, QLabel]:
+        """Returns (card_widget, value_label) — value_label can be updated directly."""
         card = QWidget()
         card.setFixedHeight(80)
         card.setStyleSheet(f"""
@@ -502,39 +507,54 @@ class MainWindow(QMainWindow):
         l.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
         cl.addWidget(l)
 
-        return card
+        return card, v  # return v so caller can setText() on it later
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def refresh(self):
-        """Reload all sessions and rebuild the grid."""
-        sessions = db.get_all_sessions()
+        """Reload all sessions and rebuild the grid. Safe to call any number of times."""
+        try:
+            sessions = db.get_all_sessions()
 
-        # Clear grid
-        while self.grid_layout.count():
-            item = self.grid_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            # ── Update hero stats in-place (no layout changes, no widget destruction) ──
+            total = len(sessions)
+            active = sum(1 for s in sessions if s["status"] == "active")
+            total_time = sum(s.get("total_seconds", 0) for s in sessions)
+            hours = total_time // 3600
+            self._stat_labels["total"].setText(str(total))
+            self._stat_labels["active"].setText(str(active))
+            self._stat_labels["time"].setText(f"{hours}h")
 
-        if not sessions:
-            empty = EmptyState()
-            empty.setFixedHeight(300)
-            self.grid_layout.addWidget(empty, 0, 0, 1, 2)
-            return
+            # ── Rebuild the session grid ──
+            while self.grid_layout.count():
+                item = self.grid_layout.takeAt(0)
+                w = item.widget()
+                if w:
+                    w.setParent(None)   # detach first, then schedule deletion
+                    w.deleteLater()
 
-        cols = 2
-        for i, session in enumerate(sessions):
-            stats = db.get_session_stats(session["id"])
-            card = SessionFullCard(session, stats)
-            card.restore_clicked.connect(self._on_restore)
-            card.delete_clicked.connect(self._on_delete)
-            self.grid_layout.addWidget(card, i // cols, i % cols)
+            if not sessions:
+                empty = EmptyState()
+                empty.setFixedHeight(300)
+                self.grid_layout.addWidget(empty, 0, 0, 1, 2)
+                return
 
-        # Rebuild hero
-        old_hero = self.centralWidget().layout().itemAt(1).widget().layout().itemAt(0).widget()
-        if old_hero:
-            old_hero.setParent(None)
-        # Simple stats update via toast
+            cols = 2
+            for i, session in enumerate(sessions):
+                stats = db.get_session_stats(session["id"])
+                card = SessionFullCard(session, stats)
+                card.restore_clicked.connect(self._on_restore)
+                card.delete_clicked.connect(self._on_delete)
+                self.grid_layout.addWidget(card, i // cols, i % cols)
+
+        except RuntimeError as e:
+            # Should never happen now, but guard defensively
+            print(f"[MainWindow] refresh() error (non-fatal): {e}")
+
+    def showEvent(self, e):
+        """Auto-refresh whenever the window becomes visible (e.g. after desktop switch)."""
+        super().showEvent(e)
+        self.refresh()
 
     def show_toast(self, icon: str, msg: str):
         self.toast.show_toast(icon, msg)

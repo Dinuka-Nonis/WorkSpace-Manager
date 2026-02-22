@@ -50,7 +50,8 @@ class WorkSpaceDaemon(QObject):
         self._active_desktop_id: str | None = snap.get_current_desktop_id()
         self._session_map: dict[str, int] = {}  # desktop_id -> session_id
         self._last_snapshot: dict[int, float] = {}  # session_id -> timestamp
-        self._suppress_next_desktop = False  # set True during restore to skip Spotlight
+        # Int counter not bool — handles rapid successive restores without race
+        self._suppress_desktop_count: int = 0
 
         # Load existing desktop→session mappings from DB
         self._restore_desktop_map()
@@ -90,26 +91,46 @@ class WorkSpaceDaemon(QObject):
             current_active = snap.get_current_desktop_id()
 
             if current_count > self._prev_desktop_count:
-                # New desktop(s) created — update active FIRST so spotlight
-                # sees the correct new desktop when it fires
+                # ── New desktop(s) created ──────────────────────────────────
+                new_ids = current_ids - self._prev_desktop_ids
                 self._active_desktop_id = current_active
 
-                new_ids = current_ids - self._prev_desktop_ids
-
-                if self._suppress_next_desktop:
-                    # This desktop was created by a restore — skip the Spotlight prompt.
-                    # We still update our tracking state normally.
-                    self._suppress_next_desktop = False
-                    print(f"[Daemon] Suppressed Spotlight for restore-created desktop(s): {new_ids}")
+                if self._suppress_desktop_count > 0:
+                    # Created by a restore — skip Spotlight, consume one suppression
+                    self._suppress_desktop_count -= 1
+                    print(f"[Daemon] Suppressed Spotlight for restore desktop(s): {new_ids}")
                 else:
                     for desktop_id in new_ids:
                         self.new_desktop_detected.emit(desktop_id)
 
+            elif current_count < self._prev_desktop_count:
+                # ── Desktop(s) removed ─────────────────────────────────────
+                # Windows already moved their windows to another desktop.
+                # Mark orphaned sessions as idle so they show as restorable.
+                removed_ids = self._prev_desktop_ids - current_ids
+                for desktop_id in removed_ids:
+                    if desktop_id in self._session_map:
+                        sid = self._session_map[desktop_id]
+                        db.update_session_status(sid, "idle")
+                        print(f"[Daemon] Desktop removed — session {sid} marked idle")
+                        # Keep in session_map so restore can find it, but
+                        # clear active_desktop_id if it was the removed one
+                        if self._active_desktop_id == desktop_id:
+                            self._active_desktop_id = current_active
+
             else:
-                # Detect desktop switch — pause old session, resume new one
+                # ── Same count — check for desktop switch ─────────────────
                 if current_active and current_active != self._active_desktop_id:
-                    if self._active_desktop_id and self._active_desktop_id in self._session_map:
-                        old_sid = self._session_map[self._active_desktop_id]
+                    old_desktop = self._active_desktop_id
+
+                    # CRITICAL: snapshot old desktop RIGHT NOW before we leave it.
+                    # The 30s timer is too slow — if user closes a desktop, windows
+                    # move immediately and we'd lose all state. This captures it at
+                    # the exact moment of switching away.
+                    if old_desktop and old_desktop in self._session_map:
+                        old_sid = self._session_map[old_desktop]
+                        print(f"[Daemon] Switching away from desktop — snapshotting session {old_sid}")
+                        self._snapshot_session(old_sid, old_desktop)
                         db.update_session_status(old_sid, "paused")
 
                     if current_active in self._session_map:
@@ -129,18 +150,19 @@ class WorkSpaceDaemon(QObject):
 
     def suppress_next_new_desktop(self):
         """
-        Call this BEFORE programmatically creating a desktop (e.g. during restore)
-        so the Spotlight prompt does NOT appear for that machine-created desktop.
+        Increment the suppression counter before programmatically creating a
+        desktop (e.g. during restore) so Spotlight doesn't appear for it.
+        Using a counter handles rapid successive restores correctly.
         """
-        self._suppress_next_desktop = True
+        self._suppress_desktop_count += 1
 
     def register_session(self, session_id: int, desktop_id: str):
         """Called after user names a new session in the spotlight."""
         self._session_map[desktop_id] = session_id
         db.update_session_status(session_id, "active")
-        # Delay first snapshot by 10s — desktop is fresh/empty right at creation.
-        # This gives the user time to open their apps before we capture state.
-        QTimer.singleShot(10_000, lambda: self._snapshot_session(session_id, desktop_id))
+        # First snapshot after 3s — quick enough to catch apps the user opens right away,
+        # but not so instant that the desktop is still empty.
+        QTimer.singleShot(3_000, lambda: self._snapshot_session(session_id, desktop_id))
 
     def get_active_session_id(self) -> int | None:
         """Return the session_id for the current virtual desktop, if any."""
