@@ -75,7 +75,7 @@ else:
             return None
         try:
             view = AppView(hwnd)
-            desktop = view.desktop()
+            desktop = view.virtual_desktop()   # FIXED: was .desktop() — wrong API
             return str(desktop.id) if desktop else None
         except Exception:
             return None
@@ -102,10 +102,12 @@ else:
             if not _is_real_window(hwnd):
                 return
 
-            # If we have pyvda, filter by desktop
+            # If we have pyvda, filter by desktop.
+            # STRICT: if we can't determine the window's desktop (returns None),
+            # we skip it — better to miss a window than include wrong-desktop windows.
             if PYVDA_AVAILABLE and target_id:
                 win_desktop = _get_desktop_id_for_window(hwnd)
-                if win_desktop and win_desktop != target_id:
+                if win_desktop != target_id:   # None != target_id → correctly excluded
                     return
 
             try:

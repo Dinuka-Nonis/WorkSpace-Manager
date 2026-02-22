@@ -83,32 +83,39 @@ class WorkSpaceDaemon(QObject):
     # ── Desktop polling ───────────────────────────────────────────────────────
 
     def _poll_desktops(self):
-        current_count = snap.get_desktop_count()
-        current_ids = set(snap.get_all_desktop_ids())
+        try:
+            current_count = snap.get_desktop_count()
+            current_ids = set(snap.get_all_desktop_ids())
+            current_active = snap.get_current_desktop_id()
 
-        if current_count > self._prev_desktop_count:
-            # New desktop(s) created
-            new_ids = current_ids - self._prev_desktop_ids
-            for desktop_id in new_ids:
-                self.new_desktop_detected.emit(desktop_id)
+            if current_count > self._prev_desktop_count:
+                # New desktop(s) created — update active FIRST so spotlight
+                # sees the correct new desktop when it fires
+                self._active_desktop_id = current_active
 
-        # Detect desktop switches — pause old, mark new active
-        current_active = snap.get_current_desktop_id()
-        if current_active and current_active != self._active_desktop_id:
-            # Pause old session
-            if self._active_desktop_id and self._active_desktop_id in self._session_map:
-                old_sid = self._session_map[self._active_desktop_id]
-                db.update_session_status(old_sid, "paused")
+                new_ids = current_ids - self._prev_desktop_ids
+                for desktop_id in new_ids:
+                    self.new_desktop_detected.emit(desktop_id)
 
-            # Resume / mark new active session
-            if current_active in self._session_map:
-                new_sid = self._session_map[current_active]
-                db.update_session_status(new_sid, "active")
+            else:
+                # Detect desktop switch — pause old session, resume new one
+                if current_active and current_active != self._active_desktop_id:
+                    if self._active_desktop_id and self._active_desktop_id in self._session_map:
+                        old_sid = self._session_map[self._active_desktop_id]
+                        db.update_session_status(old_sid, "paused")
 
-            self._active_desktop_id = current_active
+                    if current_active in self._session_map:
+                        new_sid = self._session_map[current_active]
+                        db.update_session_status(new_sid, "active")
 
-        self._prev_desktop_count = current_count
-        self._prev_desktop_ids = current_ids
+                    self._active_desktop_id = current_active
+
+            self._prev_desktop_count = current_count
+            self._prev_desktop_ids = current_ids
+
+        except Exception as e:
+            # Never let a poll exception kill the timer loop
+            print(f"[Daemon] _poll_desktops error (non-fatal): {e}")
 
     # ── Session registration ──────────────────────────────────────────────────
 
@@ -116,8 +123,9 @@ class WorkSpaceDaemon(QObject):
         """Called after user names a new session in the spotlight."""
         self._session_map[desktop_id] = session_id
         db.update_session_status(session_id, "active")
-        # Immediately take first snapshot
-        self._snapshot_session(session_id, desktop_id)
+        # Delay first snapshot by 10s — desktop is fresh/empty right at creation.
+        # This gives the user time to open their apps before we capture state.
+        QTimer.singleShot(10_000, lambda: self._snapshot_session(session_id, desktop_id))
 
     def get_active_session_id(self) -> int | None:
         """Return the session_id for the current virtual desktop, if any."""
@@ -127,17 +135,23 @@ class WorkSpaceDaemon(QObject):
     # ── Snapshotting ──────────────────────────────────────────────────────────
 
     def _snapshot_all_active(self):
-        for desktop_id, session_id in list(self._session_map.items()):
-            session = db.get_session(session_id)
-            if session and session["status"] == "active":
-                self._snapshot_session(session_id, desktop_id)
+        try:
+            for desktop_id, session_id in list(self._session_map.items()):
+                session = db.get_session(session_id)
+                if session and session["status"] == "active":
+                    self._snapshot_session(session_id, desktop_id)
+        except Exception as e:
+            print(f"[Daemon] _snapshot_all_active error (non-fatal): {e}")
 
     def _snapshot_session(self, session_id: int, desktop_id: str):
-        windows = snap.snapshot_desktop(desktop_id)
-        tabs = db.get_chrome_tabs(session_id)  # use last known tabs
-        db.save_snapshot(session_id, windows, [dict(t) for t in tabs])
-        self._last_snapshot[session_id] = time.time()
-        self.snapshot_saved.emit(session_id)
+        try:
+            windows = snap.snapshot_desktop(desktop_id)
+            tabs = db.get_chrome_tabs(session_id)  # use last known tabs
+            db.save_snapshot(session_id, windows, [dict(t) for t in tabs])
+            self._last_snapshot[session_id] = time.time()
+            self.snapshot_saved.emit(session_id)
+        except Exception as e:
+            print(f"[Daemon] _snapshot_session error (non-fatal): {e}")
 
     # ── Chrome tab handling ───────────────────────────────────────────────────
 
@@ -150,10 +164,13 @@ class WorkSpaceDaemon(QObject):
 
     def _tick_time(self):
         """Add 60s to all active sessions."""
-        for desktop_id, session_id in list(self._session_map.items()):
-            session = db.get_session(session_id)
-            if session and session["status"] == "active":
-                db.add_session_time(session_id, 60)
+        try:
+            for desktop_id, session_id in list(self._session_map.items()):
+                session = db.get_session(session_id)
+                if session and session["status"] == "active":
+                    db.add_session_time(session_id, 60)
+        except Exception as e:
+            print(f"[Daemon] _tick_time error (non-fatal): {e}")
 
     # ── Manual snapshot trigger ───────────────────────────────────────────────
 

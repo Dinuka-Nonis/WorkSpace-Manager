@@ -187,10 +187,15 @@ class WorkSpaceApp:
     def _on_session_named(self, name: str):
         """User confirmed a session name."""
         desktop_id = getattr(self, "_pending_desktop_id", None)
+        # _pending_desktop_id is set by the daemon when it detects the new desktop.
+        # We do NOT fall back to get_current_desktop_id() here — if the user
+        # switched away while typing, we still want the session tied to the
+        # NEW desktop that triggered the spotlight, not whichever is active now.
         if not desktop_id:
+            # Fallback only if daemon somehow didn't set it (shouldn't happen)
             desktop_id = get_current_desktop_id()
+            print(f"[Main] Warning: _pending_desktop_id was unset, using current: {desktop_id}")
 
-        # Pick an icon based on common keywords
         icon = _pick_icon(name)
         session_id = db.create_session(name, icon, desktop_id)
 
@@ -199,7 +204,7 @@ class WorkSpaceApp:
 
         self.tray.showMessage(
             "Session Started",
-            f"{icon} \"{name}\" is now being tracked.",
+            f"{icon} \"{name}\" · first snapshot in 10s",
             QSystemTrayIcon.MessageIcon.Information,
             2000
         )
@@ -277,6 +282,10 @@ def _pick_icon(name: str) -> str:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
+    # Proper Ctrl+C / SIGINT handling — exit cleanly instead of dropping to REPL
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
     # High-DPI support
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
