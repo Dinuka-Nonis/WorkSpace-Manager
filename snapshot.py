@@ -83,53 +83,98 @@ else:
     def snapshot_desktop(desktop_id: str = None) -> list[dict]:
         """
         Return list of window dicts on the given virtual desktop.
-        If desktop_id is None, snapshots the current desktop.
+        
+        Primary method: VirtualDesktop.get_apps_by_z_order() — asks the 
+        desktop for its own windows. Much more reliable than checking each
+        window's desktop individually (which silently fails on many apps).
+        
+        Fallback: EnumWindows without desktop filter, for when pyvda fails.
         """
         if not WIN32_AVAILABLE:
             return []
 
-        # Determine target desktop ID
-        target_id = desktop_id
-        if target_id is None and PYVDA_AVAILABLE:
-            try:
-                target_id = str(VirtualDesktop.current().id)
-            except Exception:
-                target_id = None
-
         captured = []
+
+        # ── PRIMARY: use pyvda's direct desktop→windows lookup ──────────────
+        if PYVDA_AVAILABLE:
+            try:
+                # Find the target VirtualDesktop object by GUID
+                target_vd = None
+                if desktop_id:
+                    all_desktops = get_virtual_desktops()
+                    target_vd = next(
+                        (d for d in all_desktops if str(d.id) == desktop_id),
+                        None
+                    )
+                else:
+                    target_vd = VirtualDesktop.current()
+
+                if target_vd is not None:
+                    apps = target_vd.get_apps_by_z_order()
+                    print(f"[Snapshot] Desktop {str(target_vd.id)[:8]}… has {len(apps)} app views via pyvda")
+
+                    for app in apps:
+                        try:
+                            hwnd = app.hwnd
+                            if not hwnd or not win32gui.IsWindowVisible(hwnd):
+                                continue
+                            title = win32gui.GetWindowText(hwnd)
+                            if len(title) < MIN_TITLE_LEN:
+                                continue
+                            # Skip windows without a caption bar
+                            style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+                            if not (style & win32con.WS_CAPTION):
+                                continue
+
+                            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                            proc_info = _get_process_info(pid)
+                            if proc_info["exe_name"].lower() in EXCLUDED_EXE:
+                                continue
+
+                            captured.append({
+                                "hwnd": hwnd,
+                                "title": title,
+                                **proc_info,
+                            })
+                            print(f"[Snapshot]   + {proc_info['exe_name']} — {title[:50]}")
+                        except Exception as e:
+                            continue  # skip this one app view, keep going
+
+                    if captured:
+                        return captured  # success — return pyvda results
+                    else:
+                        print("[Snapshot] pyvda returned 0 usable windows, trying EnumWindows fallback")
+
+            except Exception as e:
+                print(f"[Snapshot] pyvda get_apps_by_z_order failed ({e}), falling back to EnumWindows")
+
+        # ── FALLBACK: EnumWindows without desktop filtering ──────────────────
+        # Used when pyvda fails entirely. Captures all visible windows on the
+        # system — not perfect, but better than returning empty.
+        print("[Snapshot] Using EnumWindows fallback (no desktop filter)")
 
         def enum_handler(hwnd, _):
             if not _is_real_window(hwnd):
                 return
-
-            # If we have pyvda, filter by desktop.
-            # STRICT: if we can't determine the window's desktop (returns None),
-            # we skip it — better to miss a window than include wrong-desktop windows.
-            if PYVDA_AVAILABLE and target_id:
-                win_desktop = _get_desktop_id_for_window(hwnd)
-                if win_desktop != target_id:   # None != target_id → correctly excluded
-                    return
-
             try:
                 title = win32gui.GetWindowText(hwnd)
                 _, pid = win32process.GetWindowThreadProcessId(hwnd)
                 proc_info = _get_process_info(pid)
-
                 if proc_info["exe_name"].lower() in EXCLUDED_EXE:
                     return
-
                 captured.append({
                     "hwnd": hwnd,
                     "title": title,
                     **proc_info,
                 })
+                print(f"[Snapshot]   ~ {proc_info['exe_name']} — {title[:50]}")
             except Exception:
                 pass
 
         try:
             win32gui.EnumWindows(enum_handler, None)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Snapshot] EnumWindows error: {e}")
 
         return captured
 

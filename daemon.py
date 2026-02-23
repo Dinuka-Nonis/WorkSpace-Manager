@@ -21,8 +21,8 @@ import snapshot as snap
 # How often to check for new virtual desktops (ms)
 DESKTOP_POLL_MS = 500
 
-# How often to snapshot windows (ms)
-SNAPSHOT_INTERVAL_MS = 30_000
+# How often to snapshot windows (ms) — 8s keeps data fresh without hammering pyvda
+SNAPSHOT_INTERVAL_MS = 8_000
 
 # How often to add time to active sessions (ms)
 TIME_TICK_MS = 60_000
@@ -105,16 +105,44 @@ class WorkSpaceDaemon(QObject):
 
             elif current_count < self._prev_desktop_count:
                 # ── Desktop(s) removed ─────────────────────────────────────
-                # Windows already moved their windows to another desktop.
-                # Mark orphaned sessions as idle so they show as restorable.
+                # When a virtual desktop is closed, Windows moves all its windows
+                # to the adjacent desktop immediately — BEFORE our poll tick.
+                # Strategy: snapshot the current desktop right now and match any
+                # windows we find against the session's previously known exe list.
+                # Then mark orphaned sessions idle so they remain restorable.
                 removed_ids = self._prev_desktop_ids - current_ids
                 for desktop_id in removed_ids:
                     if desktop_id in self._session_map:
                         sid = self._session_map[desktop_id]
+
+                        # Get the exe names we previously knew about for this session
+                        prev_windows = db.get_windows(sid)
+                        known_exes = {
+                            w["exe_name"].lower() for w in prev_windows
+                            if w.get("exe_name")
+                        }
+                        print(f"[Daemon] Desktop {desktop_id[:8]}… closed. "
+                              f"Session {sid} had exes: {known_exes}")
+
+                        if prev_windows:
+                            # Try to capture the migrated windows from current desktop
+                            # by looking for matching exe names
+                            all_current = snap.snapshot_desktop(current_active)
+                            matched = [
+                                w for w in all_current
+                                if w.get("exe_name", "").lower() in known_exes
+                            ]
+                            if matched:
+                                print(f"[Daemon] Found {len(matched)} migrated windows "
+                                      f"on current desktop — saving for session {sid}")
+                                tabs = db.get_chrome_tabs(sid)
+                                db.save_snapshot(sid, matched, [dict(t) for t in tabs])
+                            else:
+                                print(f"[Daemon] No matching windows found on current desktop "
+                                      f"— keeping {len(prev_windows)} previous windows for session {sid}")
+                                # Don't overwrite — keep last known good state
+
                         db.update_session_status(sid, "idle")
-                        print(f"[Daemon] Desktop removed — session {sid} marked idle")
-                        # Keep in session_map so restore can find it, but
-                        # clear active_desktop_id if it was the removed one
                         if self._active_desktop_id == desktop_id:
                             self._active_desktop_id = current_active
 
@@ -160,9 +188,9 @@ class WorkSpaceDaemon(QObject):
         """Called after user names a new session in the spotlight."""
         self._session_map[desktop_id] = session_id
         db.update_session_status(session_id, "active")
-        # First snapshot after 3s — quick enough to catch apps the user opens right away,
-        # but not so instant that the desktop is still empty.
-        QTimer.singleShot(3_000, lambda: self._snapshot_session(session_id, desktop_id))
+        # First snapshot after 2s — catches apps opened right away.
+        # After that the 8s interval timer takes over continuously.
+        QTimer.singleShot(2_000, lambda: self._snapshot_session(session_id, desktop_id))
 
     def get_active_session_id(self) -> int | None:
         """Return the session_id for the current virtual desktop, if any."""
@@ -183,7 +211,26 @@ class WorkSpaceDaemon(QObject):
     def _snapshot_session(self, session_id: int, desktop_id: str):
         try:
             windows = snap.snapshot_desktop(desktop_id)
-            tabs = db.get_chrome_tabs(session_id)  # use last known tabs
+            tabs = db.get_chrome_tabs(session_id)
+
+            if not windows:
+                # Don't overwrite a previous good snapshot with empty data.
+                # This protects against desktop-close timing (windows move before
+                # we can read them) and pyvda failures.
+                existing = db.get_windows(session_id)
+                if existing:
+                    print(f"[Daemon] Snapshot returned 0 windows for session {session_id} "
+                          f"— keeping {len(existing)} previously saved windows")
+                    # Still update the timestamp so we know we tried
+                    self._last_snapshot[session_id] = time.time()
+                    self.snapshot_saved.emit(session_id)
+                    return
+                else:
+                    print(f"[Daemon] Snapshot returned 0 windows for session {session_id} "
+                          f"and no previous data — saving empty snapshot")
+            else:
+                print(f"[Daemon] Snapshot saved: {len(windows)} windows for session {session_id}")
+
             db.save_snapshot(session_id, windows, [dict(t) for t in tabs])
             self._last_snapshot[session_id] = time.time()
             self.snapshot_saved.emit(session_id)
