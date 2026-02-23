@@ -105,8 +105,12 @@ class WorkSpaceApp:
         # Connect signals
         self._wire()
 
-        # Start daemon
+        # Start daemon — this runs the startup desktop scan synchronously,
+        # then starts the polling timers
         self.daemon.start()
+
+        # Refresh UI now that daemon has scanned all desktops and created sessions
+        QTimer.singleShot(100, self.main_window.refresh)
 
         # Start hotkeys in background thread
         self.hotkeys.start_listening()
@@ -176,8 +180,8 @@ class WorkSpaceApp:
         self.hotkeys.hud_toggle_requested.connect(self.hud.toggle)
         self.hotkeys.snapshot_requested.connect(self.daemon.force_snapshot)
 
-        # Daemon → Main window refresh
-        self.daemon.snapshot_saved.connect(lambda _: None)  # refresh on demand
+        # Auto-refresh dashboard whenever a snapshot is saved
+        self.daemon.snapshot_saved.connect(lambda _: self.main_window.refresh())
 
     # ── Event Handlers ────────────────────────────────────────────────────────
 
