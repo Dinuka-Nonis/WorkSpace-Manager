@@ -1,45 +1,42 @@
 """
-ui/main_window.py — Full session dashboard.
-Shows all sessions in card grid, stats, restore/delete actions.
-Matches the HTML mockup design closely.
+ui/main_window.py — Main window: session card grid + inline detail panel.
+
+Layout:
+  Left  — sidebar (logo, nav, create button)
+  Right — either the session card grid OR the SessionDetailPanel
 """
+
+from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QScrollArea, QFrame, QGraphicsDropShadowEffect,
-    QSizePolicy, QMessageBox, QGridLayout, QApplication
+    QSizePolicy, QInputDialog, QLineEdit, QMessageBox, QApplication
 )
-from PyQt6.QtCore import (
-    Qt, pyqtSignal, QSize, QTimer
-)
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer
 from PyQt6.QtGui import (
-    QPainter, QColor, QPainterPath, QFont, QLinearGradient,
-    QPen, QPixmap, QIcon, QBrush
+    QPainter, QColor, QPainterPath, QFont, QLinearGradient, QPen, QIcon, QPixmap
 )
 
 import db
-import restore as restorer
-from snapshot import friendly_app_name
+from ui.session_detail import SessionDetailPanel
 from ui.styles import (
     BG, SURFACE, SURFACE2, SURFACE3, BORDER, ACCENT, ACCENT2, ACCENT_DIM,
     TEXT, MUTED, MUTED2, GREEN, AMBER, RED,
     WHITE_005, ACCENT_010, ACCENT_020
 )
 
-STATUS_COLORS = {"active": GREEN, "paused": AMBER, "idle": MUTED}
-STATUS_BG = {
-    "active": "rgba(74,222,128,0.12)",
-    "paused": "rgba(251,191,36,0.12)",
-    "idle": "rgba(107,107,128,0.08)",
-}
 
+# ── Toast ─────────────────────────────────────────────────────────────────────
 
 class ToastNotification(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
-                            Qt.WindowType.WindowStaysOnTopHint |
-                            Qt.WindowType.Tool)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.Tool
+        )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFixedSize(300, 44)
         self._timer = QTimer(self)
@@ -49,7 +46,7 @@ class ToastNotification(QWidget):
 
     def show_toast(self, icon: str, msg: str, duration=2500):
         self._icon = icon
-        self._msg = msg
+        self._msg  = msg
         screen = QApplication.primaryScreen().availableGeometry()
         self.move(screen.center().x() - 150, screen.bottom() - 80)
         self.show()
@@ -63,8 +60,7 @@ class ToastNotification(QWidget):
         path = QPainterPath()
         path.addRoundedRect(0, 0, self.width(), self.height(), 12, 12)
         p.fillPath(path, QColor(20, 20, 32, 240))
-        pen = QPen(QColor(ACCENT), 1)
-        p.setPen(pen)
+        p.setPen(QPen(QColor(ACCENT), 1))
         p.drawPath(path)
         p.setPen(QColor(TEXT))
         p.setFont(QFont("Segoe UI Variable", 12))
@@ -72,34 +68,36 @@ class ToastNotification(QWidget):
                    f"  {self._icon}  {self._msg}")
 
 
-class SessionFullCard(QWidget):
-    restore_clicked = pyqtSignal(int)
-    delete_clicked = pyqtSignal(int)
+# ── Session card ──────────────────────────────────────────────────────────────
+
+class SessionCard(QWidget):
+    clicked        = pyqtSignal(int)   # session_id
+    delete_clicked = pyqtSignal(int)   # session_id
 
     def __init__(self, session: dict, stats: dict, parent=None):
         super().__init__(parent)
         self.session_id = session["id"]
-        self.status = session.get("status", "idle")
-        self._hovered = False
-        self.setFixedHeight(230)
-        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self._hovered   = False
+        self.setFixedHeight(170)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMouseTracking(True)
         self._build(session, stats)
 
     def _build(self, session: dict, stats: dict):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(10)
+        layout.setSpacing(8)
 
-        # ── Top: icon + name + status ──
+        # ── Top: icon + name + delete ──
         top = QHBoxLayout()
         top.setSpacing(10)
 
         icon_w = QLabel(session.get("icon", "🗂"))
-        icon_w.setFixedSize(42, 42)
+        icon_w.setFixedSize(40, 40)
         icon_w.setAlignment(Qt.AlignmentFlag.AlignCenter)
         icon_w.setStyleSheet(f"""
-            background: {STATUS_BG.get(self.status, 'rgba(124,106,247,0.1)')};
-            border-radius: 12px;
+            background: {ACCENT_010};
+            border-radius: 10px;
             font-size: 20px;
         """)
         top.addWidget(icon_w)
@@ -107,158 +105,109 @@ class SessionFullCard(QWidget):
         title_col = QVBoxLayout()
         title_col.setSpacing(2)
         name = QLabel(session["name"])
-        name.setStyleSheet(f"""
-            color: {TEXT};
-            font-size: 14px;
-            font-weight: 700;
-            font-family: "Segoe UI Variable";
-            letter-spacing: -0.3px;
-        """)
+        name.setStyleSheet(
+            f"color: {TEXT}; font-size: 14px; font-weight: 700; letter-spacing: -0.2px;"
+        )
         title_col.addWidget(name)
 
-        from datetime import datetime
         try:
-            dt = datetime.fromisoformat(session.get("created_at", ""))
+            dt = datetime.fromisoformat(session.get("updated_at", ""))
             date_str = dt.strftime("%b %d, %H:%M")
         except Exception:
             date_str = "—"
-        date_lbl = QLabel(date_str)
+        date_lbl = QLabel(f"Updated {date_str}")
         date_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
         title_col.addWidget(date_lbl)
+
         top.addLayout(title_col)
         top.addStretch()
 
-        color = STATUS_COLORS.get(self.status, MUTED)
-        status_badge = QLabel(self.status.upper())
-        status_badge.setStyleSheet(f"""
-            color: {color};
-            background: {color}22;
-            border-radius: 12px;
-            padding: 2px 10px;
-            font-size: 9px;
-            font-weight: 700;
-            letter-spacing: 1px;
-            font-family: "Cascadia Mono", monospace;
+        del_btn = QPushButton("✕")
+        del_btn.setFixedSize(26, 26)
+        del_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; border: none;
+                color: {MUTED2}; font-size: 12px; border-radius: 6px;
+            }}
+            QPushButton:hover {{
+                background: rgba(248,113,113,0.15);
+                color: {RED};
+            }}
         """)
-        top.addWidget(status_badge)
+        del_btn.clicked.connect(lambda: self.delete_clicked.emit(self.session_id))
+        top.addWidget(del_btn)
         layout.addLayout(top)
 
-        # ── App chips row ──
+        # ── Stats chips ──
         chips = QHBoxLayout()
-        chips.setSpacing(5)
+        chips.setSpacing(6)
         chips.setContentsMargins(0, 0, 0, 0)
+        chip_data = []
+        if stats["files"]: chip_data.append(f"📄 {stats['files']}")
+        if stats["urls"]:  chip_data.append(f"🌐 {stats['urls']}")
+        if stats["apps"]:  chip_data.append(f"⚙️ {stats['apps']}")
 
-        tab_count = stats.get("tab_count", 0)
-        if tab_count > 0:
-            chips.addWidget(self._chip(f"🌐 {tab_count} tab{'s' if tab_count != 1 else ''}", "#4285f4"))
+        for text in chip_data:
+            chip = QLabel(text)
+            chip.setStyleSheet(f"""
+                background: {SURFACE3};
+                border-radius: 6px;
+                padding: 3px 9px;
+                font-size: 11px;
+                color: {MUTED};
+                font-weight: 600;
+            """)
+            chips.addWidget(chip)
 
-        for app in stats.get("apps", [])[:5]:
-            chips.addWidget(self._chip(f"🪟 {app}"))
+        if not chip_data:
+            empty_chip = QLabel("Empty")
+            empty_chip.setStyleSheet(
+                f"background: {SURFACE3}; border-radius: 6px; "
+                f"padding: 3px 9px; font-size: 11px; color: {MUTED2};"
+            )
+            chips.addWidget(empty_chip)
 
         chips.addStretch()
         layout.addLayout(chips)
 
-        # ── Description (from last snapshot title) ──
-        desc = QLabel(f"Windows: {stats.get('window_count',0)}  ·  Apps: {stats.get('app_count',0)}")
-        desc.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
-        layout.addWidget(desc)
+        # ── Description ──
+        desc = session.get("description", "")
+        if desc:
+            desc_lbl = QLabel(desc)
+            desc_lbl.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
+            desc_lbl.setWordWrap(True)
+            layout.addWidget(desc_lbl)
+        else:
+            total = stats["total"]
+            hint = QLabel(
+                f"{total} item{'s' if total != 1 else ''}" if total
+                else "Click to add files, URLs, or apps"
+            )
+            hint.setStyleSheet(f"color: {MUTED2}; font-size: 12px;")
+            layout.addWidget(hint)
 
-        # ── Stats row ──
-        stats_row = QHBoxLayout()
-        for val, lbl in [
-            (str(tab_count), "tabs"),
-            (str(stats.get("window_count", 0)), "windows"),
-            (stats.get("duration", "—"), "time"),
-        ]:
-            col = QVBoxLayout()
-            col.setSpacing(1)
-            v = QLabel(val)
-            v.setStyleSheet(f"""
-                color: {STATUS_COLORS.get(self.status, ACCENT)};
-                font-size: 16px;
-                font-weight: 700;
-                font-family: "Segoe UI Variable";
-            """)
-            v.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            l = QLabel(lbl)
-            l.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
-            l.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            col.addWidget(v)
-            col.addWidget(l)
-            stats_row.addLayout(col)
-            if lbl != "time":
-                stats_row.addWidget(self._vline())
-        layout.addLayout(stats_row)
+        layout.addStretch()
 
-        # ── Action buttons ──
-        actions = QHBoxLayout()
-        actions.setSpacing(8)
-
-        restore_btn = QPushButton("↩  Restore Session")
+        # ── Bottom: Restore button ──
+        restore_btn = QPushButton("▶  Restore All")
+        restore_btn.setFixedHeight(30)
         restore_btn.setStyleSheet(f"""
             QPushButton {{
-                background: {ACCENT};
-                border: none;
-                color: white;
-                border-radius: 9px;
-                padding: 8px 0;
-                font-size: 12px;
-                font-weight: 700;
-                font-family: "Segoe UI Variable";
-            }}
-            QPushButton:hover {{
-                background: {ACCENT2};
-            }}
-        """)
-        restore_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        restore_btn.clicked.connect(lambda: self.restore_clicked.emit(self.session_id))
-        actions.addWidget(restore_btn, 3)
-
-        del_btn = QPushButton("🗑 Delete")
-        del_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: rgba(248,113,113,0.1);
-                border: 1px solid rgba(248,113,113,0.2);
-                color: {RED};
-                border-radius: 9px;
-                padding: 8px 0;
+                background: {ACCENT_010};
+                border: 1px solid {ACCENT};
+                border-radius: 7px;
+                color: {ACCENT2};
                 font-size: 12px;
                 font-weight: 600;
             }}
-            QPushButton:hover {{
-                background: rgba(248,113,113,0.22);
-                border-color: {RED};
-            }}
+            QPushButton:hover {{ background: {ACCENT_020}; }}
         """)
-        del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        del_btn.clicked.connect(lambda: self.delete_clicked.emit(self.session_id))
-        actions.addWidget(del_btn, 1)
+        restore_btn.clicked.connect(lambda: self.clicked.emit(self.session_id))
+        layout.addWidget(restore_btn)
 
-        layout.addLayout(actions)
-
-    def _chip(self, text: str, color: str = None) -> QLabel:
-        lbl = QLabel(text)
-        c = color or MUTED
-        lbl.setStyleSheet(f"""
-            color: {c};
-            background: {c}18;
-            border: 1px solid {c}28;
-            border-radius: 5px;
-            padding: 1px 7px;
-            font-size: 10px;
-            font-family: "Cascadia Mono", monospace;
-        """)
-        return lbl
-
-    def _vline(self) -> QFrame:
-        f = QFrame()
-        f.setFrameShape(QFrame.Shape.VLine)
-        f.setFixedWidth(1)
-        f.setStyleSheet(f"background: {BORDER}; border: none;")
-        return f
-
-    def _hovered_bg(self):
-        return "rgba(124,106,247,0.06)"
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.session_id)
 
     def enterEvent(self, e):
         self._hovered = True
@@ -272,339 +221,263 @@ class SessionFullCard(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         path = QPainterPath()
-        path.addRoundedRect(0, 0, self.width(), self.height(), 16, 16)
+        path.addRoundedRect(0, 0, self.width(), self.height(), 14, 14)
 
-        if self.status == "active":
-            bg = QColor(74, 222, 128, 10) if not self._hovered else QColor(74, 222, 128, 18)
-        else:
-            bg = QColor(255, 255, 255, 6 if not self._hovered else 10)
+        bg_color = QColor(SURFACE2) if not self._hovered else QColor(SURFACE3)
+        p.fillPath(path, bg_color)
 
-        p.fillPath(path, bg)
-
-        border_color = QColor(ACCENT) if self._hovered and self.status == "active" else QColor(BORDER)
+        border_color = QColor(ACCENT) if self._hovered else QColor(BORDER)
         p.setPen(QPen(border_color, 1))
         p.drawPath(path)
 
 
-class EmptyState(QWidget):
+# ── Empty state ───────────────────────────────────────────────────────────────
+
+class GridEmptyState(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.setSpacing(12)
 
-    def paintEvent(self, e):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setPen(QColor(MUTED))
-        p.setFont(QFont("Segoe UI Variable", 48))
-        p.drawText(self.rect().adjusted(0, -40, 0, 0),
-                   Qt.AlignmentFlag.AlignCenter, "⊞")
-        p.setFont(QFont("Segoe UI Variable", 15))
-        p.drawText(self.rect().adjusted(0, 60, 0, 0),
-                   Qt.AlignmentFlag.AlignCenter, "No sessions yet")
-        p.setFont(QFont("Segoe UI Variable", 11))
-        p.setPen(QColor(MUTED2))
-        p.drawText(self.rect().adjusted(0, 100, 0, 0),
-                   Qt.AlignmentFlag.AlignCenter,
-                   "Press  Ctrl + Win + D  to create a new virtual desktop\nand start tracking a session")
+        icon = QLabel("🗂")
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon.setStyleSheet("font-size: 52px; background: transparent;")
+        layout.addWidget(icon)
 
+        title = QLabel("No sessions yet")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet(f"color: {TEXT}; font-size: 18px; font-weight: 700;")
+        layout.addWidget(title)
+
+        subtitle = QLabel("Create a session to start organizing\nyour files, websites, and apps.")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        subtitle.setStyleSheet(f"color: {MUTED}; font-size: 13px;")
+        layout.addWidget(subtitle)
+
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+
+class Sidebar(QWidget):
+    create_clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(220)
+        self.setStyleSheet(f"background: {SURFACE};")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 24, 20, 24)
+        layout.setSpacing(0)
+
+        # Logo
+        logo_row = QHBoxLayout()
+        logo_icon = QLabel("⊞")
+        logo_icon.setStyleSheet(f"font-size: 22px; color: {ACCENT2};")
+        logo_row.addWidget(logo_icon)
+        logo_text = QLabel("WorkSpace")
+        logo_text.setStyleSheet(
+            f"font-size: 16px; font-weight: 800; color: {TEXT}; letter-spacing: -0.5px;"
+        )
+        logo_row.addWidget(logo_text)
+        logo_row.addStretch()
+        layout.addLayout(logo_row)
+        layout.addSpacing(32)
+
+        # Nav label
+        nav_lbl = QLabel("SESSIONS")
+        nav_lbl.setStyleSheet(
+            f"color: {MUTED}; font-size: 10px; font-weight: 700; letter-spacing: 2px;"
+        )
+        layout.addWidget(nav_lbl)
+        layout.addSpacing(8)
+
+        # Sessions count
+        self._count_lbl = QLabel("0 sessions")
+        self._count_lbl.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
+        layout.addWidget(self._count_lbl)
+
+        layout.addStretch()
+
+        # Divider
+        div = QFrame()
+        div.setFrameShape(QFrame.Shape.HLine)
+        div.setStyleSheet(f"background: {BORDER}; max-height: 1px;")
+        layout.addWidget(div)
+        layout.addSpacing(16)
+
+        # Create button
+        create_btn = QPushButton("＋  New Session")
+        create_btn.setObjectName("accentBtn")
+        create_btn.setFixedHeight(40)
+        create_btn.clicked.connect(self.create_clicked.emit)
+        layout.addWidget(create_btn)
+
+    def set_count(self, n: int):
+        self._count_lbl.setText(f"{n} session{'s' if n != 1 else ''}")
+
+
+# ── Main window ───────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
-    """
-    Full WorkSpace Manager dashboard window.
-    """
-    restore_requested = pyqtSignal(int)   # emitted when user confirms restore dialog
     def __init__(self):
         super().__init__()
-        self._setup_window()
-        self._build_ui()
-        self.toast = ToastNotification()
-        self.refresh()
-
-    def _setup_window(self):
         self.setWindowTitle("WorkSpace Manager")
-        self.setMinimumSize(900, 650)
-        self.resize(1100, 750)
-        self.setStyleSheet(f"QMainWindow {{ background: {BG}; }}")
+        self.setMinimumSize(900, 600)
+        self.resize(1100, 700)
+        self._detail_panel = None
 
-    def _build_ui(self):
-        central = QWidget()
-        central.setStyleSheet(f"background: {BG};")
-        self.setCentralWidget(central)
+        self._toast = ToastNotification()
+        self._build()
+        self._load_sessions()
 
-        main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(0)
+    def _build(self):
+        root = QWidget()
+        root.setStyleSheet(f"background: {BG};")
+        self.setCentralWidget(root)
 
-        # ── Top bar ──
-        main_layout.addWidget(self._build_topbar())
+        h = QHBoxLayout(root)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(0)
 
-        # ── Content ──
-        content = QWidget()
-        content.setStyleSheet(f"background: {BG};")
-        cl = QVBoxLayout(content)
-        cl.setContentsMargins(32, 28, 32, 28)
-        cl.setSpacing(20)
+        # Sidebar
+        self._sidebar = Sidebar()
+        self._sidebar.create_clicked.connect(self._create_session)
+        h.addWidget(self._sidebar)
 
-        # Hero stats row — stored permanently, updated in-place by refresh()
-        hero, self._stat_labels = self._build_hero()
-        cl.addWidget(hero)
+        # Vertical divider
+        div = QFrame()
+        div.setFrameShape(QFrame.Shape.VLine)
+        div.setStyleSheet(f"background: {BORDER}; max-width: 1px;")
+        h.addWidget(div)
 
-        # Section label
-        sec_lbl = QLabel("ACTIVE & RECENT SESSIONS")
-        sec_lbl.setStyleSheet(f"""
-            color: {MUTED};
-            font-size: 10px;
-            font-weight: 700;
-            letter-spacing: 2.5px;
-            font-family: "Cascadia Mono", monospace;
-        """)
-        cl.addWidget(sec_lbl)
+        # Content area (stacked: grid OR detail)
+        self._content = QWidget()
+        self._content.setStyleSheet(f"background: {BG};")
+        self._content_layout = QVBoxLayout(self._content)
+        self._content_layout.setContentsMargins(0, 0, 0, 0)
+        self._content_layout.setSpacing(0)
+        h.addWidget(self._content, 1)
 
-        # Sessions grid (scrollable)
+        # Grid page
+        self._grid_page = self._build_grid_page()
+        self._content_layout.addWidget(self._grid_page)
+
+    def _build_grid_page(self) -> QWidget:
+        page = QWidget()
+        page.setStyleSheet(f"background: {BG};")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(32, 28, 32, 28)
+        layout.setSpacing(0)
+
+        # Page header
+        header = QHBoxLayout()
+        title = QLabel("Sessions")
+        title.setStyleSheet(
+            f"color: {TEXT}; font-size: 22px; font-weight: 800; letter-spacing: -0.5px;"
+        )
+        header.addWidget(title)
+        header.addStretch()
+        layout.addLayout(header)
+        layout.addSpacing(24)
+
+        # Scrollable card grid
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setStyleSheet("background: transparent;")
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("background: transparent;")
 
-        self.grid_container = QWidget()
-        self.grid_container.setStyleSheet("background: transparent;")
-        self.grid_layout = QGridLayout(self.grid_container)
-        self.grid_layout.setSpacing(14)
-        self.grid_layout.setContentsMargins(0, 0, 0, 0)
+        self._grid_widget = QWidget()
+        self._grid_widget.setStyleSheet("background: transparent;")
+        self._grid_layout = QVBoxLayout(self._grid_widget)
+        self._grid_layout.setContentsMargins(0, 0, 0, 0)
+        self._grid_layout.setSpacing(12)
+        self._grid_layout.addStretch()
 
-        scroll.setWidget(self.grid_container)
-        cl.addWidget(scroll)
+        scroll.setWidget(self._grid_widget)
+        layout.addWidget(scroll)
 
-        main_layout.addWidget(content)
+        return page
 
-    def _build_topbar(self) -> QWidget:
-        bar = QWidget()
-        bar.setFixedHeight(56)
-        bar.setStyleSheet(f"""
-            background: {SURFACE};
-            border-bottom: 1px solid {BORDER};
-        """)
-        hl = QHBoxLayout(bar)
-        hl.setContentsMargins(24, 0, 24, 0)
-        hl.setSpacing(12)
+    # ── Data loading ──
 
-        # Logo
-        logo = QLabel("⊞ WorkSpace")
-        logo.setStyleSheet(f"""
-            color: {TEXT};
-            font-size: 15px;
-            font-weight: 700;
-            letter-spacing: -0.4px;
-            font-family: "Segoe UI Variable";
-        """)
-        hl.addWidget(logo)
-
-        # Version badge
-        ver = QLabel("beta")
-        ver.setStyleSheet(f"""
-            color: {ACCENT2};
-            background: {ACCENT_010};
-            border: 1px solid {ACCENT}44;
-            border-radius: 8px;
-            padding: 1px 8px;
-            font-size: 10px;
-            font-weight: 700;
-            font-family: "Cascadia Mono", monospace;
-        """)
-        hl.addWidget(ver)
-        hl.addStretch()
-
-        # Hotkey hints
-        for key, hint in [("Ctrl+Win+D", "New Session"), ("Ctrl+Alt+W", "Toggle HUD")]:
-            k = QLabel(key)
-            k.setStyleSheet(f"""
-                color: {MUTED};
-                background: rgba(255,255,255,0.05);
-                border: 1px solid {BORDER};
-                border-radius: 5px;
-                padding: 2px 8px;
-                font-size: 10px;
-                font-family: "Cascadia Mono", monospace;
-            """)
-            h = QLabel(hint)
-            h.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
-            hl.addWidget(k)
-            hl.addWidget(h)
-            hl.addSpacing(12)
-
-        # Refresh
-        refresh_btn = QPushButton("⟳  Refresh")
-        refresh_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent;
-                border: 1px solid {BORDER};
-                color: {MUTED};
-                border-radius: 8px;
-                padding: 4px 14px;
-                font-size: 12px;
-            }}
-            QPushButton:hover {{
-                border-color: {MUTED2};
-                color: {TEXT};
-                background: {WHITE_005};
-            }}
-        """)
-        refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        refresh_btn.clicked.connect(self.refresh)
-        hl.addWidget(refresh_btn)
-
-        return bar
-
-    def _build_hero(self) -> tuple[QWidget, dict]:
-        """Build the stats row. Returns (widget, labels_dict) for in-place updates."""
-        hero = QWidget()
-        hl = QHBoxLayout(hero)
-        hl.setContentsMargins(0, 0, 0, 0)
-        hl.setSpacing(14)
+    def _load_sessions(self):
+        # Clear existing cards
+        while self._grid_layout.count() > 1:
+            item = self._grid_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
 
         sessions = db.get_all_sessions()
-        total = len(sessions)
-        active = sum(1 for s in sessions if s["status"] == "active")
-        total_time = sum(s.get("total_seconds", 0) for s in sessions)
-        hours = total_time // 3600
+        self._sidebar.set_count(len(sessions))
 
-        labels = {}
-        for key, val, label, color in [
-            ("total", str(total), "Total Sessions", ACCENT2),
-            ("active", str(active), "Active Now", GREEN),
-            ("time", f"{hours}h", "Total Time", AMBER),
-        ]:
-            card, val_lbl = self._stat_card(val, label, color)
-            hl.addWidget(card)
-            labels[key] = val_lbl  # keep reference for direct updates
-
-        return hero, labels
-
-    def _stat_card(self, value: str, label: str, color: str) -> tuple[QWidget, QLabel]:
-        """Returns (card_widget, value_label) — value_label can be updated directly."""
-        card = QWidget()
-        card.setFixedHeight(80)
-        card.setStyleSheet(f"""
-            background: {SURFACE};
-            border: 1px solid {BORDER};
-            border-radius: 14px;
-        """)
-        cl = QVBoxLayout(card)
-        cl.setContentsMargins(20, 12, 20, 12)
-        cl.setSpacing(4)
-
-        v = QLabel(value)
-        v.setStyleSheet(f"""
-            color: {color};
-            font-size: 24px;
-            font-weight: 700;
-            font-family: "Segoe UI Variable";
-            letter-spacing: -1px;
-        """)
-        cl.addWidget(v)
-
-        l = QLabel(label)
-        l.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
-        cl.addWidget(l)
-
-        return card, v  # return v so caller can setText() on it later
-
-    # ── Public API ────────────────────────────────────────────────────────────
-
-    def refresh(self):
-        """Reload all sessions and rebuild the grid. Safe to call any number of times."""
-        try:
-            sessions = db.get_all_sessions()
-
-            # ── Update hero stats in-place (no layout changes, no widget destruction) ──
-            total = len(sessions)
-            active = sum(1 for s in sessions if s["status"] == "active")
-            total_time = sum(s.get("total_seconds", 0) for s in sessions)
-            hours = total_time // 3600
-            self._stat_labels["total"].setText(str(total))
-            self._stat_labels["active"].setText(str(active))
-            self._stat_labels["time"].setText(f"{hours}h")
-
-            # ── Rebuild the session grid ──
-            while self.grid_layout.count():
-                item = self.grid_layout.takeAt(0)
-                w = item.widget()
-                if w:
-                    w.setParent(None)   # detach first, then schedule deletion
-                    w.deleteLater()
-
-            if not sessions:
-                empty = EmptyState()
-                empty.setFixedHeight(300)
-                self.grid_layout.addWidget(empty, 0, 0, 1, 2)
-                return
-
-            cols = 2
-            for i, session in enumerate(sessions):
-                stats = db.get_session_stats(session["id"])
-                card = SessionFullCard(session, stats)
-                card.restore_clicked.connect(self._on_restore)
-                card.delete_clicked.connect(self._on_delete)
-                self.grid_layout.addWidget(card, i // cols, i % cols)
-
-        except RuntimeError as e:
-            # Should never happen now, but guard defensively
-            print(f"[MainWindow] refresh() error (non-fatal): {e}")
-
-    def showEvent(self, e):
-        """Auto-refresh whenever the window becomes visible (e.g. after desktop switch)."""
-        super().showEvent(e)
-        self.refresh()
-
-    def show_toast(self, icon: str, msg: str):
-        self.toast.show_toast(icon, msg)
-
-    def _on_restore(self, session_id: int):
-        session = db.get_session(session_id)
-        if not session:
+        if not sessions:
+            empty = GridEmptyState()
+            self._grid_layout.insertWidget(0, empty)
             return
 
-        preview = restorer.get_restore_preview(session_id)
+        for i, session in enumerate(sessions):
+            stats = db.get_session_stats(session["id"])
+            card = SessionCard(session, stats)
+            card.clicked.connect(self._open_detail)
+            card.delete_clicked.connect(self._delete_session)
+            self._grid_layout.insertWidget(i, card)
 
-        # Build dialog text — don't block restore even if nothing was captured yet
-        if preview:
-            detail = "\n".join(preview)
-        else:
-            detail = "⚠️ No apps or tabs were captured for this session yet.\n\nA new virtual desktop will still be created for you."
+    # ── Session actions ──
 
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Restore Session")
-        msg.setText(f"Restore  \"{session['name']}\"?")
-        msg.setInformativeText(detail)
-        msg.setStandardButtons(
-            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel
+    def _create_session(self):
+        name, ok = QInputDialog.getText(
+            self, "New Session", "Session name:",
+            QLineEdit.EchoMode.Normal, ""
         )
-        msg.setDefaultButton(QMessageBox.StandardButton.Ok)
-        msg.button(QMessageBox.StandardButton.Ok).setText("↩  Restore")
-        if msg.exec() == QMessageBox.StandardButton.Ok:
-            # Emit restore_requested so main.py can suppress the Spotlight prompt
-            # for the new desktop that restore creates
-            self.restore_requested.emit(session_id)
+        if ok and name.strip():
+            session_id = db.create_session(name.strip())
+            self._load_sessions()
+            self._toast.show_toast("✓", f'Session "{name.strip()}" created')
+            # Immediately open the new session
+            self._open_detail(session_id)
 
-    def _on_delete(self, session_id: int):
+    def _delete_session(self, session_id: int):
         session = db.get_session(session_id)
         if not session:
             return
-
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Delete Session")
-        msg.setText(f"Delete  \"{session['name']}\"?")
-        msg.setInformativeText("This cannot be undone.")
-        msg.setStandardButtons(
+        reply = QMessageBox.question(
+            self, "Delete Session",
+            f'Delete "{session["name"]}"?\nThis cannot be undone.',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
         )
-        if msg.exec() == QMessageBox.StandardButton.Yes:
+        if reply == QMessageBox.StandardButton.Yes:
             db.delete_session(session_id)
-            self.show_toast("🗑", f"\"{session['name']}\" deleted")
-            self.refresh()
+            self._close_detail()
+            self._load_sessions()
+            self._toast.show_toast("🗑", f'Deleted "{session["name"]}"')
 
-    def closeEvent(self, e):
-        """Minimize to tray instead of closing."""
-        e.ignore()
-        self.hide()
-        self.show_toast("⊞", "WorkSpace running in tray")
+    def _open_detail(self, session_id: int):
+        self._close_detail()
+
+        panel = SessionDetailPanel(session_id)
+        panel.closed.connect(self._close_detail)
+        panel.session_changed.connect(self._load_sessions)
+
+        self._detail_panel = panel
+        self._grid_page.hide()
+        self._content_layout.addWidget(panel)
+
+    def _close_detail(self):
+        if self._detail_panel:
+            self._content_layout.removeWidget(self._detail_panel)
+            self._detail_panel.deleteLater()
+            self._detail_panel = None
+        self._grid_page.show()
+        self._load_sessions()
+
+    # ── Drag to move (frameless-friendly) ──
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = e.globalPosition().toPoint()
+
+    def mouseMoveEvent(self, e):
+        if e.buttons() == Qt.MouseButton.LeftButton and hasattr(self, "_drag_pos"):
+            self.move(self.pos() + e.globalPosition().toPoint() - self._drag_pos)
+            self._drag_pos = e.globalPosition().toPoint()
