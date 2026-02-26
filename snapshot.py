@@ -1,38 +1,23 @@
 """
 snapshot.py — Per-desktop window capture using pyvda + win32gui.
 
-Core insight: get_apps_by_z_order() is a TOP-LEVEL function that returns
-ALL AppView objects across ALL virtual desktops. Each AppView has:
-  .hwnd             — the window handle
-  .virtual_desktop() — which VirtualDesktop it belongs to
-
-Correct approach:
-  1. Call get_apps_by_z_order() ONCE to get everything
-  2. For each AppView, call .virtual_desktop().id to know which desktop
-  3. Group by desktop_id → return the group you need
-
-This is the only reliable method. Asking each hwnd "which desktop?" via
-AppView(hwnd).virtual_desktop() fails silently for most apps.
+Key insight on desktop assignment:
+  app.desktop.id  — WRONG: returns current active desktop's ID for cloaked
+                    (inactive) windows. All windows appear on Desktop 1.
+  app.is_on_desktop(vd) — CORRECT: explicitly checks membership per desktop.
 """
 
 import os
 import sys
 
 if sys.platform != "win32":
-    def snapshot_all_desktops() -> dict:
-        return {}
-    def snapshot_desktop(desktop_id=None) -> list:
-        return []
-    def get_current_desktop_id():
-        return None
-    def get_all_desktop_ids() -> list:
-        return []
-    def get_desktop_count() -> int:
-        return 1
-    def get_desktop_number(desktop_id) -> int | None:
-        return None
-    def friendly_app_name(exe_name: str) -> str:
-        return exe_name
+    def snapshot_all_desktops(): return {}
+    def snapshot_desktop(desktop_id=None): return []
+    def get_current_desktop_id(): return None
+    def get_all_desktop_ids(): return []
+    def get_desktop_count(): return 1
+    def get_desktop_number(desktop_id): return None
+    def friendly_app_name(exe_name): return exe_name
 else:
     import psutil
 
@@ -61,29 +46,17 @@ else:
 
     def _is_capturable(hwnd: int) -> bool:
         """
-        Return True if this hwnd is a real user-facing window.
-        
-        IMPORTANT: Do NOT call IsWindowVisible() here. Windows intentionally
-        cloaks (hides) windows that live on inactive virtual desktops — so
-        IsWindowVisible() returns False for every window on Desktop 2, 3, etc.
-        That was why we got 0 results: we were filtering out exactly the
-        windows we wanted to capture.
-        
-        Instead we check: window exists, has a title, has no parent (top-level),
-        and has a caption bar (WS_CAPTION style).
+        Check if a hwnd is a real user-facing window.
+        NOTE: Do NOT use IsWindowVisible() — Windows cloaks (hides) windows
+        on inactive virtual desktops, so they would all fail this check.
         """
-        if not hwnd:
-            return False
-        # Window must still exist
-        if not win32gui.IsWindow(hwnd):
+        if not hwnd or not win32gui.IsWindow(hwnd):
             return False
         title = win32gui.GetWindowText(hwnd)
         if len(title.strip()) < 2:
             return False
-        # Must be a top-level window (no parent)
         if win32gui.GetParent(hwnd) != 0:
             return False
-        # Must have a title bar
         style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
         if not (style & win32con.WS_CAPTION):
             return False
@@ -100,8 +73,10 @@ else:
     def snapshot_all_desktops() -> dict[str, list[dict]]:
         """
         Returns {desktop_id: [window_dict, ...]} for ALL virtual desktops.
-        Uses get_apps_by_z_order() — returns every AppView across all desktops.
-        Each AppView.virtual_desktop() tells us which desktop it belongs to.
+
+        Desktop assignment uses app.is_on_desktop(vd) by iterating all desktops.
+        This is the only reliable method — app.desktop.id silently returns the
+        CURRENT active desktop's ID for cloaked (inactive desktop) windows.
         """
         result: dict[str, list[dict]] = {}
 
@@ -110,43 +85,41 @@ else:
 
         try:
             all_apps = get_apps_by_z_order()
-            print(f"[Snapshot] {len(all_apps)} total app views across all desktops")
+            all_desktops = get_virtual_desktops()
         except Exception as e:
-            print(f"[Snapshot] get_apps_by_z_order() failed: {e}")
+            print(f"[Snapshot] pyvda call failed: {e}")
             return result
+
+        print(f"[Snapshot] {len(all_apps)} total app views, {len(all_desktops)} desktops")
 
         passed = 0
         for app in all_apps:
             try:
                 hwnd = app.hwnd
-                title = win32gui.GetWindowText(hwnd) if hwnd else ""
-
-                # Debug: log why each app is accepted or rejected
                 if not hwnd:
-                    print(f"[Snapshot]   SKIP: no hwnd")
                     continue
-                if not win32gui.IsWindow(hwnd):
-                    print(f"[Snapshot]   SKIP hwnd={hwnd}: not a window")
-                    continue
-                if len(title.strip()) < 2:
-                    print(f"[Snapshot]   SKIP hwnd={hwnd}: title too short '{title}'")
-                    continue
+
+                title = win32gui.GetWindowText(hwnd)
 
                 if not _is_capturable(hwnd):
-                    style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
-                    parent = win32gui.GetParent(hwnd)
-                    has_caption = bool(style & win32con.WS_CAPTION)
-                    print(f"[Snapshot]   SKIP '{title[:40]}': "
-                          f"parent={parent} caption={has_caption}")
                     continue
 
-                # Which desktop does this window live on?
-                # app.desktop is a property returning a VirtualDesktop object.
-                # app.desktop_id is a GUID property — same format as VirtualDesktop.id.
-                try:
-                    desktop_id = str(app.desktop.id)
-                except Exception as e:
-                    print(f"[Snapshot]   SKIP '{title[:40]}': app.desktop failed: {e}")
+                # ── Determine which desktop this window belongs to ────────
+                # CRITICAL: use is_on_desktop(vd) not app.desktop.id
+                # app.desktop.id returns current desktop ID for ALL cloaked
+                # windows (those on inactive desktops), causing them all to
+                # appear grouped under Desktop 1.
+                desktop_id = None
+                for vd in all_desktops:
+                    try:
+                        if app.is_on_desktop(vd):
+                            desktop_id = str(vd.id)
+                            break
+                    except Exception:
+                        continue
+
+                if desktop_id is None:
+                    print(f"[Snapshot]   SKIP '{title[:40]}': no desktop match")
                     continue
 
                 _, pid = win32process.GetWindowThreadProcessId(hwnd)
@@ -163,7 +136,7 @@ else:
                 passed += 1
 
             except Exception as e:
-                print(f"[Snapshot]   ERROR processing app: {e}")
+                print(f"[Snapshot]   ERROR: {e}")
                 continue
 
         print(f"[Snapshot] {passed}/{len(all_apps)} app views captured")
@@ -174,7 +147,6 @@ else:
         return result
 
     def snapshot_desktop(desktop_id: str = None) -> list[dict]:
-        """Windows for a single desktop. Calls snapshot_all_desktops() internally."""
         if desktop_id is None:
             desktop_id = get_current_desktop_id()
         if not desktop_id:
@@ -206,13 +178,12 @@ else:
             return 1
 
     def get_desktop_number(desktop_id: str) -> int | None:
-        """1-based desktop number. Uses VirtualDesktop.number property directly."""
         if not PYVDA_AVAILABLE:
             return None
         try:
             for d in get_virtual_desktops():
                 if str(d.id) == desktop_id:
-                    return d.number  # built-in property, 1-based
+                    return d.number
         except Exception:
             pass
         return None
@@ -236,5 +207,6 @@ else:
             "figma.exe": "Figma", "Teams.exe": "Teams",
             "zoom.exe": "Zoom", "vlc.exe": "VLC",
             "blender.exe": "Blender", "devenv.exe": "Visual Studio",
+            "POWERPNT.EXE": "PowerPoint",
         }
         return mapping.get(exe_name, exe_name.replace(".exe", "").replace(".EXE", ""))
