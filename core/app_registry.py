@@ -341,12 +341,31 @@ def get_installed_apps(force_refresh: bool = False) -> list[dict]:
     """
     global _cache
     if _cache is not None and not force_refresh:
+        print(f"[AppRegistry] Returning {len(_cache)} cached apps")
         return _cache
 
     all_apps: list[dict] = []
-    all_apps.extend(_read_uninstall_keys())
-    all_apps.extend(_read_app_paths())
-    all_apps.extend(_read_start_menu_shortcuts())
+
+    try:
+        uninstall = _read_uninstall_keys()
+        print(f"[AppRegistry] Uninstall keys: {len(uninstall)} apps")
+        all_apps.extend(uninstall)
+    except Exception as e:
+        print(f"[AppRegistry] Uninstall keys failed: {e}")
+
+    try:
+        app_paths = _read_app_paths()
+        print(f"[AppRegistry] App Paths: {len(app_paths)} apps")
+        all_apps.extend(app_paths)
+    except Exception as e:
+        print(f"[AppRegistry] App Paths failed: {e}")
+
+    try:
+        shortcuts = _read_start_menu_shortcuts()
+        print(f"[AppRegistry] Start Menu shortcuts: {len(shortcuts)} apps")
+        all_apps.extend(shortcuts)
+    except Exception as e:
+        print(f"[AppRegistry] Start Menu shortcuts failed: {e}")
 
     # Deduplicate by normalized exe path
     seen_paths: set[str] = set()

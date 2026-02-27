@@ -8,7 +8,6 @@ App    → searchable list of installed Windows apps (from registry + Start Menu
 """
 
 import os
-import threading
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -16,7 +15,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QFileDialog, QWidget, QFrame, QScrollArea,
     QApplication, QSizePolicy
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QObject
 from PyQt6.QtGui import QPainter, QColor, QPainterPath, QFont, QDragEnterEvent, QDropEvent
 
 import db
@@ -27,6 +26,27 @@ from ui.styles import (
     BG, SURFACE, SURFACE2, SURFACE3, BORDER, ACCENT, ACCENT2, ACCENT_DIM,
     TEXT, MUTED, MUTED2, RED, WHITE_005, ACCENT_010, ACCENT_020
 )
+
+
+# ── Background worker for loading installed apps ──────────────────────────────
+
+class AppLoaderWorker(QObject):
+    """Runs in a QThread. Emits apps_loaded when done, error on failure."""
+    apps_loaded = pyqtSignal(list)
+    error       = pyqtSignal(str)
+
+    def run(self):
+        try:
+            print("[AppLoader] Starting registry scan…")
+            from core.app_registry import get_installed_apps
+            apps = get_installed_apps()
+            print(f"[AppLoader] Found {len(apps)} apps")
+            self.apps_loaded.emit(apps)
+        except Exception as e:
+            import traceback
+            msg = traceback.format_exc()
+            print(f"[AppLoader] ERROR:\n{msg}")
+            self.error.emit(str(e))
 
 
 # ── Tab button ────────────────────────────────────────────────────────────────
@@ -372,33 +392,36 @@ class AddItemDialog(QDialog):
         browse_row.addWidget(fallback_btn)
         layout.addLayout(browse_row)
 
-        # Kick off background load
+        # Kick off background load via QThread (safe cross-thread signal delivery)
         self._all_apps: list[dict] = []
-        threading.Thread(target=self._load_apps_bg, daemon=True).start()
+        self._app_thread = QThread()
+        self._app_worker = AppLoaderWorker()
+        self._app_worker.moveToThread(self._app_thread)
+        self._app_thread.started.connect(self._app_worker.run)
+        self._app_worker.apps_loaded.connect(self._on_apps_loaded)
+        self._app_worker.apps_loaded.connect(self._app_thread.quit)
+        self._app_worker.error.connect(self._on_apps_error)
+        self._app_worker.error.connect(self._app_thread.quit)
+        self._app_thread.start()
 
         return w
-
-    def _load_apps_bg(self):
-        """Load installed apps in background thread, then populate UI."""
-        try:
-            from core.app_registry import get_installed_apps
-            apps = get_installed_apps()
-        except Exception:
-            apps = []
-        # Schedule UI update on main thread
-        QTimer.singleShot(0, lambda: self._on_apps_loaded(apps))
 
     def _on_apps_loaded(self, apps: list[dict]):
         self._all_apps = apps
         self._app_loading.hide()
         self._populate_app_list(apps)
 
+    def _on_apps_error(self, msg: str):
+        self._app_loading.setText(f"⚠ Failed to load apps — use Browse .exe…")
+        self._app_loading.setStyleSheet(f"color: {RED}; font-size: 11px;")
+        print(f"[AppLoader] Could not load installed apps: {msg}")
+
     def _filter_apps(self, query: str):
         if not self._all_apps:
             return
         q = query.lower().strip()
         filtered = [a for a in self._all_apps if q in a["name"].lower()] if q else self._all_apps
-        self._populate_app_list(filtered[:50])  # cap at 50 for performance
+        self._populate_app_list(filtered[:60])
 
     def _populate_app_list(self, apps: list[dict]):
         # Clear existing rows
@@ -539,3 +562,10 @@ class AddItemDialog(QDialog):
         if e.buttons() == Qt.MouseButton.LeftButton:
             self.move(self.pos() + e.globalPosition().toPoint() - self._drag_pos)
             self._drag_pos = e.globalPosition().toPoint()
+
+    def closeEvent(self, e):
+        # Clean up QThread if it's still running
+        if hasattr(self, "_app_thread") and self._app_thread.isRunning():
+            self._app_thread.quit()
+            self._app_thread.wait(1000)
+        super().closeEvent(e)
