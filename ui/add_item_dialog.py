@@ -4,17 +4,19 @@ ui/add_item_dialog.py — Dialog to add a file, URL, or app to a session.
 Three tabs: File, URL, App.
 File   → drag & drop or browse button → stores absolute path.
 URL    → paste field with live label preview.
-App    → browse to .exe → stores absolute path.
+App    → searchable list of installed Windows apps (from registry + Start Menu).
 """
 
 import os
+import threading
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QLineEdit, QFileDialog, QWidget, QFrame, QApplication
+    QLineEdit, QFileDialog, QWidget, QFrame, QScrollArea,
+    QApplication, QSizePolicy
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QMimeData
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QPainter, QColor, QPainterPath, QFont, QDragEnterEvent, QDropEvent
 
 import db
@@ -182,9 +184,10 @@ class AddItemDialog(QDialog):
         self._active_tab = "file"
 
         self.setWindowTitle("Add Item")
-        self.setFixedSize(480, 400)
+        self.setFixedSize(480, 460)
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self._selected_app = None
 
         self._build()
 
@@ -314,25 +317,148 @@ class AddItemDialog(QDialog):
         w = QWidget()
         layout = QVBoxLayout(w)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
+        layout.setSpacing(8)
 
-        path_row = QHBoxLayout()
-        path_row.setSpacing(8)
-        self._app_path = _make_field("Path to .exe")
-        self._app_path.setReadOnly(True)
-        path_row.addWidget(self._app_path)
-        browse_btn = QPushButton("Browse…")
-        browse_btn.setFixedWidth(90)
-        browse_btn.setFixedHeight(38)
-        browse_btn.clicked.connect(self._browse_app)
-        path_row.addWidget(browse_btn)
-        layout.addLayout(path_row)
+        # Search bar
+        self._app_search = _make_field("Search installed apps…")
+        self._app_search.textChanged.connect(self._filter_apps)
+        layout.addWidget(self._app_search)
 
-        layout.addWidget(_section("Label"))
-        self._app_label = _make_field("Auto-generated from filename")
-        layout.addWidget(self._app_label)
+        # Scrollable app list
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setFixedHeight(160)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("background: transparent;")
+
+        self._app_list_widget = QWidget()
+        self._app_list_widget.setStyleSheet("background: transparent;")
+        self._app_list_layout = QVBoxLayout(self._app_list_widget)
+        self._app_list_layout.setContentsMargins(0, 0, 0, 0)
+        self._app_list_layout.setSpacing(2)
+        self._app_list_layout.addStretch()
+        scroll.setWidget(self._app_list_widget)
+        layout.addWidget(scroll)
+
+        # Loading label
+        self._app_loading = QLabel("Loading installed apps…")
+        self._app_loading.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
+        self._app_loading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._app_loading)
+
+        # Selected app display
+        self._selected_app: dict | None = None
+        self._app_selected_lbl = QLabel("")
+        self._app_selected_lbl.setStyleSheet(
+            f"color: {ACCENT2}; font-size: 12px; font-weight: 600;"
+        )
+        layout.addWidget(self._app_selected_lbl)
+
+        # Also allow manual browse as fallback
+        browse_row = QHBoxLayout()
+        browse_row.addStretch()
+        fallback_btn = QPushButton("Browse .exe…")
+        fallback_btn.setFixedHeight(28)
+        fallback_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; border: 1px solid {BORDER};
+                border-radius: 6px; color: {MUTED}; font-size: 11px;
+                padding: 0 10px;
+            }}
+            QPushButton:hover {{ color: {TEXT}; border-color: {MUTED2}; }}
+        """)
+        fallback_btn.clicked.connect(self._browse_app_fallback)
+        browse_row.addWidget(fallback_btn)
+        layout.addLayout(browse_row)
+
+        # Kick off background load
+        self._all_apps: list[dict] = []
+        threading.Thread(target=self._load_apps_bg, daemon=True).start()
 
         return w
+
+    def _load_apps_bg(self):
+        """Load installed apps in background thread, then populate UI."""
+        try:
+            from core.app_registry import get_installed_apps
+            apps = get_installed_apps()
+        except Exception:
+            apps = []
+        # Schedule UI update on main thread
+        QTimer.singleShot(0, lambda: self._on_apps_loaded(apps))
+
+    def _on_apps_loaded(self, apps: list[dict]):
+        self._all_apps = apps
+        self._app_loading.hide()
+        self._populate_app_list(apps)
+
+    def _filter_apps(self, query: str):
+        if not self._all_apps:
+            return
+        q = query.lower().strip()
+        filtered = [a for a in self._all_apps if q in a["name"].lower()] if q else self._all_apps
+        self._populate_app_list(filtered[:50])  # cap at 50 for performance
+
+    def _populate_app_list(self, apps: list[dict]):
+        # Clear existing rows
+        while self._app_list_layout.count() > 1:
+            item = self._app_list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        for app in apps[:50]:
+            row = self._make_app_row(app)
+            self._app_list_layout.insertWidget(
+                self._app_list_layout.count() - 1, row
+            )
+
+    def _make_app_row(self, app: dict) -> QWidget:
+        row = QWidget()
+        row.setFixedHeight(36)
+        row.setCursor(Qt.CursorShape.PointingHandCursor)
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(8, 4, 8, 4)
+        row_layout.setSpacing(8)
+
+        icon_lbl = QLabel(app.get("icon_emoji", "⚙️"))
+        icon_lbl.setFixedSize(24, 24)
+        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon_lbl.setStyleSheet("font-size: 14px;")
+        row_layout.addWidget(icon_lbl)
+
+        name_lbl = QLabel(app["name"])
+        name_lbl.setStyleSheet(f"color: {TEXT}; font-size: 12px;")
+        row_layout.addWidget(name_lbl)
+        row_layout.addStretch()
+
+        def _select(a=app, r=row):
+            self._selected_app = a
+            self._app_selected_lbl.setText(f"✓  {a['name']}")
+            # Highlight selected row
+            r.setStyleSheet(f"background: {ACCENT_020}; border-radius: 7px;")
+
+        # Style default
+        row.setStyleSheet(f"""
+            QWidget {{ background: transparent; border-radius: 7px; }}
+            QWidget:hover {{ background: {SURFACE3}; }}
+        """)
+        row.mousePressEvent = lambda e, fn=_select: fn()
+        return row
+
+    def _browse_app_fallback(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Application",
+            r"C:\Program Files",
+            "Executables (*.exe)"
+        )
+        if path:
+            self._selected_app = {
+                "name":       label_for_app(path),
+                "exe_path":   path,
+                "icon_emoji": "⚙️",
+            }
+            self._app_selected_lbl.setText(f"✓  {self._selected_app['name']}")
 
     def _switch_tab(self, tab: str):
         self._active_tab = tab
@@ -363,18 +489,11 @@ class AddItemDialog(QDialog):
         if text and not self._url_label.text():
             self._url_label.setText(label_for_url(text))
 
-    # ── App tab handlers ──
+    # ── URL tab handlers ──
 
-    def _browse_app(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select Application",
-            r"C:\Program Files",
-            "Executables (*.exe)"
-        )
-        if path:
-            self._app_path.setText(path)
-            if not self._app_label.text():
-                self._app_label.setText(label_for_app(path))
+    def _on_url_changed(self, text: str):
+        if text and not self._url_label.text():
+            self._url_label.setText(label_for_url(text))
 
     # ── Add button ──
 
@@ -403,15 +522,12 @@ class AddItemDialog(QDialog):
             item_id = db.add_item(self.session_id, "url", url, label)
 
         elif self._active_tab == "app":
-            path = self._app_path.text().strip()
-            if not path:
-                self._error_lbl.setText("Please select an executable.")
+            if not self._selected_app:
+                self._error_lbl.setText("Please select an app first.")
                 return
-            if not os.path.exists(path):
-                self._error_lbl.setText("Executable not found.")
-                return
-            label = self._app_label.text().strip() or label_for_app(path)
-            item_id = db.add_item(self.session_id, "app", path, label)
+            exe_path = self._selected_app["exe_path"]
+            label    = self._selected_app["name"]
+            item_id  = db.add_item(self.session_id, "app", exe_path, label)
 
         self.item_added.emit(item_id)
         self.accept()
