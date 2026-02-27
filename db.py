@@ -121,7 +121,10 @@ def add_item(session_id: int, item_type: str, path_or_url: str, label: str) -> i
             (session_id, item_type, path_or_url, label, now)
         )
         item_id = cur.lastrowid
-    touch_session(session_id)
+        # Touch in same connection
+        conn.execute(
+            "UPDATE sessions SET updated_at=? WHERE id=?", (now, session_id)
+        )
     return item_id
 
 
@@ -135,13 +138,18 @@ def get_items(session_id: int) -> list[dict]:
 
 
 def delete_item(item_id: int):
+    now = datetime.now().isoformat()
     with get_conn() as conn:
         row = conn.execute(
             "SELECT session_id FROM session_items WHERE id=?", (item_id,)
         ).fetchone()
         conn.execute("DELETE FROM session_items WHERE id=?", (item_id,))
         if row:
-            touch_session(row["session_id"])
+            # Update in the same connection to avoid nested-transaction lock
+            conn.execute(
+                "UPDATE sessions SET updated_at=? WHERE id=?",
+                (now, row["session_id"])
+            )
 
 
 def mark_item_opened(item_id: int):
