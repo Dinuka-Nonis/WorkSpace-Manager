@@ -1,22 +1,24 @@
 """
 ui/session_detail.py — Panel showing the items inside a session.
 
-Displayed when the user clicks a session card in the main window.
-Shows a list of items (file/url/app) with open and delete per item.
-Has a "Restore All" button and an "Add Item" button.
+Changes vs original:
+  - Restore runs in RestoreWorker QThread (GUI never freezes)
+  - Dedicated error banner (no longer hijacks the meta label)
+  - Inline label editing via double-click
+  - _on_url_changed duplicate definition removed
 """
 
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QFrame, QSizePolicy, QApplication
+    QScrollArea, QFrame, QSizePolicy, QApplication, QLineEdit
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread
 from PyQt6.QtGui import QPainter, QColor, QPainterPath, QFont
 
 import db
-import restore as restorer
+from restore import RestoreWorker
 from core.launcher import open_item, icon_for_item
 from ui.add_item_dialog import AddItemDialog
 from ui.styles import (
@@ -30,11 +32,12 @@ from ui.styles import (
 class ItemRow(QWidget):
     open_clicked   = pyqtSignal(int)   # item_id
     delete_clicked = pyqtSignal(int)   # item_id
+    label_changed  = pyqtSignal(int, str)  # item_id, new_label
 
     def __init__(self, item: dict, parent=None):
         super().__init__(parent)
-        self.item_id = item["id"]
-        self._item   = item
+        self.item_id  = item["id"]
+        self._item    = item
         self.setFixedHeight(56)
         self._hovered = False
         self.setMouseTracking(True)
@@ -46,35 +49,30 @@ class ItemRow(QWidget):
         layout.setSpacing(10)
 
         # Icon
-        icon = icon_for_item(item)
-        icon_lbl = QLabel(icon)
+        icon_lbl = QLabel(icon_for_item(item))
         icon_lbl.setFixedSize(32, 32)
         icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon_lbl.setStyleSheet(f"""
-            background: {SURFACE3};
-            border-radius: 8px;
-            font-size: 16px;
-        """)
+        icon_lbl.setStyleSheet(f"background: {SURFACE3}; border-radius: 8px; font-size: 16px;")
         layout.addWidget(icon_lbl)
 
-        # Label + path
+        # Label + path (label is double-click editable)
         text_col = QVBoxLayout()
         text_col.setSpacing(1)
 
-        name_lbl = QLabel(item["label"])
-        name_lbl.setStyleSheet(f"color: {TEXT}; font-size: 13px; font-weight: 600;")
-        name_lbl.setMaximumWidth(280)
-        name_lbl.setToolTip(item["path_or_url"])
-        text_col.addWidget(name_lbl)
+        self._name_lbl = QLabel(item["label"])
+        self._name_lbl.setStyleSheet(f"color: {TEXT}; font-size: 13px; font-weight: 600;")
+        self._name_lbl.setMaximumWidth(280)
+        self._name_lbl.setToolTip("Double-click to rename")
+        self._name_lbl.mouseDoubleClickEvent = lambda e: self._start_edit()
+        text_col.addWidget(self._name_lbl)
 
         path_lbl = QLabel(item["path_or_url"])
         path_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
         path_lbl.setMaximumWidth(280)
-        # Truncate display but keep full in tooltip
-        metrics_text = item["path_or_url"]
-        if len(metrics_text) > 55:
-            metrics_text = "…" + metrics_text[-52:]
-        path_lbl.setText(metrics_text)
+        display = item["path_or_url"]
+        if len(display) > 55:
+            display = "…" + display[-52:]
+        path_lbl.setText(display)
         path_lbl.setToolTip(item["path_or_url"])
         text_col.addWidget(path_lbl)
 
@@ -90,13 +88,10 @@ class ItemRow(QWidget):
             except Exception:
                 badge_text = "opened"
             badge = QLabel(badge_text)
-            badge.setStyleSheet(f"""
-                color: {MUTED};
-                background: {SURFACE3};
-                border-radius: 6px;
-                padding: 2px 8px;
-                font-size: 10px;
-            """)
+            badge.setStyleSheet(
+                f"color: {MUTED}; background: {SURFACE3}; border-radius: 6px; "
+                f"padding: 2px 8px; font-size: 10px;"
+            )
             layout.addWidget(badge)
 
         # Open button
@@ -104,16 +99,11 @@ class ItemRow(QWidget):
         open_btn.setFixedSize(60, 30)
         open_btn.setStyleSheet(f"""
             QPushButton {{
-                background: {ACCENT_010};
-                border: 1px solid {ACCENT};
-                border-radius: 7px;
-                color: {ACCENT2};
-                font-size: 12px;
-                font-weight: 600;
+                background: {ACCENT_010}; border: 1px solid {ACCENT};
+                border-radius: 7px; color: {ACCENT2};
+                font-size: 12px; font-weight: 600;
             }}
-            QPushButton:hover {{
-                background: {ACCENT_020};
-            }}
+            QPushButton:hover {{ background: {ACCENT_020}; }}
         """)
         open_btn.clicked.connect(lambda: self.open_clicked.emit(self.item_id))
         layout.addWidget(open_btn)
@@ -123,20 +113,47 @@ class ItemRow(QWidget):
         del_btn.setFixedSize(30, 30)
         del_btn.setStyleSheet(f"""
             QPushButton {{
-                background: transparent;
-                border: 1px solid {BORDER};
-                border-radius: 7px;
-                color: {MUTED};
-                font-size: 12px;
+                background: transparent; border: 1px solid {BORDER};
+                border-radius: 7px; color: {MUTED}; font-size: 12px;
             }}
             QPushButton:hover {{
                 background: rgba(248,113,113,0.15);
-                border-color: {RED};
-                color: {RED};
+                border-color: {RED}; color: {RED};
             }}
         """)
         del_btn.clicked.connect(lambda: self.delete_clicked.emit(self.item_id))
         layout.addWidget(del_btn)
+
+    def _start_edit(self):
+        """Replace the name label with an inline QLineEdit."""
+        current = self._name_lbl.text()
+        self._name_lbl.hide()
+        editor = QLineEdit(current, self._name_lbl.parent())
+        editor.setStyleSheet(f"""
+            QLineEdit {{
+                background: {SURFACE3}; border: 1px solid {ACCENT};
+                border-radius: 5px; color: {TEXT}; font-size: 13px;
+                font-weight: 600; padding: 1px 4px;
+            }}
+        """)
+        editor.setFixedWidth(260)
+        # Place the editor where the label was
+        pos = self._name_lbl.mapToParent(self._name_lbl.rect().topLeft())
+        editor.move(pos)
+        editor.show()
+        editor.setFocus()
+        editor.selectAll()
+
+        def _commit():
+            new_label = editor.text().strip() or current
+            editor.deleteLater()
+            self._name_lbl.setText(new_label)
+            self._name_lbl.show()
+            if new_label != current:
+                self.label_changed.emit(self.item_id, new_label)
+
+        editor.editingFinished.connect(_commit)
+        editor.returnPressed.connect(_commit)
 
     def enterEvent(self, e):
         self._hovered = True
@@ -151,25 +168,19 @@ class ItemRow(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         path = QPainterPath()
         path.addRoundedRect(0, 0, self.width(), self.height(), 10, 10)
-        if self._hovered:
-            p.fillPath(path, QColor(SURFACE3))
-        else:
-            p.fillPath(path, QColor(SURFACE2))
+        p.fillPath(path, QColor(SURFACE3 if self._hovered else SURFACE2))
 
 
-# ── Type section header ───────────────────────────────────────────────────────
+# ── Section header ────────────────────────────────────────────────────────────
 
 class SectionHeader(QLabel):
     def __init__(self, label: str, parent=None):
         super().__init__(label, parent)
         self.setFixedHeight(28)
-        self.setStyleSheet(f"""
-            color: {MUTED};
-            font-size: 10px;
-            font-weight: 700;
-            letter-spacing: 2px;
-            padding-left: 4px;
-        """)
+        self.setStyleSheet(
+            f"color: {MUTED}; font-size: 10px; font-weight: 700; "
+            f"letter-spacing: 2px; padding-left: 4px;"
+        )
 
 
 # ── Empty state ───────────────────────────────────────────────────────────────
@@ -201,11 +212,13 @@ class EmptyState(QWidget):
 
 class SessionDetailPanel(QWidget):
     closed          = pyqtSignal()
-    session_changed = pyqtSignal()   # something was added/deleted
+    session_changed = pyqtSignal()
 
     def __init__(self, session_id: int, parent=None):
         super().__init__(parent)
         self.session_id = session_id
+        self._restore_thread: QThread | None = None
+        self._restore_worker = None
         self._restore_feedback_timer = QTimer(self)
         self._restore_feedback_timer.setSingleShot(True)
         self._restore_feedback_timer.timeout.connect(self._reset_restore_btn)
@@ -225,11 +238,9 @@ class SessionDetailPanel(QWidget):
         self._icon_lbl = QLabel("")
         self._icon_lbl.setFixedSize(44, 44)
         self._icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._icon_lbl.setStyleSheet(f"""
-            background: {ACCENT_010};
-            border-radius: 12px;
-            font-size: 22px;
-        """)
+        self._icon_lbl.setStyleSheet(
+            f"background: {ACCENT_010}; border-radius: 12px; font-size: 22px;"
+        )
         header.addWidget(self._icon_lbl)
 
         title_col = QVBoxLayout()
@@ -252,7 +263,19 @@ class SessionDetailPanel(QWidget):
         header.addWidget(back_btn)
 
         layout.addLayout(header)
-        layout.addSpacing(20)
+        layout.addSpacing(8)
+
+        # ── Error banner (hidden until needed) ──
+        self._error_banner = QLabel("")
+        self._error_banner.setStyleSheet(
+            f"color: {RED}; background: rgba(248,113,113,0.10); "
+            f"border: 1px solid rgba(248,113,113,0.3); border-radius: 8px; "
+            f"padding: 6px 12px; font-size: 12px;"
+        )
+        self._error_banner.setWordWrap(True)
+        self._error_banner.hide()
+        layout.addWidget(self._error_banner)
+        layout.addSpacing(12)
 
         # ── Action bar ──
         actions = QHBoxLayout()
@@ -291,7 +314,6 @@ class SessionDetailPanel(QWidget):
         layout.addWidget(scroll)
 
     def refresh(self):
-        """Reload data from DB and rebuild the item list."""
         session = db.get_session(self.session_id)
         if not session:
             return
@@ -301,12 +323,12 @@ class SessionDetailPanel(QWidget):
 
         stats = db.get_session_stats(self.session_id)
         parts = []
-        if stats["files"]:  parts.append(f"{stats['files']} file{'s' if stats['files'] != 1 else ''}")
-        if stats["urls"]:   parts.append(f"{stats['urls']} URL{'s' if stats['urls'] != 1 else ''}")
-        if stats["apps"]:   parts.append(f"{stats['apps']} app{'s' if stats['apps'] != 1 else ''}")
+        if stats["files"]: parts.append(f"{stats['files']} file{'s' if stats['files'] != 1 else ''}")
+        if stats["urls"]:  parts.append(f"{stats['urls']} URL{'s' if stats['urls'] != 1 else ''}")
+        if stats["apps"]:  parts.append(f"{stats['apps']} app{'s' if stats['apps'] != 1 else ''}")
         self._meta_lbl.setText("  ·  ".join(parts) if parts else "Empty session")
 
-        # Clear existing rows (preserve the trailing stretch)
+        # Clear existing rows (keep trailing stretch)
         while self._list_layout.count() > 1:
             item = self._list_layout.takeAt(0)
             if item.widget():
@@ -314,11 +336,9 @@ class SessionDetailPanel(QWidget):
 
         items = stats["items"]
         if not items:
-            empty = EmptyState()
-            self._list_layout.insertWidget(0, empty)
+            self._list_layout.insertWidget(0, EmptyState())
             return
 
-        # Group by type
         groups = {"file": [], "url": [], "app": []}
         for it in items:
             groups[it["type"]].append(it)
@@ -329,18 +349,15 @@ class SessionDetailPanel(QWidget):
             grp = groups[gtype]
             if not grp:
                 continue
-
-            header = SectionHeader(group_labels[gtype])
-            self._list_layout.insertWidget(idx, header)
+            self._list_layout.insertWidget(idx, SectionHeader(group_labels[gtype]))
             idx += 1
-
             for item in grp:
                 row = ItemRow(item)
                 row.open_clicked.connect(self._open_single)
                 row.delete_clicked.connect(self._delete_item)
+                row.label_changed.connect(self._rename_item)
                 self._list_layout.insertWidget(idx, row)
                 idx += 1
-
             spacer = QWidget()
             spacer.setFixedHeight(8)
             self._list_layout.insertWidget(idx, spacer)
@@ -366,21 +383,40 @@ class SessionDetailPanel(QWidget):
             db.mark_item_opened(item_id)
             self.refresh()
         else:
-            # Show error briefly in meta label
-            self._meta_lbl.setText(f"⚠ Could not open: {err}")
-            QTimer.singleShot(3000, self.refresh)
+            self._show_error(f"Could not open: {err}")
 
     def _delete_item(self, item_id: int):
         db.delete_item(item_id)
         self.refresh()
         self.session_changed.emit()
 
+    def _rename_item(self, item_id: int, new_label: str):
+        db.update_item_label(item_id, new_label)
+        self.session_changed.emit()
+
     def _restore_all(self):
+        """Launch restore in a background QThread to keep the UI responsive."""
+        if self._restore_thread and self._restore_thread.isRunning():
+            return  # already running
+
         self._restore_btn.setEnabled(False)
         self._restore_btn.setText("Opening…")
+        self._hide_error()
 
-        results = restorer.restore_session(self.session_id)
+        self._restore_thread = QThread(self)
+        self._restore_worker = RestoreWorker(self.session_id)
+        self._restore_worker.moveToThread(self._restore_thread)
 
+        self._restore_thread.started.connect(self._restore_worker.run)
+        self._restore_worker.finished.connect(self._on_restore_done)
+        self._restore_worker.finished.connect(self._restore_thread.quit)
+        self._restore_worker.progress.connect(
+            lambda label: self._restore_btn.setText(f"Opening {label}…")
+        )
+
+        self._restore_thread.start()
+
+    def _on_restore_done(self, results: dict):
         opened = results["opened"]
         total  = results["total"]
         failed = results["failed"]
@@ -389,45 +425,42 @@ class SessionDetailPanel(QWidget):
             self._restore_btn.setText(f"✓  Opened {opened}")
             self._restore_btn.setStyleSheet(f"""
                 QPushButton {{
-                    background: rgba(74,222,128,0.15);
-                    border: 1px solid {GREEN};
-                    color: {GREEN};
-                    border-radius: 10px;
-                    font-weight: 700;
-                    padding: 9px 22px;
+                    background: rgba(74,222,128,0.15); border: 1px solid {GREEN};
+                    color: {GREEN}; border-radius: 10px;
+                    font-weight: 700; padding: 9px 22px;
                 }}
             """)
         else:
             self._restore_btn.setText(f"⚠  {opened}/{total} opened")
             self._restore_btn.setStyleSheet(f"""
                 QPushButton {{
-                    background: rgba(251,191,36,0.15);
-                    border: 1px solid {AMBER};
-                    color: {AMBER};
-                    border-radius: 10px;
-                    font-weight: 700;
-                    padding: 9px 22px;
+                    background: rgba(251,191,36,0.15); border: 1px solid {AMBER};
+                    color: {AMBER}; border-radius: 10px;
+                    font-weight: 700; padding: 9px 22px;
                 }}
             """)
+            self._show_error("\n".join(results["errors"]))
 
         self.refresh()
         self._restore_feedback_timer.start(3000)
 
     def _reset_restore_btn(self):
         self._restore_btn.setText("▶  Restore All")
-        self._restore_btn.setObjectName("accentBtn")
-        self._restore_btn.setStyleSheet("")  # revert to stylesheet
-        # Re-apply the object name style
         self._restore_btn.setStyleSheet(f"""
             QPushButton {{
-                background: {ACCENT};
-                border: none;
-                color: white;
-                font-weight: 700;
-                border-radius: 10px;
-                padding: 9px 22px;
+                background: {ACCENT}; border: none; color: white;
+                font-weight: 700; border-radius: 10px; padding: 9px 22px;
             }}
             QPushButton:hover {{ background: {ACCENT2}; }}
             QPushButton:pressed {{ background: {ACCENT_DIM}; }}
         """)
         self._restore_btn.setEnabled(True)
+
+    def _show_error(self, msg: str):
+        self._error_banner.setText(f"⚠  {msg}")
+        self._error_banner.show()
+        QTimer.singleShot(6000, self._hide_error)
+
+    def _hide_error(self):
+        self._error_banner.hide()
+        self._error_banner.setText("")
