@@ -1,19 +1,17 @@
 """
 ui/main_window.py — Main window: session card grid + inline detail panel.
 
-Changes vs original:
-  - SessionCard "Restore All" button actually restores (not navigates)
-  - Search bar filters the session grid
-  - _load_sessions uses get_all_session_stats() → single DB query
-  - Drag-to-move removed from QMainWindow (it has a native title bar)
+Layout:
+  Left  — sidebar (logo, nav, create button)
+  Right — either the session card grid OR the SessionDetailPanel
 """
 
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QScrollArea, QFrame, QSizePolicy,
-    QInputDialog, QLineEdit, QMessageBox, QApplication, QThread
+    QPushButton, QScrollArea, QFrame, QGraphicsDropShadowEffect,
+    QSizePolicy, QInputDialog, QLineEdit, QMessageBox, QApplication
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer
 from PyQt6.QtGui import (
@@ -21,7 +19,6 @@ from PyQt6.QtGui import (
 )
 
 import db
-from restore import RestoreWorker
 from ui.session_detail import SessionDetailPanel
 from ui.styles import (
     BG, SURFACE, SURFACE2, SURFACE3, BORDER, ACCENT, ACCENT2, ACCENT_DIM,
@@ -45,7 +42,7 @@ class ToastNotification(QWidget):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.hide)
         self._icon = ""
-        self._msg  = ""
+        self._msg = ""
 
     def show_toast(self, icon: str, msg: str, duration=2500):
         self._icon = icon
@@ -67,21 +64,20 @@ class ToastNotification(QWidget):
         p.drawPath(path)
         p.setPen(QColor(TEXT))
         p.setFont(QFont("Segoe UI Variable", 12))
-        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, f"  {self._icon}  {self._msg}")
+        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
+                   f"  {self._icon}  {self._msg}")
 
 
 # ── Session card ──────────────────────────────────────────────────────────────
 
 class SessionCard(QWidget):
-    open_detail    = pyqtSignal(int)   # session_id — navigate to detail view
+    clicked        = pyqtSignal(int)   # session_id
     delete_clicked = pyqtSignal(int)   # session_id
-    restore_done   = pyqtSignal(str)   # toast message
 
     def __init__(self, session: dict, stats: dict, parent=None):
         super().__init__(parent)
         self.session_id = session["id"]
         self._hovered   = False
-        self._restore_thread: QThread | None = None
         self.setFixedHeight(170)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setMouseTracking(True)
@@ -99,9 +95,11 @@ class SessionCard(QWidget):
         icon_w = QLabel(session.get("icon", "🗂"))
         icon_w.setFixedSize(40, 40)
         icon_w.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon_w.setStyleSheet(
-            f"background: {ACCENT_010}; border-radius: 10px; font-size: 20px;"
-        )
+        icon_w.setStyleSheet(f"""
+            background: {ACCENT_010};
+            border-radius: 10px;
+            font-size: 20px;
+        """)
         top.addWidget(icon_w)
 
         title_col = QVBoxLayout()
@@ -132,7 +130,8 @@ class SessionCard(QWidget):
                 color: {MUTED2}; font-size: 12px; border-radius: 6px;
             }}
             QPushButton:hover {{
-                background: rgba(248,113,113,0.15); color: {RED};
+                background: rgba(248,113,113,0.15);
+                color: {RED};
             }}
         """)
         del_btn.clicked.connect(lambda: self.delete_clicked.emit(self.session_id))
@@ -142,6 +141,7 @@ class SessionCard(QWidget):
         # ── Stats chips ──
         chips = QHBoxLayout()
         chips.setSpacing(6)
+        chips.setContentsMargins(0, 0, 0, 0)
         chip_data = []
         if stats["files"]: chip_data.append(f"📄 {stats['files']}")
         if stats["urls"]:  chip_data.append(f"🌐 {stats['urls']}")
@@ -149,24 +149,28 @@ class SessionCard(QWidget):
 
         for text in chip_data:
             chip = QLabel(text)
-            chip.setStyleSheet(
-                f"background: {SURFACE3}; border-radius: 6px; padding: 3px 9px; "
-                f"font-size: 11px; color: {MUTED}; font-weight: 600;"
-            )
+            chip.setStyleSheet(f"""
+                background: {SURFACE3};
+                border-radius: 6px;
+                padding: 3px 9px;
+                font-size: 11px;
+                color: {MUTED};
+                font-weight: 600;
+            """)
             chips.addWidget(chip)
 
         if not chip_data:
             empty_chip = QLabel("Empty")
             empty_chip.setStyleSheet(
-                f"background: {SURFACE3}; border-radius: 6px; padding: 3px 9px; "
-                f"font-size: 11px; color: {MUTED2};"
+                f"background: {SURFACE3}; border-radius: 6px; "
+                f"padding: 3px 9px; font-size: 11px; color: {MUTED2};"
             )
             chips.addWidget(empty_chip)
 
         chips.addStretch()
         layout.addLayout(chips)
 
-        # ── Hint / description ──
+        # ── Description ──
         desc = session.get("description", "")
         if desc:
             desc_lbl = QLabel(desc)
@@ -184,74 +188,26 @@ class SessionCard(QWidget):
 
         layout.addStretch()
 
-        # ── Bottom: Open + Restore buttons ──
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
-
-        open_btn = QPushButton("Open")
-        open_btn.setFixedHeight(30)
-        open_btn.setStyleSheet(f"""
+        # ── Bottom: Restore button ──
+        restore_btn = QPushButton("▶  Restore All")
+        restore_btn.setFixedHeight(30)
+        restore_btn.setStyleSheet(f"""
             QPushButton {{
-                background: {SURFACE3}; border: 1px solid {BORDER};
-                border-radius: 7px; color: {TEXT};
-                font-size: 12px; font-weight: 600;
-            }}
-            QPushButton:hover {{ background: {BORDER}; }}
-        """)
-        open_btn.clicked.connect(lambda: self.open_detail.emit(self.session_id))
-        btn_row.addWidget(open_btn)
-
-        self._restore_btn = QPushButton("▶  Restore")
-        self._restore_btn.setFixedHeight(30)
-        self._restore_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {ACCENT_010}; border: 1px solid {ACCENT};
-                border-radius: 7px; color: {ACCENT2};
-                font-size: 12px; font-weight: 600;
+                background: {ACCENT_010};
+                border: 1px solid {ACCENT};
+                border-radius: 7px;
+                color: {ACCENT2};
+                font-size: 12px;
+                font-weight: 600;
             }}
             QPushButton:hover {{ background: {ACCENT_020}; }}
         """)
-        self._restore_btn.clicked.connect(self._do_restore)
-        btn_row.addWidget(self._restore_btn)
-
-        layout.addLayout(btn_row)
-
-    def _do_restore(self):
-        """Restore directly from the card, without navigating to detail."""
-        if self._restore_thread and self._restore_thread.isRunning():
-            return
-        self._restore_btn.setEnabled(False)
-        self._restore_btn.setText("…")
-
-        self._restore_thread = QThread(self)
-        worker = RestoreWorker(self.session_id)
-        worker.moveToThread(self._restore_thread)
-        self._restore_thread.started.connect(worker.run)
-
-        def _done(results):
-            self._restore_thread.quit()
-            opened = results["opened"]
-            total  = results["total"]
-            failed = results["failed"]
-            if failed == 0:
-                self.restore_done.emit(f"✓ Restored {opened} item{'s' if opened != 1 else ''}")
-                self._restore_btn.setText("✓")
-            else:
-                self.restore_done.emit(f"⚠ {opened}/{total} restored")
-                self._restore_btn.setText("⚠")
-            QTimer.singleShot(2000, self._reset_restore_btn)
-
-        worker.finished.connect(_done)
-        worker.finished.connect(self._restore_thread.quit)
-        self._restore_thread.start()
-
-    def _reset_restore_btn(self):
-        self._restore_btn.setText("▶  Restore")
-        self._restore_btn.setEnabled(True)
+        restore_btn.clicked.connect(lambda: self.clicked.emit(self.session_id))
+        layout.addWidget(restore_btn)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
-            self.open_detail.emit(self.session_id)
+            self.clicked.emit(self.session_id)
 
     def enterEvent(self, e):
         self._hovered = True
@@ -266,8 +222,12 @@ class SessionCard(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         path = QPainterPath()
         path.addRoundedRect(0, 0, self.width(), self.height(), 14, 14)
-        p.fillPath(path, QColor(SURFACE3 if self._hovered else SURFACE2))
-        p.setPen(QPen(QColor(ACCENT if self._hovered else BORDER), 1))
+
+        bg_color = QColor(SURFACE2) if not self._hovered else QColor(SURFACE3)
+        p.fillPath(path, bg_color)
+
+        border_color = QColor(ACCENT) if self._hovered else QColor(BORDER)
+        p.setPen(QPen(border_color, 1))
         p.drawPath(path)
 
 
@@ -323,6 +283,7 @@ class Sidebar(QWidget):
         layout.addLayout(logo_row)
         layout.addSpacing(32)
 
+        # Nav label
         nav_lbl = QLabel("SESSIONS")
         nav_lbl.setStyleSheet(
             f"color: {MUTED}; font-size: 10px; font-weight: 700; letter-spacing: 2px;"
@@ -330,18 +291,21 @@ class Sidebar(QWidget):
         layout.addWidget(nav_lbl)
         layout.addSpacing(8)
 
+        # Sessions count
         self._count_lbl = QLabel("0 sessions")
         self._count_lbl.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
         layout.addWidget(self._count_lbl)
 
         layout.addStretch()
 
+        # Divider
         div = QFrame()
         div.setFrameShape(QFrame.Shape.HLine)
         div.setStyleSheet(f"background: {BORDER}; max-height: 1px;")
         layout.addWidget(div)
         layout.addSpacing(16)
 
+        # Create button
         create_btn = QPushButton("＋  New Session")
         create_btn.setObjectName("accentBtn")
         create_btn.setFixedHeight(40)
@@ -361,6 +325,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(900, 600)
         self.resize(1100, 700)
         self._detail_panel = None
+
         self._toast = ToastNotification()
         self._build()
         self._load_sessions()
@@ -374,15 +339,18 @@ class MainWindow(QMainWindow):
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(0)
 
+        # Sidebar
         self._sidebar = Sidebar()
         self._sidebar.create_clicked.connect(self._create_session)
         h.addWidget(self._sidebar)
 
+        # Vertical divider
         div = QFrame()
         div.setFrameShape(QFrame.Shape.VLine)
         div.setStyleSheet(f"background: {BORDER}; max-width: 1px;")
         h.addWidget(div)
 
+        # Content area (stacked: grid OR detail)
         self._content = QWidget()
         self._content.setStyleSheet(f"background: {BG};")
         self._content_layout = QVBoxLayout(self._content)
@@ -390,6 +358,7 @@ class MainWindow(QMainWindow):
         self._content_layout.setSpacing(0)
         h.addWidget(self._content, 1)
 
+        # Grid page
         self._grid_page = self._build_grid_page()
         self._content_layout.addWidget(self._grid_page)
 
@@ -400,7 +369,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(32, 28, 32, 28)
         layout.setSpacing(0)
 
-        # Header + search
+        # Page header
         header = QHBoxLayout()
         title = QLabel("Sessions")
         title.setStyleSheet(
@@ -408,25 +377,10 @@ class MainWindow(QMainWindow):
         )
         header.addWidget(title)
         header.addStretch()
-
-        self._search = QLineEdit()
-        self._search.setPlaceholderText("🔍  Search sessions…")
-        self._search.setFixedWidth(220)
-        self._search.setFixedHeight(34)
-        self._search.setStyleSheet(f"""
-            QLineEdit {{
-                background: {SURFACE2}; border: 1px solid {BORDER};
-                border-radius: 8px; color: {TEXT};
-                font-size: 13px; padding: 0 12px;
-            }}
-            QLineEdit:focus {{ border-color: {ACCENT}; }}
-        """)
-        self._search.textChanged.connect(self._filter_sessions)
-        header.addWidget(self._search)
-
         layout.addLayout(header)
         layout.addSpacing(24)
 
+        # Scrollable card grid
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -447,7 +401,8 @@ class MainWindow(QMainWindow):
 
     # ── Data loading ──
 
-    def _load_sessions(self, filter_text: str = ""):
+    def _load_sessions(self):
+        # Clear existing cards
         while self._grid_layout.count() > 1:
             item = self._grid_layout.takeAt(0)
             if item.widget():
@@ -456,28 +411,17 @@ class MainWindow(QMainWindow):
         sessions = db.get_all_sessions()
         self._sidebar.set_count(len(sessions))
 
-        if filter_text:
-            q = filter_text.lower()
-            sessions = [s for s in sessions if q in s["name"].lower()
-                        or q in (s.get("description") or "").lower()]
-
         if not sessions:
-            self._grid_layout.insertWidget(0, GridEmptyState())
+            empty = GridEmptyState()
+            self._grid_layout.insertWidget(0, empty)
             return
 
-        # Single query for all stats
-        all_stats = db.get_all_session_stats()
-
         for i, session in enumerate(sessions):
-            stats = all_stats.get(session["id"], {"total": 0, "files": 0, "urls": 0, "apps": 0})
+            stats = db.get_session_stats(session["id"])
             card = SessionCard(session, stats)
-            card.open_detail.connect(self._open_detail)
+            card.clicked.connect(self._open_detail)
             card.delete_clicked.connect(self._delete_session)
-            card.restore_done.connect(lambda msg: self._toast.show_toast("", msg))
             self._grid_layout.insertWidget(i, card)
-
-    def _filter_sessions(self, text: str):
-        self._load_sessions(filter_text=text)
 
     # ── Session actions ──
 
@@ -490,6 +434,7 @@ class MainWindow(QMainWindow):
             session_id = db.create_session(name.strip())
             self._load_sessions()
             self._toast.show_toast("✓", f'Session "{name.strip()}" created')
+            # Immediately open the new session
             self._open_detail(session_id)
 
     def _delete_session(self, session_id: int):
@@ -509,9 +454,11 @@ class MainWindow(QMainWindow):
 
     def _open_detail(self, session_id: int):
         self._close_detail()
+
         panel = SessionDetailPanel(session_id)
         panel.closed.connect(self._close_detail)
         panel.session_changed.connect(self._load_sessions)
+
         self._detail_panel = panel
         self._grid_page.hide()
         self._content_layout.addWidget(panel)
@@ -523,3 +470,14 @@ class MainWindow(QMainWindow):
             self._detail_panel = None
         self._grid_page.show()
         self._load_sessions()
+
+    # ── Drag to move (frameless-friendly) ──
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = e.globalPosition().toPoint()
+
+    def mouseMoveEvent(self, e):
+        if e.buttons() == Qt.MouseButton.LeftButton and hasattr(self, "_drag_pos"):
+            self.move(self.pos() + e.globalPosition().toPoint() - self._drag_pos)
+            self._drag_pos = e.globalPosition().toPoint()

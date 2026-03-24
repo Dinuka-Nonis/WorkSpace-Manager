@@ -195,8 +195,6 @@ QMenu::separator {{
     margin: 4px 8px;
 }}
 
-/* ── QSystemTrayIcon (no style needed directly) ── */
-
 /* ── QToolTip ── */
 QToolTip {{
     background: {SURFACE};

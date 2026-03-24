@@ -58,53 +58,6 @@ def start_hotkey_listener(window: MainWindow):
     t.start()
 
 
-# ── Daemon + Spotlight wiring ─────────────────────────────────────────────────
-
-def start_daemon(window: MainWindow):
-    """
-    Initialise and start the virtual-desktop daemon.
-    Wire its new_desktop_detected signal → Spotlight prompt.
-    Only runs on Windows where pyvda is available.
-    """
-    try:
-        from daemon import WorkSpaceDaemon
-        from ui.spotlight import SpotlightPrompt
-
-        daemon = WorkSpaceDaemon()
-
-        _active_spotlights: dict[str, SpotlightPrompt] = {}
-
-        def _show_spotlight(desktop_id: str):
-            if desktop_id in _active_spotlights:
-                return   # already showing for this desktop
-            prompt = SpotlightPrompt(desktop_id)
-
-            def _on_confirmed(session_id: int, did: str):
-                daemon.register_session(session_id, did)
-                _active_spotlights.pop(did, None)
-                window._load_sessions()
-
-            def _on_dismissed():
-                _active_spotlights.pop(desktop_id, None)
-
-            prompt.confirmed.connect(_on_confirmed)
-            prompt.dismissed.connect(_on_dismissed)
-            _active_spotlights[desktop_id] = prompt
-            prompt.show()
-            prompt.raise_()
-            prompt.activateWindow()
-
-        daemon.new_desktop_detected.connect(_show_spotlight)
-        daemon.snapshot_saved.connect(lambda sid: window._load_sessions())
-        daemon.start()
-
-        return daemon
-
-    except Exception as e:
-        print(f"[Daemon] Could not start: {e}")
-        return None
-
-
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
@@ -145,7 +98,6 @@ def main():
     tray.show()
 
     start_hotkey_listener(window)
-    _daemon = start_daemon(window)   # keep reference alive
 
     sys.exit(app.exec())
 
