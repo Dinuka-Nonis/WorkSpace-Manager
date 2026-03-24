@@ -160,7 +160,7 @@ class DropZone(QWidget):
 
         if self._hovering:
             p.fillPath(path, QColor(ACCENT_LIGHT))
-            pen = QPen(QColor(ACCENT), 2, Qt.PenStyle.DashLine)
+            pen = QPen(QColor(0,0,0,60), 1, Qt.PenStyle.DashLine)
         else:
             p.fillPath(path, QColor(SURFACE2))
             pen = QPen(QColor(BORDER), 1.5, Qt.PenStyle.DashLine)
@@ -254,9 +254,9 @@ class AddItemDialog(QDialog):
         # Tabs
         tabs_row = QHBoxLayout()
         tabs_row.setSpacing(8)
-        self._tab_file = TabBtn("📄  File",    "#6c63ff")
-        self._tab_url  = TabBtn("🌐  Website", "#10b981")
-        self._tab_app  = TabBtn("⚙️  App",     "#f59e0b")
+        self._tab_file = TabBtn("📄  File",    "#1A1A1A")
+        self._tab_url  = TabBtn("🌐  Website", "#1A1A1A")
+        self._tab_app  = TabBtn("⚙️  App",     "#1A1A1A")
         for btn in (self._tab_file, self._tab_url, self._tab_app):
             tabs_row.addWidget(btn)
         tabs_row.addStretch()
@@ -409,7 +409,7 @@ class AddItemDialog(QDialog):
 
     def _on_apps_error(self, msg: str):
         self._app_loading.setText("⚠ Could not load apps — use Browse .exe…")
-        self._app_loading.setStyleSheet(f"color: {RED}; font-size: 11px;")
+        self._app_loading.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
 
     def _filter_apps(self, query: str):
         if not self._all_apps:
@@ -457,8 +457,8 @@ class AddItemDialog(QDialog):
             self._app_selected_lbl.setText(f"✓  {a['name']}")
             r.setStyleSheet(f"""
                 QWidget {{
-                    background: {ACCENT_LIGHT};
-                    border: 1.5px solid {ACCENT}44;
+                    background: rgba(0,0,0,0.05);
+                    border: 1px solid rgba(0,0,0,0.10);
                     border-radius: 9px;
                 }}
             """)

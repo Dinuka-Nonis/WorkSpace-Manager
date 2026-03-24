@@ -1,6 +1,6 @@
 """
 ui/session_detail.py — Session detail panel.
-Uiverse-inspired: white glass cards, gradient accents, soft shadows.
+Minimal design: neutral palette, clean list rows, no color accents.
 """
 
 from datetime import datetime
@@ -10,21 +10,22 @@ from PyQt6.QtWidgets import (
     QScrollArea, QFrame, QGraphicsDropShadowEffect, QApplication
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
-from PyQt6.QtGui import QPainter, QColor, QPainterPath, QFont, QLinearGradient, QPen
+from PyQt6.QtGui import QPainter, QColor, QPainterPath, QFont, QPen
 
 import db
 import restore as restorer
 from core.launcher import open_item, icon_for_item
 from ui.add_item_dialog import AddItemDialog
 from ui.styles import (
-    BG, SURFACE, SURFACE2, SURFACE3, GLASS, BORDER,
-    ACCENT, ACCENT2, ACCENT3, ACCENT_LIGHT, ACCENT_MED,
-    GRAD_START, GRAD_END, TEXT, TEXT2, MUTED, MUTED2,
-    GREEN, GREEN_BG, AMBER, AMBER_BG, RED, RED_BG, SHADOW_SM, SHADOW_MD
+    BG, SURFACE, SURFACE2, SURFACE3, BORDER,
+    ACCENT, ACCENT2, ACCENT3, ACCENT_LIGHT,
+    TEXT, TEXT2, MUTED, MUTED2,
+    GREEN, GREEN_BG, AMBER, AMBER_BG, RED, RED_BG,
+    SHADOW_SM
 )
 
 
-def _shadow(widget, radius=16, color=SHADOW_SM, dy=3):
+def _shadow(widget, radius=12, color=SHADOW_SM, dy=2):
     fx = QGraphicsDropShadowEffect(widget)
     fx.setBlurRadius(radius)
     fx.setColor(QColor(color))
@@ -35,21 +36,21 @@ def _shadow(widget, radius=16, color=SHADOW_SM, dy=3):
 # ── Stat badge ────────────────────────────────────────────────────────────────
 
 class StatBadge(QWidget):
-    def __init__(self, icon: str, count: int, label: str, color: str, parent=None):
+    def __init__(self, icon: str, count: int, label: str, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(64)
+        self.setFixedHeight(56)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(14, 10, 14, 10)
         layout.setSpacing(10)
 
         icon_lbl = QLabel(icon)
-        icon_lbl.setFixedSize(36, 36)
+        icon_lbl.setFixedSize(30, 30)
         icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         icon_lbl.setStyleSheet(f"""
-            background: {color}18;
-            border: 1.5px solid {color}33;
-            border-radius: 10px;
-            font-size: 18px;
+            background: {SURFACE2};
+            border: 1px solid {BORDER};
+            border-radius: 8px;
+            font-size: 14px;
         """)
         layout.addWidget(icon_lbl)
 
@@ -57,11 +58,11 @@ class StatBadge(QWidget):
         text_col.setSpacing(1)
         count_lbl = QLabel(str(count))
         count_lbl.setStyleSheet(
-            f"color: {color}; font-size: 18px; font-weight: 800;"
+            f"color: {TEXT}; font-size: 16px; font-weight: 700;"
         )
         text_col.addWidget(count_lbl)
         label_lbl = QLabel(label)
-        label_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        label_lbl.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
         text_col.addWidget(label_lbl)
         layout.addLayout(text_col)
         layout.addStretch()
@@ -69,11 +70,10 @@ class StatBadge(QWidget):
         self.setStyleSheet(f"""
             QWidget {{
                 background: {SURFACE};
-                border: 1.5px solid {color}22;
-                border-radius: 14px;
+                border: 1px solid {BORDER};
+                border-radius: 10px;
             }}
         """)
-        _shadow(self, radius=12, color=SHADOW_SM, dy=2)
 
 
 # ── Item row ──────────────────────────────────────────────────────────────────
@@ -82,38 +82,38 @@ class ItemRow(QWidget):
     open_clicked   = pyqtSignal(int)
     delete_clicked = pyqtSignal(int)
 
-    TYPE_COLORS = {
-        "file": "#6c63ff",
-        "url":  "#10b981",
-        "app":  "#f59e0b",
+    TYPE_ICONS_BG = {
+        "file": SURFACE2,
+        "url":  SURFACE2,
+        "app":  SURFACE2,
     }
 
     def __init__(self, item: dict, parent=None):
         super().__init__(parent)
         self.item_id = item["id"]
         self._item   = item
-        self.setFixedHeight(60)
+        self.setFixedHeight(58)
         self._hovered = False
         self.setMouseTracking(True)
+        self._del_btn = None
         self._build(item)
 
     def _build(self, item: dict):
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setContentsMargins(16, 0, 12, 0)
         layout.setSpacing(12)
 
-        color = self.TYPE_COLORS.get(item["type"], ACCENT)
-        icon  = icon_for_item(item)
+        icon = icon_for_item(item)
 
-        # Icon pill
+        # Icon
         icon_lbl = QLabel(icon)
-        icon_lbl.setFixedSize(34, 34)
+        icon_lbl.setFixedSize(30, 30)
         icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         icon_lbl.setStyleSheet(f"""
-            background: {color}18;
-            border: 1.5px solid {color}33;
-            border-radius: 9px;
-            font-size: 16px;
+            background: {SURFACE2};
+            border: 1px solid {BORDER};
+            border-radius: 8px;
+            font-size: 14px;
         """)
         layout.addWidget(icon_lbl)
 
@@ -121,14 +121,12 @@ class ItemRow(QWidget):
         text_col = QVBoxLayout()
         text_col.setSpacing(2)
         name_lbl = QLabel(item["label"])
-        name_lbl.setStyleSheet(
-            f"color: {TEXT}; font-size: 13px; font-weight: 600;"
-        )
-        name_lbl.setMaximumWidth(340)
+        name_lbl.setStyleSheet(f"color: {TEXT}; font-size: 13px; font-weight: 500;")
+        name_lbl.setMaximumWidth(380)
         text_col.addWidget(name_lbl)
 
         path = item["path_or_url"]
-        short = ("…" + path[-50:]) if len(path) > 53 else path
+        short = ("…" + path[-52:]) if len(path) > 55 else path
         path_lbl = QLabel(short)
         path_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
         path_lbl.setToolTip(path)
@@ -136,94 +134,95 @@ class ItemRow(QWidget):
         layout.addLayout(text_col)
         layout.addStretch()
 
-        # Last opened chip
+        # Last opened
         last = item.get("last_opened_at")
         if last:
             try:
                 dt = datetime.fromisoformat(last)
                 badge_txt = dt.strftime("%b %d")
             except Exception:
-                badge_txt = "opened"
-            badge = QLabel(f"🕐 {badge_txt}")
+                badge_txt = "—"
+            badge = QLabel(badge_txt)
             badge.setStyleSheet(f"""
                 color: {MUTED};
-                background: {SURFACE3};
-                border-radius: 8px;
-                padding: 2px 8px;
                 font-size: 10px;
-                font-weight: 600;
+                padding: 2px 7px;
+                background: {SURFACE2};
+                border: 1px solid {BORDER};
+                border-radius: 5px;
             """)
             layout.addWidget(badge)
 
         # Open button
         open_btn = QPushButton("Open")
-        open_btn.setFixedSize(62, 30)
+        open_btn.setFixedSize(56, 28)
         open_btn.setStyleSheet(f"""
             QPushButton {{
-                background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
-                    stop:0 {GRAD_START}, stop:1 {GRAD_END});
-                border: none; border-radius: 8px;
-                color: white; font-size: 12px; font-weight: 700;
+                background: {ACCENT};
+                border: none;
+                border-radius: 7px;
+                color: white;
+                font-size: 12px;
+                font-weight: 600;
             }}
-            QPushButton:hover {{ opacity: 0.85; }}
+            QPushButton:hover {{ background: {ACCENT2}; }}
         """)
         open_btn.clicked.connect(lambda: self.open_clicked.emit(self.item_id))
         layout.addWidget(open_btn)
 
         # Delete button
-        del_btn = QPushButton("✕")
-        del_btn.setFixedSize(30, 30)
-        del_btn.setStyleSheet(f"""
+        self._del_btn = QPushButton("✕")
+        self._del_btn.setFixedSize(26, 26)
+        self._del_btn.setStyleSheet(f"""
             QPushButton {{
                 background: transparent;
-                border: 1.5px solid {BORDER};
-                border-radius: 8px;
-                color: {MUTED};
-                font-size: 12px;
+                border: none;
+                border-radius: 6px;
+                color: {MUTED2};
+                font-size: 11px;
             }}
             QPushButton:hover {{
                 background: {RED_BG};
-                border-color: rgba(239,68,68,0.4);
                 color: {RED};
             }}
         """)
-        del_btn.clicked.connect(lambda: self.delete_clicked.emit(self.item_id))
-        layout.addWidget(del_btn)
+        self._del_btn.hide()
+        self._del_btn.clicked.connect(lambda: self.delete_clicked.emit(self.item_id))
+        layout.addWidget(self._del_btn)
 
     def enterEvent(self, e):
         self._hovered = True
+        if self._del_btn:
+            self._del_btn.show()
         self.update()
 
     def leaveEvent(self, e):
         self._hovered = False
+        if self._del_btn:
+            self._del_btn.hide()
         self.update()
 
     def paintEvent(self, e):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        path = QPainterPath()
-        path.addRoundedRect(0, 0, self.width(), self.height(), 12, 12)
-        color = QColor(SURFACE3) if self._hovered else QColor(SURFACE)
-        p.fillPath(path, color)
-        p.setPen(QPen(QColor(BORDER), 1.5))
-        p.drawPath(path)
+        if self._hovered:
+            path = QPainterPath()
+            path.addRoundedRect(0, 2, self.width(), self.height() - 4, 8, 8)
+            p.fillPath(path, QColor(0, 0, 0, 14))
 
 
 # ── Section header ────────────────────────────────────────────────────────────
 
 class SectionHeader(QLabel):
-    COLORS = {"FILES": "#6c63ff", "WEBSITES": "#10b981", "APPLICATIONS": "#f59e0b"}
-
     def __init__(self, label: str, parent=None):
         super().__init__(label, parent)
-        color = self.COLORS.get(label, ACCENT)
-        self.setFixedHeight(30)
+        self.setFixedHeight(28)
         self.setStyleSheet(f"""
-            color: {color};
+            color: {MUTED};
             font-size: 10px;
-            font-weight: 800;
-            letter-spacing: 2.5px;
-            padding-left: 4px;
+            font-weight: 600;
+            letter-spacing: 1.2px;
+            padding-left: 16px;
         """)
 
 
@@ -234,16 +233,16 @@ class EmptyState(QWidget):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.setSpacing(10)
+        layout.setSpacing(8)
 
-        icon = QLabel("📂")
+        icon = QLabel("◫")
         icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon.setStyleSheet("font-size: 40px; background: transparent;")
+        icon.setStyleSheet(f"font-size: 28px; color: {MUTED2}; background: transparent;")
         layout.addWidget(icon)
 
         msg = QLabel("No items yet")
         msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        msg.setStyleSheet(f"color: {TEXT}; font-size: 15px; font-weight: 700;")
+        msg.setStyleSheet(f"color: {TEXT}; font-size: 14px; font-weight: 600;")
         layout.addWidget(msg)
 
         hint = QLabel("Add files, URLs, or apps using the button below")
@@ -270,7 +269,7 @@ class SessionDetailPanel(QWidget):
     def _build(self):
         self.setStyleSheet(f"background: {BG};")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(36, 28, 36, 28)
+        layout.setContentsMargins(40, 32, 40, 32)
         layout.setSpacing(0)
 
         # ── Header ──
@@ -278,22 +277,21 @@ class SessionDetailPanel(QWidget):
         header.setSpacing(14)
 
         self._icon_lbl = QLabel("")
-        self._icon_lbl.setFixedSize(52, 52)
+        self._icon_lbl.setFixedSize(44, 44)
         self._icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._icon_lbl.setStyleSheet(f"""
-            background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                stop:0 {GRAD_START}22, stop:1 {GRAD_END}22);
-            border: 2px solid {GRAD_START}33;
-            border-radius: 14px;
-            font-size: 26px;
+            background: {SURFACE2};
+            border: 1px solid {BORDER};
+            border-radius: 11px;
+            font-size: 22px;
         """)
         header.addWidget(self._icon_lbl)
 
         title_col = QVBoxLayout()
-        title_col.setSpacing(3)
+        title_col.setSpacing(2)
         self._name_lbl = QLabel("")
         self._name_lbl.setStyleSheet(
-            f"color: {TEXT}; font-size: 20px; font-weight: 800; letter-spacing: -0.4px;"
+            f"color: {TEXT}; font-size: 18px; font-weight: 700; letter-spacing: -0.3px;"
         )
         title_col.addWidget(self._name_lbl)
         self._meta_lbl = QLabel("")
@@ -304,51 +302,64 @@ class SessionDetailPanel(QWidget):
 
         back_btn = QPushButton("← Back")
         back_btn.setObjectName("ghostBtn")
-        back_btn.setFixedHeight(36)
+        back_btn.setFixedHeight(34)
         back_btn.clicked.connect(self.closed.emit)
         header.addWidget(back_btn)
 
         layout.addLayout(header)
-        layout.addSpacing(22)
+        layout.addSpacing(24)
 
         # ── Stats row ──
         self._stats_row = QHBoxLayout()
-        self._stats_row.setSpacing(12)
+        self._stats_row.setSpacing(10)
         layout.addLayout(self._stats_row)
-        layout.addSpacing(22)
+        layout.addSpacing(20)
 
         # ── Action bar ──
         actions = QHBoxLayout()
-        actions.setSpacing(10)
+        actions.setSpacing(8)
         self._restore_btn = QPushButton("▶  Restore All")
         self._restore_btn.setObjectName("accentBtn")
-        self._restore_btn.setFixedHeight(40)
+        self._restore_btn.setFixedHeight(36)
         self._restore_btn.clicked.connect(self._restore_all)
         actions.addWidget(self._restore_btn)
 
-        add_btn = QPushButton("＋  Add Item")
-        add_btn.setFixedHeight(40)
+        add_btn = QPushButton("+ Add Item")
+        add_btn.setFixedHeight(36)
         add_btn.clicked.connect(self._open_add_dialog)
         actions.addWidget(add_btn)
         actions.addStretch()
         layout.addLayout(actions)
         layout.addSpacing(20)
 
-        # ── Item list ──
+        # ── Item list card ──
+        list_card = QWidget()
+        list_card.setStyleSheet(f"""
+            QWidget {{
+                background: {SURFACE};
+                border: 1px solid {BORDER};
+                border-radius: 12px;
+            }}
+        """)
+        list_card_layout = QVBoxLayout(list_card)
+        list_card_layout.setContentsMargins(0, 6, 0, 6)
+        list_card_layout.setSpacing(0)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setStyleSheet("background: transparent;")
+        scroll.setStyleSheet("background: transparent; border: none;")
 
         self._list_container = QWidget()
         self._list_container.setStyleSheet("background: transparent;")
         self._list_layout = QVBoxLayout(self._list_container)
         self._list_layout.setContentsMargins(0, 0, 0, 0)
-        self._list_layout.setSpacing(6)
+        self._list_layout.setSpacing(0)
         self._list_layout.addStretch()
         scroll.setWidget(self._list_container)
-        layout.addWidget(scroll)
+        list_card_layout.addWidget(scroll)
+        layout.addWidget(list_card, 1)
 
     def refresh(self):
         session = db.get_session(self.session_id)
@@ -360,9 +371,9 @@ class SessionDetailPanel(QWidget):
 
         stats = db.get_session_stats(self.session_id)
         parts = []
-        if stats["files"]: parts.append(f"{stats['files']} file{'s' if stats['files']!=1 else ''}")
-        if stats["urls"]:  parts.append(f"{stats['urls']} URL{'s' if stats['urls']!=1 else ''}")
-        if stats["apps"]:  parts.append(f"{stats['apps']} app{'s' if stats['apps']!=1 else ''}")
+        if stats["files"]: parts.append(f"{stats['files']} file{'s' if stats['files'] != 1 else ''}")
+        if stats["urls"]:  parts.append(f"{stats['urls']} URL{'s' if stats['urls'] != 1 else ''}")
+        if stats["apps"]:  parts.append(f"{stats['apps']} app{'s' if stats['apps'] != 1 else ''}")
         self._meta_lbl.setText("  ·  ".join(parts) if parts else "Empty session")
 
         # Rebuild stats badges
@@ -373,13 +384,13 @@ class SessionDetailPanel(QWidget):
 
         if stats["total"]:
             badges = [
-                ("📄", stats["files"], "Files",    "#6c63ff"),
-                ("🌐", stats["urls"],  "Websites", "#10b981"),
-                ("⚙️", stats["apps"],  "Apps",     "#f59e0b"),
+                ("📄", stats["files"], "Files"),
+                ("🌐", stats["urls"],  "Websites"),
+                ("⚙️", stats["apps"],  "Apps"),
             ]
-            for icon, count, label, color in badges:
+            for icon, count, label in badges:
                 if count:
-                    b = StatBadge(icon, count, label, color)
+                    b = StatBadge(icon, count, label)
                     self._stats_row.addWidget(b)
             self._stats_row.addStretch()
 
@@ -406,16 +417,21 @@ class SessionDetailPanel(QWidget):
                 continue
             self._list_layout.insertWidget(idx, SectionHeader(group_labels[gtype]))
             idx += 1
-            for item in grp:
+            for i, item in enumerate(grp):
                 row = ItemRow(item)
                 row.open_clicked.connect(self._open_single)
                 row.delete_clicked.connect(self._delete_item)
                 self._list_layout.insertWidget(idx, row)
                 idx += 1
-            spacer = QWidget()
-            spacer.setFixedHeight(6)
-            self._list_layout.insertWidget(idx, spacer)
-            idx += 1
+                # Divider between rows (not after last in group)
+                if i < len(grp) - 1:
+                    div = QFrame()
+                    div.setFrameShape(QFrame.Shape.HLine)
+                    div.setFixedHeight(1)
+                    div.setStyleSheet("background: rgba(0,0,0,0.05); margin: 0 16px;")
+                    self._list_layout.insertWidget(idx, div)
+                    idx += 1
+            layout.addSpacing(4)
 
     def _open_add_dialog(self):
         dlg = AddItemDialog(self.session_id, self)
@@ -448,20 +464,18 @@ class SessionDetailPanel(QWidget):
             self._restore_btn.setText(f"✓  Opened {opened}")
             self._restore_btn.setStyleSheet(f"""
                 QPushButton {{
-                    background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
-                        stop:0 {GREEN}, stop:1 #34d399);
-                    border: none; border-radius: 10px;
-                    color: white; font-weight: 700; padding: 9px 22px;
+                    background: {GREEN};
+                    border: none; border-radius: 8px;
+                    color: white; font-weight: 600; padding: 9px 20px;
                 }}
             """)
         else:
             self._restore_btn.setText(f"⚠  {opened}/{total} opened")
             self._restore_btn.setStyleSheet(f"""
                 QPushButton {{
-                    background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
-                        stop:0 {AMBER}, stop:1 #fcd34d);
-                    border: none; border-radius: 10px;
-                    color: white; font-weight: 700; padding: 9px 22px;
+                    background: {AMBER};
+                    border: none; border-radius: 8px;
+                    color: white; font-weight: 600; padding: 9px 20px;
                 }}
             """)
         self.refresh()
