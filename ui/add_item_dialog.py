@@ -1,10 +1,6 @@
 """
-ui/add_item_dialog.py — Dialog to add a file, URL, or app to a session.
-
-Three tabs: File, URL, App.
-File   → drag & drop or browse button → stores absolute path.
-URL    → paste field with live label preview.
-App    → searchable list of installed Windows apps (from registry + Start Menu).
+ui/add_item_dialog.py — Add file, URL, or app to a session.
+Uiverse-inspired: white glass card, gradient tabs, soft shadows.
 """
 
 import os
@@ -13,25 +9,27 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QFileDialog, QWidget, QFrame, QScrollArea,
-    QApplication, QSizePolicy
+    QApplication, QGraphicsDropShadowEffect
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QObject
-from PyQt6.QtGui import QPainter, QColor, QPainterPath, QFont, QDragEnterEvent, QDropEvent
+from PyQt6.QtGui import (
+    QPainter, QColor, QPainterPath, QFont, QLinearGradient,
+    QPen, QDragEnterEvent, QDropEvent
+)
 
 import db
-from core.launcher import (
-    label_for_file, label_for_url, label_for_app, icon_for_item
-)
+from core.launcher import label_for_file, label_for_url, label_for_app
 from ui.styles import (
-    BG, SURFACE, SURFACE2, SURFACE3, BORDER, ACCENT, ACCENT2, ACCENT_DIM,
-    TEXT, MUTED, MUTED2, RED, WHITE_005, ACCENT_010, ACCENT_020
+    BG, SURFACE, SURFACE2, SURFACE3, GLASS, BORDER,
+    ACCENT, ACCENT2, ACCENT3, ACCENT_LIGHT, ACCENT_MED,
+    GRAD_START, GRAD_END, TEXT, TEXT2, MUTED, MUTED2,
+    GREEN, RED, RED_BG, SHADOW_SM, SHADOW_MD
 )
 
 
-# ── Background worker for loading installed apps ──────────────────────────────
+# ── App loader worker ─────────────────────────────────────────────────────────
 
 class AppLoaderWorker(QObject):
-    """Runs in a QThread. Emits apps_loaded when done, error on failure."""
     apps_loaded = pyqtSignal(list)
     error       = pyqtSignal(str)
 
@@ -44,57 +42,82 @@ class AppLoaderWorker(QObject):
             self.apps_loaded.emit(apps)
         except Exception as e:
             import traceback
-            msg = traceback.format_exc()
-            print(f"[AppLoader] ERROR:\n{msg}")
+            print(f"[AppLoader] ERROR:\n{traceback.format_exc()}")
             self.error.emit(str(e))
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _field(placeholder: str) -> QLineEdit:
+    f = QLineEdit()
+    f.setPlaceholderText(placeholder)
+    f.setStyleSheet(f"""
+        QLineEdit {{
+            background: {SURFACE2};
+            border: 1.5px solid {BORDER};
+            border-radius: 10px;
+            color: {TEXT};
+            font-size: 13px;
+            padding: 9px 13px;
+        }}
+        QLineEdit:focus {{ border-color: {ACCENT}; background: {SURFACE}; }}
+        QLineEdit::placeholder {{ color: {MUTED}; }}
+    """)
+    return f
+
+
+def _section_lbl(text: str) -> QLabel:
+    lbl = QLabel(text)
+    lbl.setStyleSheet(
+        f"color: {MUTED}; font-size: 10px; font-weight: 700; letter-spacing: 1.5px;"
+    )
+    return lbl
 
 
 # ── Tab button ────────────────────────────────────────────────────────────────
 
-class TabButton(QPushButton):
-    def __init__(self, label: str, parent=None):
+class TabBtn(QPushButton):
+    def __init__(self, label: str, color: str, parent=None):
         super().__init__(label, parent)
+        self._color = color
         self.setCheckable(True)
-        self.setFixedHeight(34)
-        self._update_style(False)
+        self.setFixedHeight(36)
+        self._update(False)
 
-    def setChecked(self, checked: bool):
-        super().setChecked(checked)
-        self._update_style(checked)
+    def setChecked(self, v: bool):
+        super().setChecked(v)
+        self._update(v)
 
-    def _update_style(self, active: bool):
+    def _update(self, active: bool):
         if active:
             self.setStyleSheet(f"""
                 QPushButton {{
-                    background: {ACCENT_020};
-                    border: 1px solid {ACCENT};
-                    border-radius: 8px;
-                    color: {ACCENT2};
-                    font-weight: 700;
-                    font-size: 13px;
-                    padding: 0 18px;
+                    background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                        stop:0 {self._color}22, stop:1 {self._color}11);
+                    border: 1.5px solid {self._color}55;
+                    border-radius: 10px;
+                    color: {self._color};
+                    font-weight: 700; font-size: 13px; padding: 0 16px;
                 }}
             """)
         else:
             self.setStyleSheet(f"""
                 QPushButton {{
                     background: transparent;
-                    border: 1px solid {BORDER};
-                    border-radius: 8px;
+                    border: 1.5px solid {BORDER};
+                    border-radius: 10px;
                     color: {MUTED};
-                    font-weight: 600;
-                    font-size: 13px;
-                    padding: 0 18px;
+                    font-weight: 600; font-size: 13px; padding: 0 16px;
                 }}
                 QPushButton:hover {{
-                    border-color: {MUTED2};
-                    color: {TEXT};
-                    background: {WHITE_005};
+                    border-color: {self._color}44;
+                    color: {self._color};
+                    background: {self._color}0a;
                 }}
             """)
 
 
-# ── Drop zone for files ───────────────────────────────────────────────────────
+# ── Drop zone ─────────────────────────────────────────────────────────────────
 
 class DropZone(QWidget):
     file_dropped = pyqtSignal(str)
@@ -102,7 +125,7 @@ class DropZone(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
-        self.setFixedHeight(110)
+        self.setFixedHeight(100)
         self._hovering = False
         self._path = ""
 
@@ -132,223 +155,198 @@ class DropZone(QWidget):
     def paintEvent(self, e):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
         path = QPainterPath()
         path.addRoundedRect(0, 0, self.width(), self.height(), 12, 12)
 
         if self._hovering:
-            p.fillPath(path, QColor(ACCENT_020))
-            border_color = QColor(ACCENT)
+            p.fillPath(path, QColor(ACCENT_LIGHT))
+            pen = QPen(QColor(ACCENT), 2, Qt.PenStyle.DashLine)
         else:
             p.fillPath(path, QColor(SURFACE2))
-            border_color = QColor(BORDER)
+            pen = QPen(QColor(BORDER), 1.5, Qt.PenStyle.DashLine)
 
-        from PyQt6.QtCore import Qt
-        from PyQt6.QtGui import QPen
-        pen = QPen(border_color, 1.5, Qt.PenStyle.DashLine)
         p.setPen(pen)
         p.drawPath(path)
 
-        p.setPen(QColor(TEXT if self._path else MUTED))
+        from PyQt6.QtCore import QRect
         if self._path:
-            p.setFont(QFont("Segoe UI Variable", 10))
-            name = Path(self._path).name
-            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, f"📄  {name}")
+            p.setPen(QColor(TEXT))
+            p.setFont(QFont("Segoe UI Variable", 11, QFont.Weight.Medium))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
+                       f"📄  {Path(self._path).name}")
         else:
-            p.setFont(QFont("Segoe UI Variable", 12))
-            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Drop a file here")
-            # subtext
-            p.setFont(QFont("Segoe UI Variable", 10))
-            p.setPen(QColor(MUTED2))
-            from PyQt6.QtCore import QRect
-            sub = QRect(0, self.height() // 2 + 10, self.width(), 24)
-            p.drawText(sub, Qt.AlignmentFlag.AlignCenter, "or use the Browse button below")
-
-
-# ── Label input with live preview ─────────────────────────────────────────────
-
-def _make_field(placeholder: str, parent=None) -> QLineEdit:
-    f = QLineEdit(parent)
-    f.setPlaceholderText(placeholder)
-    f.setStyleSheet(f"""
-        QLineEdit {{
-            background: {SURFACE2};
-            border: 1px solid {BORDER};
-            border-radius: 8px;
-            color: {TEXT};
-            font-size: 13px;
-            padding: 8px 12px;
-        }}
-        QLineEdit:focus {{
-            border-color: {ACCENT};
-        }}
-    """)
-    return f
-
-
-def _section(text: str) -> QLabel:
-    lbl = QLabel(text)
-    lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px; font-weight: 700; "
-                      f"letter-spacing: 1.5px; text-transform: uppercase;")
-    return lbl
+            p.setPen(QColor(MUTED))
+            p.setFont(QFont("Segoe UI Variable", 13))
+            p.drawText(
+                QRect(0, 10, self.width(), 30),
+                Qt.AlignmentFlag.AlignCenter, "Drop a file here"
+            )
+            p.setFont(QFont("Segoe UI Variable", 11))
+            p.drawText(
+                QRect(0, 44, self.width(), 26),
+                Qt.AlignmentFlag.AlignCenter, "or use the Browse button below"
+            )
 
 
 # ── Main dialog ───────────────────────────────────────────────────────────────
 
 class AddItemDialog(QDialog):
-    item_added = pyqtSignal(int)   # emits the new item id
+    item_added = pyqtSignal(int)
 
     def __init__(self, session_id: int, parent=None):
         super().__init__(parent)
         self.session_id = session_id
         self._active_tab = "file"
+        self._selected_app: dict | None = None
+        self._all_apps: list[dict] = []
 
         self.setWindowTitle("Add Item")
-        self.setFixedSize(480, 460)
+        self.setFixedSize(500, 490)
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self._selected_app = None
-
         self._build()
 
     def _build(self):
-        # Outer container with rounded background
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setContentsMargins(8, 8, 8, 8)
 
-        self._card = QWidget(self)
-        self._card.setObjectName("card")
-        self._card.setStyleSheet(f"""
-            #card {{
+        card = QWidget()
+        card.setObjectName("dialogCard")
+        card.setStyleSheet(f"""
+            #dialogCard {{
                 background: {SURFACE};
-                border: 1px solid {BORDER};
-                border-radius: 16px;
+                border: 1.5px solid {BORDER};
+                border-radius: 20px;
             }}
         """)
-        outer.addWidget(self._card)
+        fx = QGraphicsDropShadowEffect(card)
+        fx.setBlurRadius(40)
+        fx.setColor(QColor(SHADOW_MD))
+        fx.setOffset(0, 8)
+        card.setGraphicsEffect(fx)
+        outer.addWidget(card)
 
-        layout = QVBoxLayout(self._card)
-        layout.setContentsMargins(24, 22, 24, 22)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(26, 24, 26, 24)
         layout.setSpacing(16)
 
-        # ── Header ──
-        header = QHBoxLayout()
+        # Header
+        header_row = QHBoxLayout()
         title = QLabel("Add to Session")
-        title.setStyleSheet(f"color: {TEXT}; font-size: 16px; font-weight: 700;")
-        header.addWidget(title)
-        header.addStretch()
+        title.setStyleSheet(
+            f"color: {TEXT}; font-size: 17px; font-weight: 800; letter-spacing: -0.3px;"
+        )
+        header_row.addWidget(title)
+        header_row.addStretch()
         close_btn = QPushButton("✕")
-        close_btn.setFixedSize(28, 28)
+        close_btn.setFixedSize(30, 30)
         close_btn.setStyleSheet(f"""
             QPushButton {{
-                background: transparent; border: none;
-                color: {MUTED}; font-size: 14px; border-radius: 6px;
+                background: {SURFACE3}; border: none;
+                color: {MUTED}; font-size: 13px; border-radius: 8px;
             }}
-            QPushButton:hover {{ background: {WHITE_005}; color: {TEXT}; }}
+            QPushButton:hover {{ background: {RED_BG}; color: {RED}; }}
         """)
         close_btn.clicked.connect(self.reject)
-        header.addWidget(close_btn)
-        layout.addLayout(header)
+        header_row.addWidget(close_btn)
+        layout.addLayout(header_row)
 
-        # ── Tabs ──
-        tabs = QHBoxLayout()
-        tabs.setSpacing(8)
-        self._tab_file = TabButton("📄  File")
-        self._tab_url  = TabButton("🌐  URL")
-        self._tab_app  = TabButton("⚙️  App")
+        # Tabs
+        tabs_row = QHBoxLayout()
+        tabs_row.setSpacing(8)
+        self._tab_file = TabBtn("📄  File",    "#6c63ff")
+        self._tab_url  = TabBtn("🌐  Website", "#10b981")
+        self._tab_app  = TabBtn("⚙️  App",     "#f59e0b")
         for btn in (self._tab_file, self._tab_url, self._tab_app):
-            tabs.addWidget(btn)
-        tabs.addStretch()
-        self._tab_file.clicked.connect(lambda: self._switch_tab("file"))
-        self._tab_url.clicked.connect(lambda:  self._switch_tab("url"))
-        self._tab_app.clicked.connect(lambda:  self._switch_tab("app"))
-        layout.addLayout(tabs)
+            tabs_row.addWidget(btn)
+        tabs_row.addStretch()
+        self._tab_file.clicked.connect(lambda: self._switch("file"))
+        self._tab_url.clicked.connect(lambda:  self._switch("url"))
+        self._tab_app.clicked.connect(lambda:  self._switch("app"))
+        layout.addLayout(tabs_row)
 
-        divider = QFrame()
-        divider.setFrameShape(QFrame.Shape.HLine)
-        divider.setStyleSheet(f"background: {BORDER}; max-height: 1px;")
-        layout.addWidget(divider)
+        div = QFrame()
+        div.setFrameShape(QFrame.Shape.HLine)
+        div.setStyleSheet(f"background: {BORDER}; max-height: 1px;")
+        layout.addWidget(div)
 
-        # ── Tab pages (stacked manually) ──
+        # Pages
         self._file_page = self._build_file_page()
         self._url_page  = self._build_url_page()
         self._app_page  = self._build_app_page()
-        layout.addWidget(self._file_page)
-        layout.addWidget(self._url_page)
-        layout.addWidget(self._app_page)
+        for pg in (self._file_page, self._url_page, self._app_page):
+            layout.addWidget(pg)
         layout.addStretch()
 
-        # ── Add button ──
+        # Add button
         self._add_btn = QPushButton("Add to Session")
         self._add_btn.setObjectName("accentBtn")
-        self._add_btn.setFixedHeight(40)
+        self._add_btn.setFixedHeight(42)
         self._add_btn.clicked.connect(self._on_add)
         layout.addWidget(self._add_btn)
 
         self._error_lbl = QLabel("")
-        self._error_lbl.setStyleSheet(f"color: {RED}; font-size: 12px;")
+        self._error_lbl.setStyleSheet(
+            f"color: {RED}; font-size: 12px; font-weight: 600;"
+        )
         self._error_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self._error_lbl)
 
-        self._switch_tab("file")
+        self._switch("file")
+
+    # ── Pages ──
 
     def _build_file_page(self) -> QWidget:
         w = QWidget()
-        layout = QVBoxLayout(w)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(10)
 
         self._drop_zone = DropZone()
         self._drop_zone.file_dropped.connect(self._on_file_dropped)
-        layout.addWidget(self._drop_zone)
+        v.addWidget(self._drop_zone)
 
-        browse_row = QHBoxLayout()
-        browse_btn = QPushButton("Browse…")
-        browse_btn.setFixedHeight(34)
-        browse_btn.clicked.connect(self._browse_file)
-        browse_row.addStretch()
-        browse_row.addWidget(browse_btn)
-        layout.addLayout(browse_row)
+        row = QHBoxLayout()
+        browse = QPushButton("Browse…")
+        browse.setFixedHeight(32)
+        browse.clicked.connect(self._browse_file)
+        row.addStretch()
+        row.addWidget(browse)
+        v.addLayout(row)
 
-        layout.addWidget(_section("Label"))
-        self._file_label = _make_field("Auto-generated from filename")
-        layout.addWidget(self._file_label)
-
+        v.addWidget(_section_lbl("LABEL"))
+        self._file_label = _field("Auto-generated from filename")
+        v.addWidget(self._file_label)
         return w
 
     def _build_url_page(self) -> QWidget:
         w = QWidget()
-        layout = QVBoxLayout(w)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
-
-        layout.addWidget(_section("URL"))
-        self._url_field = _make_field("https://...")
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(10)
+        v.addWidget(_section_lbl("URL"))
+        self._url_field = _field("https://...")
         self._url_field.textChanged.connect(self._on_url_changed)
-        layout.addWidget(self._url_field)
-
-        layout.addWidget(_section("Label"))
-        self._url_label = _make_field("Auto-generated from URL")
-        layout.addWidget(self._url_label)
-
+        v.addWidget(self._url_field)
+        v.addWidget(_section_lbl("LABEL"))
+        self._url_label = _field("Auto-generated from URL")
+        v.addWidget(self._url_label)
         return w
 
     def _build_app_page(self) -> QWidget:
         w = QWidget()
-        layout = QVBoxLayout(w)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(8)
 
-        # Search bar
-        self._app_search = _make_field("Search installed apps…")
+        self._app_search = _field("Search installed apps…")
         self._app_search.textChanged.connect(self._filter_apps)
-        layout.addWidget(self._app_search)
+        v.addWidget(self._app_search)
 
-        # Scrollable app list
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setFixedHeight(160)
+        scroll.setFixedHeight(165)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setStyleSheet("background: transparent;")
 
@@ -359,41 +357,37 @@ class AddItemDialog(QDialog):
         self._app_list_layout.setSpacing(2)
         self._app_list_layout.addStretch()
         scroll.setWidget(self._app_list_widget)
-        layout.addWidget(scroll)
+        v.addWidget(scroll)
 
-        # Loading label
         self._app_loading = QLabel("Loading installed apps…")
-        self._app_loading.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
+        self._app_loading.setStyleSheet(
+            f"color: {MUTED}; font-size: 12px; font-style: italic;"
+        )
         self._app_loading.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self._app_loading)
+        v.addWidget(self._app_loading)
 
-        # Selected app display
-        self._selected_app: dict | None = None
         self._app_selected_lbl = QLabel("")
         self._app_selected_lbl.setStyleSheet(
-            f"color: {ACCENT2}; font-size: 12px; font-weight: 600;"
+            f"color: {ACCENT}; font-size: 12px; font-weight: 700;"
         )
-        layout.addWidget(self._app_selected_lbl)
+        v.addWidget(self._app_selected_lbl)
 
-        # Also allow manual browse as fallback
-        browse_row = QHBoxLayout()
-        browse_row.addStretch()
-        fallback_btn = QPushButton("Browse .exe…")
-        fallback_btn.setFixedHeight(28)
-        fallback_btn.setStyleSheet(f"""
+        fallback_row = QHBoxLayout()
+        fallback_row.addStretch()
+        fb = QPushButton("Browse .exe…")
+        fb.setFixedHeight(28)
+        fb.setStyleSheet(f"""
             QPushButton {{
-                background: transparent; border: 1px solid {BORDER};
-                border-radius: 6px; color: {MUTED}; font-size: 11px;
-                padding: 0 10px;
+                background: transparent; border: 1.5px solid {BORDER};
+                border-radius: 8px; color: {MUTED}; font-size: 11px; padding: 0 10px;
             }}
-            QPushButton:hover {{ color: {TEXT}; border-color: {MUTED2}; }}
+            QPushButton:hover {{ color: {TEXT}; border-color: {ACCENT}; }}
         """)
-        fallback_btn.clicked.connect(self._browse_app_fallback)
-        browse_row.addWidget(fallback_btn)
-        layout.addLayout(browse_row)
+        fb.clicked.connect(self._browse_app_fallback)
+        fallback_row.addWidget(fb)
+        v.addLayout(fallback_row)
 
-        # Kick off background load via QThread (safe cross-thread signal delivery)
-        self._all_apps: list[dict] = []
+        # Start QThread loader
         self._app_thread = QThread()
         self._app_worker = AppLoaderWorker()
         self._app_worker.moveToThread(self._app_thread)
@@ -406,15 +400,16 @@ class AddItemDialog(QDialog):
 
         return w
 
+    # ── App loading ──
+
     def _on_apps_loaded(self, apps: list[dict]):
         self._all_apps = apps
         self._app_loading.hide()
         self._populate_app_list(apps)
 
     def _on_apps_error(self, msg: str):
-        self._app_loading.setText(f"⚠ Failed to load apps — use Browse .exe…")
+        self._app_loading.setText("⚠ Could not load apps — use Browse .exe…")
         self._app_loading.setStyleSheet(f"color: {RED}; font-size: 11px;")
-        print(f"[AppLoader] Could not load installed apps: {msg}")
 
     def _filter_apps(self, query: str):
         if not self._all_apps:
@@ -424,76 +419,64 @@ class AddItemDialog(QDialog):
         self._populate_app_list(filtered[:60])
 
     def _populate_app_list(self, apps: list[dict]):
-        # Clear existing rows
         while self._app_list_layout.count() > 1:
             item = self._app_list_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-
-        for app in apps[:50]:
+        for i, app in enumerate(apps[:60]):
             row = self._make_app_row(app)
-            self._app_list_layout.insertWidget(
-                self._app_list_layout.count() - 1, row
-            )
+            self._app_list_layout.insertWidget(i, row)
 
     def _make_app_row(self, app: dict) -> QWidget:
         row = QWidget()
-        row.setFixedHeight(36)
+        row.setFixedHeight(38)
         row.setCursor(Qt.CursorShape.PointingHandCursor)
-        row_layout = QHBoxLayout(row)
-        row_layout.setContentsMargins(8, 4, 8, 4)
-        row_layout.setSpacing(8)
+        row.setStyleSheet(f"""
+            QWidget {{ background: transparent; border-radius: 9px; }}
+            QWidget:hover {{ background: {SURFACE3}; }}
+        """)
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(8, 4, 8, 4)
+        rl.setSpacing(10)
 
         icon_lbl = QLabel(app.get("icon_emoji", "⚙️"))
-        icon_lbl.setFixedSize(24, 24)
+        icon_lbl.setFixedSize(26, 26)
         icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon_lbl.setStyleSheet("font-size: 14px;")
-        row_layout.addWidget(icon_lbl)
+        icon_lbl.setStyleSheet(
+            f"background: #f59e0b18; border-radius: 7px; font-size: 14px;"
+        )
+        rl.addWidget(icon_lbl)
 
         name_lbl = QLabel(app["name"])
-        name_lbl.setStyleSheet(f"color: {TEXT}; font-size: 12px;")
-        row_layout.addWidget(name_lbl)
-        row_layout.addStretch()
+        name_lbl.setStyleSheet(f"color: {TEXT}; font-size: 12px; font-weight: 500;")
+        rl.addWidget(name_lbl)
+        rl.addStretch()
 
         def _select(a=app, r=row):
             self._selected_app = a
             self._app_selected_lbl.setText(f"✓  {a['name']}")
-            # Highlight selected row
-            r.setStyleSheet(f"background: {ACCENT_020}; border-radius: 7px;")
+            r.setStyleSheet(f"""
+                QWidget {{
+                    background: {ACCENT_LIGHT};
+                    border: 1.5px solid {ACCENT}44;
+                    border-radius: 9px;
+                }}
+            """)
 
-        # Style default
-        row.setStyleSheet(f"""
-            QWidget {{ background: transparent; border-radius: 7px; }}
-            QWidget:hover {{ background: {SURFACE3}; }}
-        """)
         row.mousePressEvent = lambda e, fn=_select: fn()
         return row
 
     def _browse_app_fallback(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Application",
-            r"C:\Program Files",
-            "Executables (*.exe)"
+            self, "Select Application", r"C:\Program Files", "Executables (*.exe)"
         )
         if path:
             self._selected_app = {
-                "name":       label_for_app(path),
-                "exe_path":   path,
-                "icon_emoji": "⚙️",
+                "name": label_for_app(path), "exe_path": path, "icon_emoji": "⚙️"
             }
             self._app_selected_lbl.setText(f"✓  {self._selected_app['name']}")
 
-    def _switch_tab(self, tab: str):
-        self._active_tab = tab
-        self._tab_file.setChecked(tab == "file")
-        self._tab_url.setChecked(tab == "url")
-        self._tab_app.setChecked(tab == "app")
-        self._file_page.setVisible(tab == "file")
-        self._url_page.setVisible(tab == "url")
-        self._app_page.setVisible(tab == "app")
-        self._error_lbl.setText("")
-
-    # ── File tab handlers ──
+    # ── File / URL handlers ──
 
     def _on_file_dropped(self, path: str):
         if not self._file_label.text():
@@ -506,19 +489,23 @@ class AddItemDialog(QDialog):
             if not self._file_label.text():
                 self._file_label.setText(label_for_file(path))
 
-    # ── URL tab handlers ──
-
     def _on_url_changed(self, text: str):
         if text and not self._url_label.text():
             self._url_label.setText(label_for_url(text))
 
-    # ── URL tab handlers ──
+    # ── Tab switching ──
 
-    def _on_url_changed(self, text: str):
-        if text and not self._url_label.text():
-            self._url_label.setText(label_for_url(text))
+    def _switch(self, tab: str):
+        self._active_tab = tab
+        self._tab_file.setChecked(tab == "file")
+        self._tab_url.setChecked(tab == "url")
+        self._tab_app.setChecked(tab == "app")
+        self._file_page.setVisible(tab == "file")
+        self._url_page.setVisible(tab == "url")
+        self._app_page.setVisible(tab == "app")
+        self._error_lbl.setText("")
 
-    # ── Add button ──
+    # ── Add ──
 
     def _on_add(self):
         self._error_lbl.setText("")
@@ -526,12 +513,12 @@ class AddItemDialog(QDialog):
         if self._active_tab == "file":
             path = self._drop_zone._path
             if not path:
-                self._error_lbl.setText("Please select a file first.")
+                self._error_lbl.setText("Please select or drop a file first.")
                 return
             if not os.path.exists(path):
-                self._error_lbl.setText("File not found.")
+                self._error_lbl.setText("File not found on disk.")
                 return
-            label = self._file_label.text().strip() or label_for_file(path)
+            label   = self._file_label.text().strip() or label_for_file(path)
             item_id = db.add_item(self.session_id, "file", path, label)
 
         elif self._active_tab == "url":
@@ -541,19 +528,23 @@ class AddItemDialog(QDialog):
                 return
             if not url.startswith(("http://", "https://")):
                 url = "https://" + url
-            label = self._url_label.text().strip() or label_for_url(url)
+            label   = self._url_label.text().strip() or label_for_url(url)
             item_id = db.add_item(self.session_id, "url", url, label)
 
         elif self._active_tab == "app":
             if not self._selected_app:
                 self._error_lbl.setText("Please select an app first.")
                 return
-            exe_path = self._selected_app["exe_path"]
-            label    = self._selected_app["name"]
-            item_id  = db.add_item(self.session_id, "app", exe_path, label)
+            item_id = db.add_item(
+                self.session_id, "app",
+                self._selected_app["exe_path"],
+                self._selected_app["name"]
+            )
 
         self.item_added.emit(item_id)
         self.accept()
+
+    # ── Window drag ──
 
     def mousePressEvent(self, e):
         self._drag_pos = e.globalPosition().toPoint()
@@ -564,7 +555,6 @@ class AddItemDialog(QDialog):
             self._drag_pos = e.globalPosition().toPoint()
 
     def closeEvent(self, e):
-        # Clean up QThread if it's still running
         if hasattr(self, "_app_thread") and self._app_thread.isRunning():
             self._app_thread.quit()
             self._app_thread.wait(1000)

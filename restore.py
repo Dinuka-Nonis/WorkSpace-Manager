@@ -26,10 +26,11 @@ def restore_session(session_id: int) -> dict:
 
     results = open_all(items)
 
-    # Mark all successfully-opened items with a timestamp
+    # Mark opened items — use results from open_all, don't re-open
     for item in items:
-        success, _ = open_item(item)
-        if success:
+        # open_all already tried; mark as opened if it didn't appear in errors
+        failed_labels = {e.split(":")[0].strip() for e in results["errors"]}
+        if item["label"] not in failed_labels:
             db.mark_item_opened(item["id"])
 
     print(f"[Restore] Done — {results['opened']}/{results['total']} opened, "
