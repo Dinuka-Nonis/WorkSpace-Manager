@@ -1,4 +1,8 @@
-PyQt6>=6.6.0
-pywin32>=306
+# WorkSpace Manager — Python dependencies
+PyQt6>=6.5.0
+psutil>=5.9.0
 keyboard>=0.13.5
-requests>=2.31.0
+
+# Windows-only (install separately on Windows):
+# pywin32  — for tray balloon, win32api shutdown hook, COM/shortcut reading
+#            pip install pywin32
