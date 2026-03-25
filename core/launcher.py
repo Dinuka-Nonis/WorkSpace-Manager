@@ -56,10 +56,25 @@ def open_url(url: str) -> tuple[bool, str]:
     Falls back to system default if Chrome/Edge not found.
     Returns (success, error_message).
     """
-    if not url.startswith(("http://", "https://", "file://")):
+    # Only prepend https:// for bare hostnames/paths with no scheme at all.
+    # Schemes like mailto:, ftp:, etc. are passed straight through to the
+    # system default handler via webbrowser.open rather than Chrome/Edge,
+    # since those browsers may not handle non-http schemes reliably.
+    KNOWN_WEB_SCHEMES = ("http://", "https://", "file://")
+    OTHER_SCHEMES = ("mailto:", "ftp://", "ftps://", "tel:", "data:")
+
+    if any(url.startswith(s) for s in OTHER_SCHEMES):
+        try:
+            webbrowser.open(url)
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+
+    if not url.startswith(KNOWN_WEB_SCHEMES):
         url = "https://" + url
 
     browser = _find_browser()
+
     if browser:
         try:
             subprocess.Popen([browser, url])
@@ -112,8 +127,19 @@ def open_all(items: list[dict]) -> dict:
     Open all items in a session.
     Returns a summary: {total, opened, failed, errors}
     """
+    results, _ = open_all_tracked(items)
+    return results
+
+
+def open_all_tracked(items: list[dict]) -> tuple[dict, set]:
+    """
+    Open all items in a session.
+    Returns (summary_dict, failed_item_ids) so callers can match on item ID
+    rather than parsing label strings (labels may contain ":" themselves).
+    """
     import time
     results = {"total": len(items), "opened": 0, "failed": 0, "errors": []}
+    failed_ids: set[int] = set()
 
     for item in items:
         success, err = open_item(item)
@@ -122,10 +148,11 @@ def open_all(items: list[dict]) -> dict:
         else:
             results["failed"] += 1
             results["errors"].append(f"{item.get('label', '?')}: {err}")
+            failed_ids.add(item["id"])
         # Small delay so apps don't fight over focus
         time.sleep(0.25)
 
-    return results
+    return results, failed_ids
 
 
 # ── Label helpers (used when auto-generating labels) ─────────────────────────

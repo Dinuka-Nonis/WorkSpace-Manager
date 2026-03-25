@@ -162,6 +162,7 @@ def mark_item_opened(item_id: int):
 
 
 def update_item_label(item_id: int, label: str):
+    now = datetime.now().isoformat()
     with get_conn() as conn:
         row = conn.execute(
             "SELECT session_id FROM session_items WHERE id=?", (item_id,)
@@ -170,8 +171,13 @@ def update_item_label(item_id: int, label: str):
             "UPDATE session_items SET label=? WHERE id=?",
             (label, item_id)
         )
+        # Touch in the same connection — avoids a separate transaction that
+        # could leave session.updated_at stale if the process dies between calls.
         if row:
-            touch_session(row["session_id"])
+            conn.execute(
+                "UPDATE sessions SET updated_at=? WHERE id=?",
+                (now, row["session_id"])
+            )
 
 
 # ─── STATS ───────────────────────────────────────────────────────────────────

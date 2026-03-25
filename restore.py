@@ -6,7 +6,7 @@ No window detection, no title parsing, no file searching — we have exact paths
 """
 
 import db
-from core.launcher import open_all, open_item, icon_for_item
+from core.launcher import open_all_tracked, open_item, icon_for_item
 
 
 def restore_session(session_id: int) -> dict:
@@ -24,13 +24,13 @@ def restore_session(session_id: int) -> dict:
         icon = icon_for_item(item)
         print(f"[Restore]   {icon}  [{item['type']}]  {item['label']}")
 
-    results = open_all(items)
+    # open_all_tracked returns per-item success so we match on ID, not label text.
+    # This avoids the bug where labels containing ":" (e.g. "Meeting: Q1") would
+    # be split and fail to match, marking a failed item as successfully opened.
+    results, failed_ids = open_all_tracked(items)
 
-    # Mark opened items — use results from open_all, don't re-open
     for item in items:
-        # open_all already tried; mark as opened if it didn't appear in errors
-        failed_labels = {e.split(":")[0].strip() for e in results["errors"]}
-        if item["label"] not in failed_labels:
+        if item["id"] not in failed_ids:
             db.mark_item_opened(item["id"])
 
     print(f"[Restore] Done — {results['opened']}/{results['total']} opened, "

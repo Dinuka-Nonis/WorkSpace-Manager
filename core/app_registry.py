@@ -51,7 +51,6 @@ def _icon_for_exe(exe_path: str) -> str:
         "powerpnt":       "📋",
         "onenote":        "📓",
         "outlook":        "📧",
-        "teams":          "👥",
         "msaccess":       "🗄",
         "mspub":          "📰",
         "lync":           "📞",

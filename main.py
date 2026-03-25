@@ -45,13 +45,18 @@ def make_tray_icon() -> QIcon:
 
 # ── Global hotkey (Ctrl+Alt+W to show/raise window) ──────────────────────────
 
-def start_hotkey_listener(window: MainWindow):
+def start_hotkey_listener(window: MainWindow, tray: "QSystemTrayIcon"):
     def _listen():
         try:
             import keyboard
             keyboard.add_hotkey("ctrl+alt+w", lambda: window.show() or window.raise_())
             keyboard.wait()
+        except ImportError:
+            # Surface to the user — silent failure is confusing
+            tray.setToolTip("WorkSpace Manager (hotkey unavailable: 'keyboard' not installed)")
+            print("[Hotkey] 'keyboard' package not installed — Ctrl+Alt+W disabled")
         except Exception as e:
+            tray.setToolTip(f"WorkSpace Manager (hotkey unavailable: {e})")
             print(f"[Hotkey] Unavailable: {e}")
 
     t = threading.Thread(target=_listen, daemon=True)
@@ -74,6 +79,7 @@ def main():
     # System tray
     tray_icon = make_tray_icon()
     tray = QSystemTrayIcon(tray_icon, app)
+    tray.setToolTip("WorkSpace Manager")
 
     tray_menu = QMenu()
     tray_menu.setStyleSheet(f"""
@@ -97,7 +103,7 @@ def main():
     )
     tray.show()
 
-    start_hotkey_listener(window)
+    start_hotkey_listener(window, tray)
 
     sys.exit(app.exec())
 

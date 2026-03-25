@@ -9,6 +9,11 @@
 const NATIVE_HOST_ID = "com.workspace.manager";
 const SEND_INTERVAL_MS = 30_000; // Push tabs every 30s
 
+// Reconnect backoff: starts at 5s, doubles each attempt, caps at 60s.
+const RECONNECT_BASE_MS  = 5_000;
+const RECONNECT_MAX_MS   = 60_000;
+let   reconnectDelay     = RECONNECT_BASE_MS;
+
 let port = null;
 let currentSessionId = null;
 let intervalTimer = null;
@@ -46,17 +51,21 @@ function connectNative() {
       console.log("[WorkSpace] Native host disconnected:", chrome.runtime.lastError?.message);
       port = null;
       currentSessionId = null;
-      // Retry connection after 5s
-      setTimeout(connectNative, 5000);
+      // Exponential backoff so a crashed host isn't hammered every 5s.
+      setTimeout(connectNative, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
     });
 
+    // Reset backoff — we have a working connection.
+    reconnectDelay = RECONNECT_BASE_MS;
     console.log("[WorkSpace] Connected to native host.");
     // Ask which session is currently active
     sendMessage({ type: "get_active_session" });
 
   } catch (err) {
     console.error("[WorkSpace] Native connect failed:", err);
-    setTimeout(connectNative, 5000);
+    setTimeout(connectNative, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
   }
 }
 
