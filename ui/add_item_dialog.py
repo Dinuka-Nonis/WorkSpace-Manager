@@ -1,6 +1,7 @@
 """
 ui/add_item_dialog.py — Add file, URL, or app to a session.
-Uiverse-inspired: white glass card, gradient tabs, soft shadows.
+Premium redesign: Helvetica Bold · Large fonts · No emoji · Pill tabs ·
+Full-size floating card dialog.
 """
 
 import os
@@ -23,8 +24,14 @@ from ui.styles import (
     BG, SURFACE, SURFACE2, SURFACE3, GLASS, BORDER,
     ACCENT, ACCENT2, ACCENT3, ACCENT_LIGHT, ACCENT_MED,
     GRAD_START, GRAD_END, TEXT, TEXT2, MUTED, MUTED2,
-    GREEN, RED, RED_BG, SHADOW_SM, SHADOW_MD
+    GREEN, RED, RED_BG, SHADOW_SM, SHADOW_MD,
+    FONT_DISPLAY, FONT_BODY
 )
+
+# Geometric symbols
+ICON_FILE = "▭"
+ICON_WEB  = "○"
+ICON_APP  = "◈"
 
 
 # ── App loader worker ─────────────────────────────────────────────────────────
@@ -35,10 +42,8 @@ class AppLoaderWorker(QObject):
 
     def run(self):
         try:
-            print("[AppLoader] Starting registry scan…")
             from core.app_registry import get_installed_apps
             apps = get_installed_apps()
-            print(f"[AppLoader] Found {len(apps)} apps")
             self.apps_loaded.emit(apps)
         except Exception as e:
             import traceback
@@ -51,37 +56,45 @@ class AppLoaderWorker(QObject):
 def _field(placeholder: str) -> QLineEdit:
     f = QLineEdit()
     f.setPlaceholderText(placeholder)
+    f.setFont(QFont(FONT_BODY, 15))
     f.setStyleSheet(f"""
         QLineEdit {{
             background: {SURFACE2};
-            border: 1.5px solid {BORDER};
-            border-radius: 10px;
+            border: 1.5px solid rgba(0,0,0,0.07);
+            border-radius: 14px;
             color: {TEXT};
-            font-size: 13px;
-            padding: 9px 13px;
+            font-size: 15px;
+            font-weight: 500;
+            padding: 11px 16px;
         }}
-        QLineEdit:focus {{ border-color: {ACCENT}; background: {SURFACE}; }}
-        QLineEdit::placeholder {{ color: {MUTED}; }}
+        QLineEdit:focus {{
+            border-color: rgba(0,0,0,0.22);
+            background: {SURFACE};
+        }}
     """)
     return f
 
 
 def _section_lbl(text: str) -> QLabel:
     lbl = QLabel(text)
+    lbl.setFont(QFont(FONT_BODY, 10, QFont.Weight.Bold))
     lbl.setStyleSheet(
-        f"color: {MUTED}; font-size: 10px; font-weight: 700; letter-spacing: 1.5px;"
+        f"color: {MUTED}; letter-spacing: 1.8px;"
     )
     return lbl
 
 
-# ── Tab button ────────────────────────────────────────────────────────────────
+# ── Tab button — pill style ───────────────────────────────────────────────────
 
 class TabBtn(QPushButton):
-    def __init__(self, label: str, color: str, parent=None):
-        super().__init__(label, parent)
-        self._color = color
+    def __init__(self, icon_sym: str, label: str, parent=None):
+        super().__init__(f"{icon_sym}  {label}", parent)
+        self._icon_sym = icon_sym
+        self._label    = label
         self.setCheckable(True)
-        self.setFixedHeight(36)
+        self.setFixedHeight(40)
+        self.setMinimumWidth(110)
+        self.setFont(QFont(FONT_DISPLAY, 14, QFont.Weight.Bold))
         self._update(False)
 
     def setChecked(self, v: bool):
@@ -92,27 +105,30 @@ class TabBtn(QPushButton):
         if active:
             self.setStyleSheet(f"""
                 QPushButton {{
-                    background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
-                        stop:0 {self._color}22, stop:1 {self._color}11);
-                    border: 1.5px solid {self._color}55;
-                    border-radius: 10px;
-                    color: {self._color};
-                    font-weight: 700; font-size: 13px; padding: 0 16px;
+                    background: {ACCENT};
+                    border: none;
+                    border-radius: 20px;
+                    color: white;
+                    font-weight: 700;
+                    font-size: 14px;
+                    padding: 0 18px;
                 }}
             """)
         else:
             self.setStyleSheet(f"""
                 QPushButton {{
                     background: transparent;
-                    border: 1.5px solid {BORDER};
-                    border-radius: 10px;
+                    border: 1.5px solid rgba(0,0,0,0.08);
+                    border-radius: 20px;
                     color: {MUTED};
-                    font-weight: 600; font-size: 13px; padding: 0 16px;
+                    font-weight: 600;
+                    font-size: 14px;
+                    padding: 0 18px;
                 }}
                 QPushButton:hover {{
-                    border-color: {self._color}44;
-                    color: {self._color};
-                    background: {self._color}0a;
+                    border-color: rgba(0,0,0,0.16);
+                    color: {TEXT2};
+                    background: {SURFACE2};
                 }}
             """)
 
@@ -125,7 +141,7 @@ class DropZone(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
-        self.setFixedHeight(100)
+        self.setFixedHeight(108)
         self._hovering = False
         self._path = ""
 
@@ -156,14 +172,14 @@ class DropZone(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         path = QPainterPath()
-        path.addRoundedRect(0, 0, self.width(), self.height(), 12, 12)
+        path.addRoundedRect(0, 0, self.width(), self.height(), 16, 16)
 
         if self._hovering:
-            p.fillPath(path, QColor(ACCENT_LIGHT))
-            pen = QPen(QColor(0,0,0,60), 1, Qt.PenStyle.DashLine)
+            p.fillPath(path, QColor(0, 0, 0, 28))
+            pen = QPen(QColor(0, 0, 0, 80), 1.5, Qt.PenStyle.DashLine)
         else:
             p.fillPath(path, QColor(SURFACE2))
-            pen = QPen(QColor(BORDER), 1.5, Qt.PenStyle.DashLine)
+            pen = QPen(QColor(0, 0, 0, 35), 1.5, Qt.PenStyle.DashLine)
 
         p.setPen(pen)
         p.drawPath(path)
@@ -171,19 +187,19 @@ class DropZone(QWidget):
         from PyQt6.QtCore import QRect
         if self._path:
             p.setPen(QColor(TEXT))
-            p.setFont(QFont("Segoe UI Variable", 11, QFont.Weight.Medium))
+            p.setFont(QFont(FONT_DISPLAY, 14, QFont.Weight.Bold))
             p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
-                       f"📄  {Path(self._path).name}")
+                       f"{ICON_FILE}  {Path(self._path).name}")
         else:
             p.setPen(QColor(MUTED))
-            p.setFont(QFont("Segoe UI Variable", 13))
+            p.setFont(QFont(FONT_DISPLAY, 14, QFont.Weight.Bold))
             p.drawText(
-                QRect(0, 10, self.width(), 30),
+                QRect(0, 16, self.width(), 30),
                 Qt.AlignmentFlag.AlignCenter, "Drop a file here"
             )
-            p.setFont(QFont("Segoe UI Variable", 11))
+            p.setFont(QFont(FONT_BODY, 13))
             p.drawText(
-                QRect(0, 44, self.width(), 26),
+                QRect(0, 50, self.width(), 28),
                 Qt.AlignmentFlag.AlignCenter, "or use the Browse button below"
             )
 
@@ -201,49 +217,51 @@ class AddItemDialog(QDialog):
         self._all_apps: list[dict] = []
 
         self.setWindowTitle("Add Item")
-        self.setFixedSize(500, 490)
+        self.setFixedSize(520, 520)
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self._build()
 
     def _build(self):
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setContentsMargins(12, 12, 12, 12)
 
         card = QWidget()
         card.setObjectName("dialogCard")
         card.setStyleSheet(f"""
             #dialogCard {{
                 background: {SURFACE};
-                border: 1.5px solid {BORDER};
-                border-radius: 20px;
+                border: 1.5px solid rgba(0,0,0,0.07);
+                border-radius: 24px;
             }}
         """)
         fx = QGraphicsDropShadowEffect(card)
-        fx.setBlurRadius(40)
-        fx.setColor(QColor(SHADOW_MD))
-        fx.setOffset(0, 8)
+        fx.setBlurRadius(50)
+        fx.setColor(QColor(0, 0, 0, 60))
+        fx.setOffset(0, 12)
         card.setGraphicsEffect(fx)
         outer.addWidget(card)
 
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(26, 24, 26, 24)
-        layout.setSpacing(16)
+        layout.setContentsMargins(30, 28, 30, 28)
+        layout.setSpacing(20)
 
         # Header
         header_row = QHBoxLayout()
         title = QLabel("Add to Session")
-        title.setStyleSheet(
-            f"color: {TEXT}; font-size: 17px; font-weight: 800; letter-spacing: -0.3px;"
-        )
+        title.setFont(QFont(FONT_DISPLAY, 20, QFont.Weight.Black))
+        title.setStyleSheet(f"color: {TEXT}; letter-spacing: -0.3px;")
         header_row.addWidget(title)
         header_row.addStretch()
-        close_btn = QPushButton("✕")
-        close_btn.setFixedSize(30, 30)
+        close_btn = QPushButton("×")
+        close_btn.setFixedSize(36, 36)
+        close_btn.setFont(QFont(FONT_BODY, 20, QFont.Weight.Light))
         close_btn.setStyleSheet(f"""
             QPushButton {{
-                background: {SURFACE3}; border: none;
-                color: {MUTED}; font-size: 13px; border-radius: 8px;
+                background: {SURFACE2};
+                border: none;
+                color: {MUTED};
+                border-radius: 12px;
             }}
             QPushButton:hover {{ background: {RED_BG}; color: {RED}; }}
         """)
@@ -251,12 +269,12 @@ class AddItemDialog(QDialog):
         header_row.addWidget(close_btn)
         layout.addLayout(header_row)
 
-        # Tabs
+        # Pill tabs
         tabs_row = QHBoxLayout()
         tabs_row.setSpacing(8)
-        self._tab_file = TabBtn("📄  File",    "#1A1A1A")
-        self._tab_url  = TabBtn("🌐  Website", "#1A1A1A")
-        self._tab_app  = TabBtn("⚙️  App",     "#1A1A1A")
+        self._tab_file = TabBtn(ICON_FILE, "File")
+        self._tab_url  = TabBtn(ICON_WEB,  "Website")
+        self._tab_app  = TabBtn(ICON_APP,  "App")
         for btn in (self._tab_file, self._tab_url, self._tab_app):
             tabs_row.addWidget(btn)
         tabs_row.addStretch()
@@ -267,7 +285,7 @@ class AddItemDialog(QDialog):
 
         div = QFrame()
         div.setFrameShape(QFrame.Shape.HLine)
-        div.setStyleSheet(f"background: {BORDER}; max-height: 1px;")
+        div.setStyleSheet(f"background: rgba(0,0,0,0.06); max-height: 1px;")
         layout.addWidget(div)
 
         # Pages
@@ -281,14 +299,14 @@ class AddItemDialog(QDialog):
         # Add button
         self._add_btn = QPushButton("Add to Session")
         self._add_btn.setObjectName("accentBtn")
-        self._add_btn.setFixedHeight(42)
+        self._add_btn.setFixedHeight(48)
+        self._add_btn.setFont(QFont(FONT_DISPLAY, 15, QFont.Weight.Bold))
         self._add_btn.clicked.connect(self._on_add)
         layout.addWidget(self._add_btn)
 
         self._error_lbl = QLabel("")
-        self._error_lbl.setStyleSheet(
-            f"color: {RED}; font-size: 12px; font-weight: 600;"
-        )
+        self._error_lbl.setFont(QFont(FONT_BODY, 13, QFont.Weight.Bold))
+        self._error_lbl.setStyleSheet(f"color: {RED};")
         self._error_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self._error_lbl)
 
@@ -300,7 +318,7 @@ class AddItemDialog(QDialog):
         w = QWidget()
         v = QVBoxLayout(w)
         v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(10)
+        v.setSpacing(12)
 
         self._drop_zone = DropZone()
         self._drop_zone.file_dropped.connect(self._on_file_dropped)
@@ -308,7 +326,19 @@ class AddItemDialog(QDialog):
 
         row = QHBoxLayout()
         browse = QPushButton("Browse…")
-        browse.setFixedHeight(32)
+        browse.setFixedHeight(36)
+        browse.setMinimumWidth(100)
+        browse.setFont(QFont(FONT_BODY, 13, QFont.Weight.Bold))
+        browse.setStyleSheet(f"""
+            QPushButton {{
+                background: {SURFACE2};
+                border: 1.5px solid rgba(0,0,0,0.07);
+                border-radius: 18px;
+                color: {TEXT2};
+                padding: 0 16px;
+            }}
+            QPushButton:hover {{ background: {SURFACE3}; }}
+        """)
         browse.clicked.connect(self._browse_file)
         row.addStretch()
         row.addWidget(browse)
@@ -323,7 +353,7 @@ class AddItemDialog(QDialog):
         w = QWidget()
         v = QVBoxLayout(w)
         v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(10)
+        v.setSpacing(12)
         v.addWidget(_section_lbl("URL"))
         self._url_field = _field("https://...")
         self._url_field.textChanged.connect(self._on_url_changed)
@@ -337,7 +367,7 @@ class AddItemDialog(QDialog):
         w = QWidget()
         v = QVBoxLayout(w)
         v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(8)
+        v.setSpacing(10)
 
         self._app_search = _field("Search installed apps…")
         self._app_search.textChanged.connect(self._filter_apps)
@@ -346,7 +376,7 @@ class AddItemDialog(QDialog):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setFixedHeight(165)
+        scroll.setFixedHeight(170)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setStyleSheet("background: transparent;")
 
@@ -360,34 +390,36 @@ class AddItemDialog(QDialog):
         v.addWidget(scroll)
 
         self._app_loading = QLabel("Loading installed apps…")
-        self._app_loading.setStyleSheet(
-            f"color: {MUTED}; font-size: 12px; font-style: italic;"
-        )
+        self._app_loading.setFont(QFont(FONT_BODY, 13))
+        self._app_loading.setStyleSheet(f"color: {MUTED}; font-style: italic;")
         self._app_loading.setAlignment(Qt.AlignmentFlag.AlignCenter)
         v.addWidget(self._app_loading)
 
         self._app_selected_lbl = QLabel("")
-        self._app_selected_lbl.setStyleSheet(
-            f"color: {ACCENT}; font-size: 12px; font-weight: 700;"
-        )
+        self._app_selected_lbl.setFont(QFont(FONT_DISPLAY, 13, QFont.Weight.Bold))
+        self._app_selected_lbl.setStyleSheet(f"color: {ACCENT};")
         v.addWidget(self._app_selected_lbl)
 
         fallback_row = QHBoxLayout()
         fallback_row.addStretch()
         fb = QPushButton("Browse .exe…")
-        fb.setFixedHeight(28)
+        fb.setFixedHeight(32)
+        fb.setMinimumWidth(110)
+        fb.setFont(QFont(FONT_BODY, 12, QFont.Weight.Bold))
         fb.setStyleSheet(f"""
             QPushButton {{
-                background: transparent; border: 1.5px solid {BORDER};
-                border-radius: 8px; color: {MUTED}; font-size: 11px; padding: 0 10px;
+                background: transparent;
+                border: 1.5px solid rgba(0,0,0,0.08);
+                border-radius: 16px;
+                color: {MUTED};
+                padding: 0 14px;
             }}
-            QPushButton:hover {{ color: {TEXT}; border-color: {ACCENT}; }}
+            QPushButton:hover {{ color: {TEXT}; border-color: rgba(0,0,0,0.18); }}
         """)
         fb.clicked.connect(self._browse_app_fallback)
         fallback_row.addWidget(fb)
         v.addLayout(fallback_row)
 
-        # Start QThread loader
         self._app_thread = QThread()
         self._app_worker = AppLoaderWorker()
         self._app_worker.moveToThread(self._app_thread)
@@ -408,8 +440,8 @@ class AddItemDialog(QDialog):
         self._populate_app_list(apps)
 
     def _on_apps_error(self, msg: str):
-        self._app_loading.setText("⚠ Could not load apps — use Browse .exe…")
-        self._app_loading.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        self._app_loading.setText("Could not load apps — use Browse .exe…")
+        self._app_loading.setStyleSheet(f"color: {MUTED}; font-size: 13px;")
 
     def _filter_apps(self, query: str):
         if not self._all_apps:
@@ -429,37 +461,45 @@ class AddItemDialog(QDialog):
 
     def _make_app_row(self, app: dict) -> QWidget:
         row = QWidget()
-        row.setFixedHeight(38)
+        row.setFixedHeight(42)
         row.setCursor(Qt.CursorShape.PointingHandCursor)
         row.setStyleSheet(f"""
-            QWidget {{ background: transparent; border-radius: 9px; }}
-            QWidget:hover {{ background: {SURFACE3}; }}
+            QWidget {{ background: transparent; border-radius: 12px; }}
+            QWidget:hover {{ background: {SURFACE2}; }}
         """)
         rl = QHBoxLayout(row)
-        rl.setContentsMargins(8, 4, 8, 4)
-        rl.setSpacing(10)
+        rl.setContentsMargins(10, 4, 10, 4)
+        rl.setSpacing(12)
 
-        icon_lbl = QLabel(app.get("icon_emoji", "⚙️"))
-        icon_lbl.setFixedSize(26, 26)
-        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon_lbl.setStyleSheet(
-            f"background: #f59e0b18; border-radius: 7px; font-size: 14px;"
-        )
-        rl.addWidget(icon_lbl)
+        icon_box = QWidget()
+        icon_box.setFixedSize(30, 30)
+        icon_box.setStyleSheet(f"""
+            background: {SURFACE3};
+            border-radius: 8px;
+        """)
+        il = QHBoxLayout(icon_box)
+        il.setContentsMargins(0, 0, 0, 0)
+        sym = QLabel(ICON_APP)
+        sym.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sym.setFont(QFont(FONT_BODY, 11))
+        sym.setStyleSheet(f"color: {TEXT2}; background: transparent;")
+        il.addWidget(sym)
+        rl.addWidget(icon_box)
 
         name_lbl = QLabel(app["name"])
-        name_lbl.setStyleSheet(f"color: {TEXT}; font-size: 12px; font-weight: 500;")
+        name_lbl.setFont(QFont(FONT_BODY, 14, QFont.Weight.Medium))
+        name_lbl.setStyleSheet(f"color: {TEXT};")
         rl.addWidget(name_lbl)
         rl.addStretch()
 
         def _select(a=app, r=row):
             self._selected_app = a
-            self._app_selected_lbl.setText(f"✓  {a['name']}")
+            self._app_selected_lbl.setText(f"Selected: {a['name']}")
             r.setStyleSheet(f"""
                 QWidget {{
                     background: rgba(0,0,0,0.05);
-                    border: 1px solid rgba(0,0,0,0.10);
-                    border-radius: 9px;
+                    border: 1.5px solid rgba(0,0,0,0.10);
+                    border-radius: 12px;
                 }}
             """)
 
@@ -472,9 +512,9 @@ class AddItemDialog(QDialog):
         )
         if path:
             self._selected_app = {
-                "name": label_for_app(path), "exe_path": path, "icon_emoji": "⚙️"
+                "name": label_for_app(path), "exe_path": path
             }
-            self._app_selected_lbl.setText(f"✓  {self._selected_app['name']}")
+            self._app_selected_lbl.setText(f"Selected: {self._selected_app['name']}")
 
     # ── File / URL handlers ──
 
