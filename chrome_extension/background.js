@@ -37,8 +37,14 @@ function connectNative() {
 
       // Native host requests tabs snapshot
       if (msg.type === "request_tabs") {
-        currentSessionId = msg.session_id;
-        sendTabs();
+        // Always honour the session_id from the request — don't rely on
+        // currentSessionId which may be null if the host just started.
+        if (msg.session_id) {
+          currentSessionId = msg.session_id;
+        }
+        // Send tabs even for the prewarm ping (session_id === 0) so the
+        // host process stays alive and ready for the real request.
+        sendTabsForSession(msg.session_id || currentSessionId);
       }
 
       // Native host says no active session
@@ -103,16 +109,21 @@ async function getCurrentTabs() {
 
 async function sendTabs() {
   if (!currentSessionId) return;
+  await sendTabsForSession(currentSessionId);
+}
+
+async function sendTabsForSession(sessionId) {
+  if (!sessionId && sessionId !== 0) return;
 
   const tabs = await getCurrentTabs();
   sendMessage({
     type: "tabs_snapshot",
-    session_id: currentSessionId,
+    session_id: sessionId,
     tabs: tabs,
     timestamp: new Date().toISOString(),
   });
 
-  console.log(`[WorkSpace] Sent ${tabs.length} tabs for session ${currentSessionId}`);
+  console.log(`[WorkSpace] Sent ${tabs.length} tabs for session ${sessionId}`);
 }
 
 // ── Event Listeners ───────────────────────────────────────────────────────────

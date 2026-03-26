@@ -32,6 +32,39 @@ ICON_APP     = "◈"
 ICON_GENERIC = "▣"
 
 
+def _display_path(path_or_url: str) -> str:
+    """
+    Return a clean human-readable version of path_or_url for display in the
+    item subtitle.  Strips internal encoding prefixes.
+
+      vscode-folder:<exe>||<folder>   →  <folder>  (or 'VS Code — no folder')
+      chrome-profile:<dir>|<url>      →  <url>  [<dir>]
+    """
+    if path_or_url.startswith("vscode-folder:"):
+        rest = path_or_url[len("vscode-folder:"):]
+        folder = rest.split("||", 1)[1] if "||" in rest else rest
+        return folder if folder.strip() else "VS Code — no folder open"
+    if path_or_url.startswith("explorer-folder:"):
+        folder = path_or_url[len("explorer-folder:"):]
+        return folder if folder.strip() else "File Explorer"
+    if path_or_url.startswith("uwp:"):
+        exe = path_or_url[len("uwp:"):]
+        # Show just the package name, not the full WindowsApps path
+        try:
+            parts = Path(exe).parts
+            idx = next(i for i, p in enumerate(parts) if p == "WindowsApps")
+            return parts[idx + 1].split("_")[0]  # e.g. "SpotifyAB.SpotifyMusic"
+        except Exception:
+            return Path(exe).stem
+    if path_or_url.startswith("chrome-profile:"):
+        rest = path_or_url[len("chrome-profile:"):]
+        if "|" in rest:
+            profile_dir, url = rest.split("|", 1)
+            return f"{url}  [{profile_dir}]"
+        return rest
+    return path_or_url
+
+
 def _apply_shadow(widget, blur=16, alpha=16, dy=4):
     fx = QGraphicsDropShadowEffect(widget)
     fx.setBlurRadius(blur)
@@ -148,11 +181,12 @@ class ItemRow(QWidget):
         text_col.addWidget(name_lbl)
 
         path = item["path_or_url"]
-        short = ("…" + path[-52:]) if len(path) > 55 else path
+        display = _display_path(path)
+        short = ("…" + display[-52:]) if len(display) > 55 else display
         path_lbl = QLabel(short)
         path_lbl.setFont(QFont(FONT_BODY, 12))
         path_lbl.setStyleSheet(f"color: {MUTED};")
-        path_lbl.setToolTip(path)
+        path_lbl.setToolTip(path)  # full raw value on hover
         text_col.addWidget(path_lbl)
         layout.addLayout(text_col)
         layout.addStretch()

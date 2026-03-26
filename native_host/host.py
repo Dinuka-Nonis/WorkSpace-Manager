@@ -79,11 +79,16 @@ def _poll_side_channel():
             if TAB_REQUEST_FILE.exists():
                 payload = json.loads(TAB_REQUEST_FILE.read_text(encoding="utf-8"))
                 sid = payload.get("session_id")
-                if sid:
+                is_prewarm = payload.get("prewarm", False)
+                TAB_REQUEST_FILE.unlink(missing_ok=True)
+
+                if is_prewarm or sid == 0:
+                    # Pre-warm ping — just stay alive, no snapshot needed
+                    log("Pre-warm ping received — host is ready")
+                elif sid:
                     log(f"Side-channel snapshot request for session {sid}")
                     with _snapshot_lock:
                         _pending_snapshot_session = int(sid)
-                TAB_REQUEST_FILE.unlink(missing_ok=True)
         except Exception as e:
             log(f"Side-channel poll error: {e}")
         time.sleep(0.5)

@@ -6,3 +6,5 @@ keyboard>=0.13.5
 # Windows-only (install separately on Windows):
 # pywin32  — for tray balloon, win32api shutdown hook, COM/shortcut reading
 #            pip install pywin32
+# comtypes — for File Explorer open-folder detection via Shell.Application COM
+#            pip install comtypes

@@ -112,6 +112,99 @@ def _icon_for_exe(exe_path: str) -> str:
 
 # ── Registry reader ───────────────────────────────────────────────────────────
 
+def _scan_user_install_dirs() -> list[dict]:
+    """
+    Scan directories where apps are installed outside Program Files and therefore
+    often missing from HKLM uninstall keys:
+
+      %LOCALAPPDATA%\\Programs\\          — VS Code, Cursor, many Electron apps
+      %APPDATA%\\Spotify\\                — Spotify
+      %LOCALAPPDATA%\\Discord\\           — Discord
+      %LOCALAPPDATA%\\<name>\\<name>.exe  — generic Electron / NSIS pattern
+
+    Only returns apps whose exe actually exists.
+    """
+    if sys.platform != "win32":
+        return []
+
+    localappdata = os.environ.get("LOCALAPPDATA", "")
+    appdata      = os.environ.get("APPDATA", "")
+
+    # (folder_to_scan, max_depth)
+    search_roots = []
+    if localappdata:
+        search_roots.append((Path(localappdata) / "Programs", 3))
+        search_roots.append((Path(localappdata), 2))   # catches Discord, etc.
+    if appdata:
+        search_roots.append((Path(appdata), 2))        # catches Spotify
+
+    # Known exact locations as a fast-path (avoid full walk)
+    known_locations = []
+    if localappdata:
+        known_locations += [
+            Path(localappdata) / "Programs" / "Microsoft VS Code" / "Code.exe",
+            Path(localappdata) / "Programs" / "cursor" / "Cursor.exe",
+            Path(localappdata) / "Discord" / "app-*" / "Discord.exe",
+        ]
+    if appdata:
+        known_locations += [
+            Path(appdata) / "Spotify" / "Spotify.exe",
+        ]
+
+    results: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(exe_path: Path):
+        norm = os.path.normcase(str(exe_path))
+        if norm in seen:
+            return
+        if not exe_path.exists():
+            return
+        stem = exe_path.stem.lower()
+        # Skip helpers, updaters, crash handlers
+        skip = ("uninstall", "setup", "helper", "updater", "crash",
+                "squirrel", "update", "installer", "repair")
+        if any(kw in stem for kw in skip):
+            return
+        seen.add(norm)
+        results.append({
+            "name":       exe_path.stem,
+            "exe_path":   str(exe_path),
+            "icon_emoji": _icon_for_exe(str(exe_path)),
+        })
+
+    # Fast-path: check known locations first (glob for versioned dirs)
+    for loc in known_locations:
+        if "*" in str(loc):
+            parent = loc.parent.parent
+            pattern = loc.parent.name + "/" + loc.name
+            try:
+                for match in parent.glob(pattern):
+                    _add(match)
+            except Exception:
+                pass
+        else:
+            _add(loc)
+
+    # Walk %LOCALAPPDATA%\Programs — this is the main catch-all for VS Code etc.
+    programs_dir = Path(localappdata) / "Programs" if localappdata else None
+    if programs_dir and programs_dir.exists():
+        for app_dir in programs_dir.iterdir():
+            if not app_dir.is_dir():
+                continue
+            # Look for a main exe named after the folder
+            for exe in app_dir.glob("*.exe"):
+                _add(exe)
+            # One level deeper
+            for sub in app_dir.iterdir():
+                if not sub.is_dir():
+                    continue
+                for exe in sub.glob("*.exe"):
+                    _add(exe)
+
+    return results
+
+
 def _read_uninstall_keys() -> list[dict]:
     """
     Read installed apps from Windows Uninstall registry keys.
@@ -344,6 +437,13 @@ def get_installed_apps(force_refresh: bool = False) -> list[dict]:
         return _cache
 
     all_apps: list[dict] = []
+
+    try:
+        user_installs = _scan_user_install_dirs()
+        print(f"[AppRegistry] User install dirs: {len(user_installs)} apps")
+        all_apps.extend(user_installs)
+    except Exception as e:
+        print(f"[AppRegistry] User install dirs failed: {e}")
 
     try:
         uninstall = _read_uninstall_keys()

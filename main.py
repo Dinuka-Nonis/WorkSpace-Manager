@@ -150,6 +150,13 @@ def main():
     db.init_db()
     register_shutdown_hook()
 
+    # Pre-warm the Chrome native host so it's ready when Save Snapshot is clicked
+    try:
+        from core.snapshot import _prewarm_native_host
+        threading.Thread(target=_prewarm_native_host, daemon=True).start()
+    except Exception:
+        pass
+
     window = MainWindow()
     window.show()
 
