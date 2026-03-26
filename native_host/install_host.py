@@ -42,6 +42,8 @@ def write_manifest():
     """Write the native host manifest JSON file."""
     host_path = get_host_py_path().resolve()
     python_path = find_python()
+    print(f"  host.py path : {host_path}")
+    print(f"  python path  : {python_path}")
 
     # Create a wrapper .bat file that Chrome can call
     bat_path = get_manifest_dir() / "workspace_host.bat"
@@ -53,7 +55,7 @@ def write_manifest():
         "type": "stdio",
         "allowed_origins": [
             # Replace with your extension ID after loading unpacked
-            "chrome-extension://jcbdppmjggfllhbnpkdllckdlpgninii/"
+            "chrome-extension://REPLACE_WITH_EXTENSION_ID/"
         ]
     }
 

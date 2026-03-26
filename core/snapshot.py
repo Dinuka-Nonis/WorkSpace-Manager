@@ -416,251 +416,234 @@ def _get_file_explorer_windows() -> list[dict]:
 
 # ── Running apps capture ──────────────────────────────────────────────────────
 
-def _get_uwp_apps() -> list[dict]:
+
+# ── New strategy: enumerate ALL visible windows directly ──────────────────────
+#
+# Instead of building a registry of "installed apps" and hoping running
+# processes match it, we ask Windows for every visible window, get its
+# title + owning process + exe path, and use that as ground truth.
+# This captures UWP apps, Store apps, Electron apps, everything —
+# with no hardcoded app lists.
+
+def _get_window_title(hwnd) -> str:
+    import ctypes
+    buf = ctypes.create_unicode_buffer(512)
+    ctypes.windll.user32.GetWindowTextW(hwnd, buf, 512)
+    return buf.value.strip()
+
+
+def _get_window_rect(hwnd) -> tuple[int, int, int, int]:
+    import ctypes, ctypes.wintypes
+    rect = ctypes.wintypes.RECT()
+    ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+    return rect.left, rect.top, rect.right, rect.bottom
+
+
+def _is_real_app_window(hwnd, user32) -> bool:
     """
-    Detect running Microsoft Store / UWP / MSIX apps (Spotify, WhatsApp,
-    Claude desktop, etc.) by enumerating processes whose exe lives under
-    C:\\Program Files\\WindowsApps\\ and have a real visible window.
+    True if hwnd is a real top-level application window the user can see.
+    Filters out: invisible, zero-title, tiny, tool windows, UWP chrome windows.
+    """
+    if not user32.IsWindowVisible(hwnd):
+        return False
+    # Must have a title
+    title_len = user32.GetWindowTextLengthW(hwnd)
+    if title_len == 0:
+        return False
+    # Must be a top-level window (no owner / owned by desktop)
+    if user32.GetWindow(hwnd, 4) != 0:   # GW_OWNER = 4
+        return False
+    # Filter by extended window style
+    import ctypes
+    GWL_EXSTYLE   = -20
+    WS_EX_TOOLWINDOW  = 0x00000080
+    WS_EX_NOACTIVATE  = 0x08000000
+    ex_style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+    if ex_style & WS_EX_TOOLWINDOW:
+        return False
+    # Must have reasonable size
+    l, t, r, b = _get_window_rect(hwnd)
+    if (r - l) < 50 or (b - t) < 50:
+        return False
+    return True
 
-    We derive a clean label from the package folder name, e.g.:
-        SpotifyAB.SpotifyMusic_1.285.519.0_x64__zpdnekdrzrea0  →  Spotify
-        5319275A.WhatsAppDesktop_...                            →  WhatsApp
 
-    path_or_url is stored as  uwp:<full_exe_path>  so the launcher can
-    open it with subprocess (UWP exes are directly executable).
+def capture_running_apps() -> list[dict]:
+    """
+    Enumerate all real visible top-level windows and return app items for each.
+
+    Strategy (no hardcoded app lists):
+      1. Walk every HWND via EnumWindows
+      2. Apply real-window filter (visible, titled, non-tool, big enough)
+      3. Get owning PID -> exe path
+      4. Skip noise (interpreters, background stems)
+      5. Special handling:
+           • explorer.exe    → capture folder path via Shell COM
+           • code.exe/cursor → capture VS Code workspace folder
+           • chrome.exe      → skip (captured via extension)
+           • WindowsApps/... → UWP app, derive label from package name
+           • everything else → use window title as label, exe as path_or_url
     """
     if sys.platform != "win32":
         return []
 
     try:
-        import psutil
+        import psutil, ctypes, ctypes.wintypes
     except ImportError:
         return []
 
-    results: list[dict] = []
-    seen_keys: set[str] = set()
+    user32  = ctypes.windll.user32
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
 
-    # Known friendly names keyed on a substring of the package publisher/name
-    _UWP_NAMES: dict[str, str] = {
-        "spotifyab":    "Spotify",
-        "spotify":      "Spotify",
-        "whatsapp":     "WhatsApp",
-        "discord":      "Discord",
-        "telegram":     "Telegram",
-        "claude":       "Claude",
-        "slack":        "Slack",
-        "netflix":      "Netflix",
-        "twitter":      "Twitter / X",
-        "instagram":    "Instagram",
-        "tiktok":       "TikTok",
-        "zoom":         "Zoom",
-        "teams":        "Microsoft Teams",
-        "onenote":      "OneNote",
-        "todo":         "Microsoft To Do",
-        "xbox":         "Xbox",
-        "prime":        "Prime Video",
+    # Collect (hwnd, pid, exe, title) for every real window
+    windows: list[tuple[int, int, str, str]] = []
+
+    def _enum_cb(hwnd, _):
+        try:
+            if not _is_real_app_window(hwnd, user32):
+                return True
+            title = _get_window_title(hwnd)
+            if not title:
+                return True
+            proc_id = ctypes.wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc_id))
+            pid = proc_id.value
+            try:
+                proc = psutil.Process(pid)
+                exe  = proc.exe()
+            except Exception:
+                return True
+            if exe:
+                windows.append((hwnd, pid, exe, title))
+        except Exception:
+            pass
+        return True
+
+    user32.EnumWindows(WNDENUMPROC(_enum_cb), 0)
+
+    # Process collected windows into app items
+    results:      list[dict] = []
+    seen_exe:     set[str]   = set()   # deduplicate by exe (most apps)
+    seen_uwp_pkg: set[str]   = set()   # deduplicate UWP by package folder
+    vscode_seen:  set[str]   = set()
+    explorer_done = False
+
+    _VSCODE_STEMS = {"code", "code - insiders", "cursor"}
+    wa_norm = os.path.normcase(r"C:\Program Files\WindowsApps")
+
+    _UWP_NAMES = {
+        "spotifyab": "Spotify", "spotify": "Spotify",
+        "whatsapp": "WhatsApp", "discord": "Discord",
+        "telegram": "Telegram", "claude": "Claude",
+        "openai": "ChatGPT", "chatgpt": "ChatGPT",
+        "slack": "Slack", "netflix": "Netflix",
+        "zunevideo": "Movies & TV", "zune": "Movies & TV",
+        "microsoftmovies": "Movies & TV",
+        "twitter": "Twitter / X", "instagram": "Instagram",
+        "tiktok": "TikTok", "zoom": "Zoom",
+        "teams": "Microsoft Teams", "xbox": "Xbox",
+        "prime": "Prime Video",
     }
 
-    windowsapps = Path("C:/Program Files/WindowsApps")
+    _UWP_BG_STEMS = frozenset({
+        "nahimic3", "rtkuwp", "igcctray", "igcc", "gesturesign",
+        "translucenttb", "widgetservice", "widgets", "xboxpcappft",
+        "gamingservices", "gamingservicesnet", "phoneexperiencehost",
+        "crossdeviceservice", "m365copilot_autostarter", "cowork-svc",
+    })
 
-    for proc in psutil.process_iter(["exe", "pid", "name"]):
+    for hwnd, pid, raw_exe, title in windows:
         try:
-            exe = proc.info.get("exe") or ""
-            pid = proc.info.get("pid") or 0
-            if not exe:
+            exe_path = Path(raw_exe)
+            stem     = exe_path.stem.lower()
+            exe_key  = os.path.normcase(raw_exe)
+
+            # ── Chrome — skip, tabs captured via extension ────────────────────
+            if stem in ("chrome", "chromium", "msedge", "brave", "firefox", "opera"):
                 continue
 
-            exe_path = Path(exe)
-            # Must live inside WindowsApps
-            try:
-                exe_path.relative_to(windowsapps)
-            except ValueError:
+            # ── Interpreters / runtimes — skip ───────────────────────────────
+            if stem in _BACKGROUND_STEMS or _is_interpreter(stem):
                 continue
 
-            norm = os.path.normcase(exe)
-            if norm in seen_keys:
+            # ── Background noise substrings ───────────────────────────────────
+            if any(s in stem for s in ("crashpad", "conhost", "dwm",
+                                        "searchhost", "textinputhost",
+                                        "applicationframehost")):
                 continue
 
-            if not _has_visible_window_win32(pid):
-                continue
-
-            seen_keys.add(norm)
-
-            # Derive a friendly name from the package folder name
-            # Package folder is the immediate child of WindowsApps
-            try:
-                package_folder = exe_path.relative_to(windowsapps).parts[0]
-            except (ValueError, IndexError):
-                package_folder = exe_path.stem
-
-            # package_folder looks like "SpotifyAB.SpotifyMusic_1.285_x64__hash"
-            # Take the part before the first underscore or dot-number
-            raw = package_folder.split("_")[0]          # "SpotifyAB.SpotifyMusic"
-            short = raw.split(".")[-1]                   # "SpotifyMusic"
-            label = short                                 # default
-
-            # Check friendly name table
-            raw_lower = raw.lower()
-            for key, friendly in _UWP_NAMES.items():
-                if key in raw_lower:
-                    label = friendly
-                    break
-
-            results.append({
-                "type":        "app",
-                "path_or_url": f"uwp:{exe}",
-                "label":       label,
-            })
-        except Exception:
-            continue
-
-    return results
-
-
-def _any_pid_has_visible_window(exe_key: str, all_procs) -> bool:
-    """
-    Check ALL processes with this exe path for a visible window.
-    VS Code and other Electron apps spawn many worker processes — the first
-    one enumerated is often a background worker with no window.
-    """
-    for pid, key in all_procs:
-        if key == exe_key:
-            if _has_visible_window_win32(pid):
-                return True
-    return False
-
-
-def capture_running_apps() -> list[dict]:
-    """
-    Return app items for currently running foreground applications.
-    Deduplicated by exe path.
-
-    Special rules:
-      • Interpreters / runtimes (python, node, java …)  → always filtered out.
-      • chrome.exe / chromium.exe → filtered out (tabs captured via extension).
-      • code.exe / cursor.exe     → replaced by vscode-folder workspace items.
-      • explorer.exe              → replaced by open folder window items.
-      • WindowsApps processes     → detected separately as UWP apps.
-
-    Key fix: for multi-process apps (VS Code, Electron apps), we check ALL
-    PIDs sharing the same exe path before deciding there is no visible window.
-    """
-    try:
-        import psutil
-    except ImportError:
-        return []
-
-    try:
-        from core.app_registry import get_installed_apps
-        known: dict[str, dict] = {
-            os.path.normcase(a["exe_path"]): a
-            for a in get_installed_apps()
-            if a.get("exe_path")
-        }
-    except Exception:
-        return []
-
-    is_win = sys.platform == "win32"
-
-    # ── Pre-collect ALL (pid, norm_exe_key) pairs in one pass ────────────────
-    # This lets _any_pid_has_visible_window check every worker of an app.
-    all_pid_keys: list[tuple[int, str]] = []
-    raw_procs: list[tuple[str, int, str]] = []  # (raw_exe, pid, stem)
-
-    try:
-        for proc in psutil.process_iter(["exe", "pid"]):
-            raw_exe = proc.info.get("exe") or ""
-            pid     = proc.info.get("pid") or 0
-            if raw_exe and pid:
-                key  = os.path.normcase(raw_exe)
-                stem = Path(raw_exe).stem.lower()
-                all_pid_keys.append((pid, key))
-                raw_procs.append((raw_exe, pid, stem))
-    except Exception:
-        return []
-
-    seen:        set[str]  = set()
-    vscode_seen: set[str]  = set()
-    results:     list[dict] = []
-
-    _VSCODE_STEMS  = {"code", "code - insiders", "cursor"}
-    _explorer_done = False
-    _uwp_done      = False
-
-    for raw_exe, pid, stem in raw_procs:
-        try:
-            key = os.path.normcase(raw_exe)
-
-            if key in seen:
-                continue
-
-            # ── UWP / WindowsApps — handle once via dedicated scanner ─────────
-            if "WindowsApps" in raw_exe and not _uwp_done:
-                _uwp_done = True
-                for item in _get_uwp_apps():
-                    results.append(item)
-                # Mark all WindowsApps exes as seen
-                for r_exe, _, _ in raw_procs:
-                    if "WindowsApps" in r_exe:
-                        seen.add(os.path.normcase(r_exe))
-                continue
-
-            if "WindowsApps" in raw_exe:
-                seen.add(key)
-                continue
-
-            # ── Hard block-list ───────────────────────────────────────────────
-            if stem in _BACKGROUND_STEMS:
-                seen.add(key)
+            # ── UWP / WindowsApps ─────────────────────────────────────────────
+            if wa_norm in exe_key:
+                if stem in _UWP_BG_STEMS:
+                    continue
+                if any(kw in stem for kw in ("helper", "service", "server",
+                                              "host", "broker", "agent",
+                                              "svc", "overlay", "systrap",
+                                              "autostart")):
+                    continue
+                # Derive package folder for dedup
+                parts = exe_path.parts
+                try:
+                    wa_idx = next(i for i, p in enumerate(parts)
+                                  if p.lower() == "windowsapps")
+                    pkg_folder = parts[wa_idx + 1]
+                except (StopIteration, IndexError):
+                    pkg_folder = stem
+                if pkg_folder in seen_uwp_pkg:
+                    continue
+                seen_uwp_pkg.add(pkg_folder)
+                # Friendly label
+                raw_pkg = pkg_folder.split("_")[0]
+                label   = raw_pkg.split(".")[-1]
+                for key, friendly in _UWP_NAMES.items():
+                    if key in raw_pkg.lower():
+                        label = friendly
+                        break
+                results.append({
+                    "type":        "app",
+                    "path_or_url": f"uwp:{raw_exe}",
+                    "label":       label,
+                })
                 continue
 
             # ── File Explorer ─────────────────────────────────────────────────
-            if stem == "explorer" and not _explorer_done:
-                _explorer_done = True
-                seen.add(key)
-                for item in _get_file_explorer_windows():
-                    results.append(item)
-                continue
-
-            # ── Versioned interpreter ─────────────────────────────────────────
-            if _is_interpreter(stem):
-                seen.add(key)
-                continue
-
-            # ── Substring block-list ──────────────────────────────────────────
-            if any(sub in stem for sub in ("helper", "updater", "service",
-                                           "agent", "daemon", "notif",
-                                           "crash", "report")):
-                seen.add(key)
+            if stem == "explorer":
+                if not explorer_done:
+                    explorer_done = True
+                    for item in _get_file_explorer_windows():
+                        results.append(item)
                 continue
 
             # ── VS Code / Cursor ──────────────────────────────────────────────
             if stem in _VSCODE_STEMS:
-                seen.add(key)
-                # Check ALL PIDs for this exe — not just the first process
-                if is_win and not _any_pid_has_visible_window(key, all_pid_keys):
-                    continue
-                for item in _get_vscode_workspaces(raw_exe):
-                    if item["path_or_url"] not in vscode_seen:
-                        vscode_seen.add(item["path_or_url"])
-                        results.append(item)
+                if exe_key not in seen_exe:
+                    seen_exe.add(exe_key)
+                    for item in _get_vscode_workspaces(raw_exe):
+                        if item["path_or_url"] not in vscode_seen:
+                            vscode_seen.add(item["path_or_url"])
+                            results.append(item)
                 continue
 
-            # ── Must be in the installed-app registry ─────────────────────────
-            if key not in known:
+            # ── Everything else — use window title + exe path ─────────────────
+            if exe_key in seen_exe:
                 continue
+            seen_exe.add(exe_key)
 
-            # ── Windows: check ALL PIDs for this exe for a visible window ─────
-            if is_win and not _any_pid_has_visible_window(key, all_pid_keys):
-                seen.add(key)
-                continue
+            # Clean up the title: remove common suffixes like " - Chrome", app name repeats
+            label = title
+            # Trim overly long window titles to just the app name part
+            # Many apps put "Document - AppName" — take last segment after " - "
+            if " - " in label:
+                parts_title = label.split(" - ")
+                # Heuristic: if last segment is short (likely app name), prefer it
+                last = parts_title[-1].strip()
+                if len(last) < 40:
+                    label = last
 
-            seen.add(key)
-            app = known[key]
             results.append({
                 "type":        "app",
-                "path_or_url": app["exe_path"],
-                "label":       app["name"],
+                "path_or_url": raw_exe,
+                "label":       label,
             })
         except Exception:
             continue
@@ -670,7 +653,7 @@ def capture_running_apps() -> list[dict]:
 
 # ── Chrome-tab capture (side-channel via native messaging host) ───────────────
 
-_TAB_REQUEST_TIMEOUT = 10.0   # raised from 3s — Chrome needs time to launch host
+_TAB_REQUEST_TIMEOUT = 10.0   # seconds to wait for Chrome extension response
 
 
 def _prewarm_native_host():
@@ -722,6 +705,7 @@ def request_tabs_from_extension(session_id: int) -> list[dict]:
     except Exception:
         return []
 
+    print(f"[Chrome] Waiting for tabs from native host (timeout={_TAB_REQUEST_TIMEOUT}s)...", flush=True)
     deadline = time.time() + _TAB_REQUEST_TIMEOUT
     while time.time() < deadline:
         if resp_file.exists():
@@ -757,6 +741,7 @@ def request_tabs_from_extension(session_id: int) -> list[dict]:
         time.sleep(0.12)
 
     req_file.unlink(missing_ok=True)
+    print("[Chrome] Timed out — no response from native host. Is the extension installed and Chrome running?", flush=True)
     return []
 
 

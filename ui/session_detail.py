@@ -5,6 +5,7 @@ Proper button sizing · Geometric icons.
 """
 
 from datetime import datetime
+from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,

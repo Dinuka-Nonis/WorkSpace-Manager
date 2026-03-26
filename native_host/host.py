@@ -47,12 +47,17 @@ def read_message(stream) -> dict | None:
         return None
 
 
+_stdout_lock = threading.Lock()
+
+
 def send_message(stream, data: dict):
+    """Thread-safe message send — overrides the earlier definition."""
     try:
         encoded = json.dumps(data).encode("utf-8")
-        stream.buffer.write(struct.pack("<I", len(encoded)))
-        stream.buffer.write(encoded)
-        stream.buffer.flush()
+        with _stdout_lock:
+            stream.buffer.write(struct.pack("<I", len(encoded)))
+            stream.buffer.write(encoded)
+            stream.buffer.flush()
     except Exception as e:
         log(f"send_message error: {e}")
 
@@ -156,21 +161,26 @@ def main():
     t = threading.Thread(target=_poll_side_channel, daemon=True)
     t.start()
 
-    while True:
-        # Check if there's a pending side-channel snapshot request first
-        with _snapshot_lock:
-            snap_sid = _pending_snapshot_session
-
-        if snap_sid is not None and not _awaiting_side_channel_tabs:
-            log(f"Sending request_tabs to extension for side-channel session {snap_sid}")
-            send_message(sys.stdout, {
-                "type":       "request_tabs",
-                "session_id": snap_sid,
-            })
-            _awaiting_side_channel_tabs = True
+    # Background thread that watches for side-channel requests and sends
+    # request_tabs to the extension without being blocked by read_message().
+    def _side_channel_sender():
+        global _awaiting_side_channel_tabs, _pending_snapshot_session
+        while True:
+            time.sleep(0.3)
             with _snapshot_lock:
-                pass  # we'll clear _pending_snapshot_session when response arrives
+                snap_sid = _pending_snapshot_session
+            if snap_sid is not None and not _awaiting_side_channel_tabs:
+                log(f"Sending request_tabs to extension for session {snap_sid}")
+                send_message(sys.stdout, {
+                    "type":       "request_tabs",
+                    "session_id": snap_sid,
+                })
+                _awaiting_side_channel_tabs = True
 
+    sender_thread = threading.Thread(target=_side_channel_sender, daemon=True)
+    sender_thread.start()
+
+    while True:
         msg = read_message(sys.stdin)
         if msg is None:
             log("EOF received — exiting")
@@ -200,9 +210,7 @@ def main():
                     if is_sc:
                         _awaiting_side_channel_tabs = False
                         with _snapshot_lock:
-                            pass
-                        global _pending_snapshot_session
-                        _pending_snapshot_session = None
+                            _pending_snapshot_session = None
                     send_message(sys.stdout, {
                         "type":       "tabs_ack",
                         "count":      len(tabs),

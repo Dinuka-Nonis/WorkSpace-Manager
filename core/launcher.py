@@ -202,42 +202,83 @@ def open_uwp_app(exe: str) -> tuple[bool, str]:
     """
     Launch a UWP / Microsoft Store app.
 
-    UWP exes in WindowsApps can't be launched directly (access denied).
-    We use the shell:AppsFolder URI scheme via explorer.exe to open them,
-    looking up the Application User Model ID (AUMID) from the registry.
-    Falls back to direct subprocess launch (works for some MSIX apps).
+    WindowsApps exes cannot be launched directly (WinError 5 Access Denied).
+    Strategy:
+      1. Find the AUMID from the registry -> launch via shell:AppsFolder\\<AUMID>
+      2. Derive package family name from the exe path → try uri launch via
+         PowerShell Start-Process
+      3. Last resort: explorer.exe shell:AppsFolder (opens the App list)
     """
     if not exe:
         return False, "No exe path for UWP app"
 
-    # Try AUMID launch via shell first (most reliable for Store apps)
+    exe_path = Path(exe)
+
+    # ── Strategy 1: AUMID lookup ──────────────────────────────────────────────
     try:
-        import winreg
-        # Search HKCU\Software\Classes\ActivatableClasses\Package for matching path
-        # The AUMID is what we need for shell:AppsFolder\<AUMID>
-        stem = Path(exe).stem.lower()
-        aumid = _find_aumid_for_stem(stem)
+        stem = exe_path.stem.lower()
+        aumid = _find_aumid_for_stem(exe)
         if aumid:
             subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{aumid}"])
             return True, ""
     except Exception:
         pass
 
-    # Fallback: try direct launch (works for some MSIX apps like Claude desktop)
+    # ── Strategy 2: PowerShell Start-Process with package family name ─────────
     try:
-        subprocess.Popen([exe])
+        # Extract package folder from path e.g.
+        # C:\Program Files\WindowsApps\SpotifyAB.SpotifyMusic_1.285_x64__zpdnekdrzrea0\Spotify.exe
+        parts = exe_path.parts
+        wa_idx = next((i for i, p in enumerate(parts) if p.lower() == "windowsapps"), None)
+        if wa_idx is not None:
+            package_folder = parts[wa_idx + 1]
+            # Package family name = everything before the last __ token + the publisher hash
+            # e.g. "SpotifyAB.SpotifyMusic_1.285_x64__zpdnekdrzrea0"
+            #   → family = "SpotifyAB.SpotifyMusic_zpdnekdrzrea0"
+            segments = package_folder.split("_")
+            if len(segments) >= 2:
+                app_name = segments[0]         # "SpotifyAB.SpotifyMusic"
+                pub_hash = segments[-1]        # "zpdnekdrzrea0"
+                family   = f"{app_name}_{pub_hash}"
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-WindowStyle", "Hidden",
+                     "-Command", f'Start-Process "shell:AppsFolder\\{family}!App"'],
+                    capture_output=True, timeout=5
+                )
+                if result.returncode == 0:
+                    return True, ""
+    except Exception:
+        pass
+
+    # ── Strategy 3: PowerShell Start-Process with ms-store URI ───────────────
+    # Works for many Store apps via their product URI
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden",
+             "-Command", f'explorer "shell:AppsFolder"'],
+            capture_output=True, timeout=5
+        )
         return True, ""
     except Exception as e:
         return False, f"Could not launch UWP app: {e}"
 
 
-def _find_aumid_for_stem(stem: str) -> str:
+def _find_aumid_for_stem(exe: str) -> str:
     """
-    Search the Windows registry for an Application User Model ID matching
-    the given exe stem (e.g. 'spotify' → 'SpotifyAB.SpotifyMusic_..!Spotify').
+    Search the Windows registry for an Application User Model ID (AUMID)
+    matching the given exe path, by looking up the package folder name.
+
+    Returns a string like "SpotifyAB.SpotifyMusic_hash!Spotify" or "".
     """
     try:
         import winreg
+        exe_path = Path(exe)
+        parts = exe_path.parts
+        wa_idx = next((i for i, p in enumerate(parts) if p.lower() == "windowsapps"), None)
+        if wa_idx is None:
+            return ""
+        package_folder = parts[wa_idx + 1]  # e.g. "SpotifyAB.SpotifyMusic_1.285_x64__hash"
+
         base = r"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages"
         root = winreg.OpenKey(winreg.HKEY_CURRENT_USER, base)
         i = 0
@@ -247,19 +288,23 @@ def _find_aumid_for_stem(stem: str) -> str:
                 i += 1
             except OSError:
                 break
-            if stem not in pkg_name.lower():
+            # Match by package folder prefix (before first underscore = publisher.appname)
+            pkg_prefix = package_folder.split("_")[0].lower()
+            if pkg_prefix not in pkg_name.lower():
                 continue
             try:
-                pkg_key = winreg.OpenKey(root, pkg_name + r"\Applications")
+                apps_key = winreg.OpenKey(root, pkg_name + r"\Applications")
                 j = 0
                 while True:
                     try:
-                        app_id = winreg.EnumKey(pkg_key, j)
+                        app_id = winreg.EnumKey(apps_key, j)
                         j += 1
+                        winreg.CloseKey(apps_key)
+                        winreg.CloseKey(root)
                         return f"{pkg_name}!{app_id}"
                     except OSError:
                         break
-                winreg.CloseKey(pkg_key)
+                winreg.CloseKey(apps_key)
             except OSError:
                 continue
         winreg.CloseKey(root)
