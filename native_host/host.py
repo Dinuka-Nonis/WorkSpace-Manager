@@ -66,6 +66,57 @@ def log(msg: str):
     print(f"[WorkSpace Host] {msg}", file=sys.stderr, flush=True)
 
 
+def _detect_chrome_profile() -> tuple[str, str]:
+    """
+    Detect the active Chrome profile by scanning running chrome.exe processes
+    for --profile-directory=<dir>, then reads Local State to get the display name.
+    Returns (profile_dir, profile_name) e.g. ("Profile 3", "Work Account").
+    Returns ("Default", "Default") if Chrome is running with no explicit flag.
+    Returns ("", "") if Chrome is not running.
+    """
+    import json, os
+    try:
+        import psutil
+    except ImportError:
+        return "", ""
+
+    local_appdata = os.getenv("LOCALAPPDATA", "")
+    local_state   = os.path.join(local_appdata, "Google", "Chrome", "User Data", "Local State")
+
+    profile_names: dict[str, str] = {}
+    if os.path.exists(local_state):
+        try:
+            data = json.loads(open(local_state, encoding="utf-8", errors="replace").read())
+            for dir_name, info in data.get("profile", {}).get("info_cache", {}).items():
+                profile_names[dir_name] = info.get("name", dir_name)
+        except Exception:
+            pass
+
+    chrome_running = False
+    profile_counts: dict[str, int] = {}
+
+    for proc in psutil.process_iter(["exe", "cmdline"]):
+        try:
+            exe = proc.info.get("exe") or ""
+            if "chrome.exe" not in exe.lower():
+                continue
+            chrome_running = True
+            for arg in (proc.info.get("cmdline") or []):
+                if arg.startswith("--profile-directory="):
+                    prof = arg.split("=", 1)[1].strip('"').strip("'")
+                    profile_counts[prof] = profile_counts.get(prof, 0) + 1
+        except Exception:
+            continue
+
+    if not chrome_running:
+        return "", ""
+    if not profile_counts:
+        name = profile_names.get("Default", "Default")
+        return "Default", name
+    best = max(profile_counts, key=lambda k: profile_counts[k])
+    return best, profile_names.get(best, best)
+
+
 # ── Side-channel poller ───────────────────────────────────────────────────────
 # The Python UI writes a tab_request.json file when it wants a snapshot.
 # We detect it here, send a request_tabs to the extension, and write the
@@ -87,9 +138,17 @@ def _poll_side_channel():
                 is_prewarm = payload.get("prewarm", False)
                 TAB_REQUEST_FILE.unlink(missing_ok=True)
 
-                if is_prewarm or sid == 0:
+                is_preview = payload.get("preview", False)
+                if is_prewarm or (sid == 0 and not is_preview):
                     # Pre-warm ping — just stay alive, no snapshot needed
                     log("Pre-warm ping received — host is ready")
+                elif sid == 0 and is_preview:
+                    # Picker dialog preview — collect tabs but don't save to DB
+                    log("Preview tab request received")
+                    with _snapshot_lock:
+                        _pending_snapshot_session = 0
+                    global _awaiting_preview
+                    _awaiting_preview = True
                 elif sid:
                     log(f"Side-channel snapshot request for session {sid}")
                     with _snapshot_lock:
@@ -116,18 +175,40 @@ def get_active_session() -> dict | None:
 
 
 def handle_tabs_snapshot(session_id: int, tabs: list[dict],
-                         is_side_channel: bool = False):
-    """Save tabs to the database."""
+                         is_side_channel: bool = False,
+                         preview_only: bool = False):
+    """
+    Enrich tabs with the active Chrome profile and optionally save to DB.
+
+    When preview_only=True the tabs are written to tab_response.json so the
+    picker UI can display them, but db.save_chrome_tabs() is NOT called.
+    The UI saves them to the correct session after the user picks a target.
+    This is the fix for tabs being written into the wrong (MRU) session.
+    """
     if not DB_AVAILABLE:
         return
     try:
-        db.save_chrome_tabs(session_id, tabs)
-        log(f"Saved {len(tabs)} tabs for session {session_id}")
+        profile_dir, profile_name = _detect_chrome_profile()
+        log(f"Chrome profile: dir={profile_dir!r} name={profile_name!r} preview={preview_only}")
+
+        enriched = []
+        for t in tabs:
+            enriched.append({
+                **t,
+                "profile_dir":  profile_dir,
+                "profile_name": profile_name,
+            })
+
+        if not preview_only:
+            db.save_chrome_tabs(session_id, enriched)
+            log(f"Saved {len(enriched)} tabs for session {session_id} (profile: {profile_dir or 'none'})")
+        else:
+            log(f"Preview mode — {len(enriched)} tabs collected, skipping DB write")
 
         if is_side_channel:
-            # Write the result back so snapshot.py can confirm
+            # Always write response so snapshot.py / picker can read tabs
             TAB_RESPONSE_FILE.write_text(
-                json.dumps({"tabs": tabs, "session_id": session_id}),
+                json.dumps({"tabs": enriched, "session_id": session_id}),
                 encoding="utf-8",
             )
     except Exception as e:
@@ -147,6 +228,7 @@ def handle_get_sessions() -> list[dict]:
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 _awaiting_side_channel_tabs = False
+_awaiting_preview           = False  # True when current request is preview-only
 
 
 def main():
@@ -173,7 +255,7 @@ def main():
                 log(f"Sending request_tabs to extension for session {snap_sid}")
                 send_message(sys.stdout, {
                     "type":       "request_tabs",
-                    "session_id": snap_sid,
+                    "session_id": snap_sid,  # 0 for preview, real id for save
                 })
                 _awaiting_side_channel_tabs = True
 
@@ -204,11 +286,18 @@ def main():
             elif msg_type == "tabs_snapshot":
                 session_id = msg.get("session_id")
                 tabs       = msg.get("tabs", [])
-                if session_id and tabs is not None:
-                    is_sc = _awaiting_side_channel_tabs
-                    handle_tabs_snapshot(session_id, tabs, is_side_channel=is_sc)
+                if tabs is not None and session_id is not None:
+                    is_sc    = _awaiting_side_channel_tabs
+                    # preview_only when the side-channel request had session_id=0
+                    is_prev  = _awaiting_preview if is_sc else False
+                    handle_tabs_snapshot(
+                        session_id, tabs,
+                        is_side_channel=is_sc,
+                        preview_only=is_prev,
+                    )
                     if is_sc:
                         _awaiting_side_channel_tabs = False
+                        _awaiting_preview           = False
                         with _snapshot_lock:
                             _pending_snapshot_session = None
                     send_message(sys.stdout, {

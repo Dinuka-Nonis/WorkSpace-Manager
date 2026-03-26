@@ -255,29 +255,12 @@ def _get_vscode_workspaces(code_exe: str) -> list[dict]:
 
 # ── Chrome profile detection ──────────────────────────────────────────────────
 
-def _get_active_chrome_profile() -> tuple[str, str]:
-    """
-    Detect the active Chrome profile by inspecting running chrome.exe processes
-    for the --profile-directory=<dir> command-line flag, then reads
-    %LOCALAPPDATA%\\Google\\Chrome\\User Data\\Local State to map the
-    directory name to the human-readable display name.
-
-    Returns (profile_dir, profile_display_name)
-      e.g. ("Profile 3", "OxzaaScials")
-    Returns ("Default", "<name>") when Chrome is running with no explicit flag.
-    Returns ("", "") when Chrome is not running at all.
-    """
-    try:
-        import psutil
-    except ImportError:
-        return "", ""
-
-    local_appdata = os.getenv("LOCALAPPDATA", "")
+def _read_chrome_profile_names() -> dict[str, str]:
+    """Read Chrome Local State and return profile_dir → display_name mapping."""
+    local_appdata    = os.getenv("LOCALAPPDATA", "")
     local_state_path = os.path.join(
         local_appdata, "Google", "Chrome", "User Data", "Local State"
     )
-
-    # Build: profile directory → human-readable name
     profile_names: dict[str, str] = {}
     if os.path.exists(local_state_path):
         try:
@@ -287,7 +270,63 @@ def _get_active_chrome_profile() -> tuple[str, str]:
                 profile_names[dir_name] = info.get("name", dir_name)
         except Exception:
             pass
+    return profile_names
 
+
+def get_all_chrome_profiles() -> dict[str, str]:
+    """
+    Return every Chrome profile that has at least one running chrome.exe process,
+    as {profile_dir: display_name}.
+
+    The Chrome extension runs inside ONE profile context — it only sees tabs for
+    that profile.  The native host uses this mapping to tag each tab_response
+    with the correct profile, because the extension response will only contain
+    tabs visible to that profile's extension instance.
+
+    Returns {} if Chrome is not running.
+    Falls back to {"Default": name} when no --profile-directory flag is present.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return {}
+
+    profile_names  = _read_chrome_profile_names()
+    chrome_running = False
+    seen: dict[str, str] = {}
+
+    for proc in psutil.process_iter(["exe", "cmdline"]):
+        try:
+            exe = proc.info.get("exe") or ""
+            if "chrome.exe" not in exe.lower():
+                continue
+            chrome_running = True
+            for arg in (proc.info.get("cmdline") or []):
+                if arg.startswith("--profile-directory="):
+                    prof = arg.split("=", 1)[1].strip('"').strip("'")
+                    if prof not in seen:
+                        seen[prof] = profile_names.get(prof, prof)
+        except Exception:
+            continue
+
+    if not chrome_running:
+        return {}
+    if not seen:
+        seen["Default"] = profile_names.get("Default", "Default")
+    return seen
+
+
+def _get_active_chrome_profile() -> tuple[str, str]:
+    """
+    Returns (profile_dir, display_name) for the Chrome profile with the most
+    open processes.  Returns ("", "") when Chrome is not running.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return "", ""
+
+    profile_names       = _read_chrome_profile_names()
     chrome_running      = False
     profile_dir_counts: dict[str, int] = {}
 
@@ -306,16 +345,11 @@ def _get_active_chrome_profile() -> tuple[str, str]:
 
     if not chrome_running:
         return "", ""
-
     if not profile_dir_counts:
-        # Chrome running with no explicit profile flag → Default profile
         name = profile_names.get("Default", "Default")
         return "Default", name
-
-    # The profile with the most associated processes = most open windows
     best = max(profile_dir_counts, key=lambda k: profile_dir_counts[k])
     return best, profile_names.get(best, best)
-
 
 # ── File Explorer open-folder detection ──────────────────────────────────────
 
@@ -680,26 +714,26 @@ def _prewarm_native_host():
 def request_tabs_from_extension(session_id: int) -> list[dict]:
     """
     Ask the native host to pull tabs from Chrome via the side-channel file.
-    Enriches each tab URL with the active Chrome profile so restoring opens
-    the URL in the same profile.
+
+    Always sends session_id=0 with "preview": true so the native host writes
+    tab_response.json but does NOT call db.save_chrome_tabs().  The caller
+    saves the returned items to the correct session after the user confirms.
+    This fixes tabs being written into the wrong (MRU) session.
 
     path_or_url encoding:  chrome-profile:<profile_dir>|<url>
     Label prefix:          [Profile Name] <page title>
-
-    Returns [] if the native host is not running or the request times out.
+    Returns [] on timeout or if the native host is not running.
     """
     appdata   = Path(os.getenv("APPDATA", ".")) / "WorkSpaceManager"
     req_file  = appdata / "tab_request.json"
     resp_file = appdata / "tab_response.json"
 
-    # Detect active Chrome profile (fast — just reads process cmdlines)
-    profile_dir, profile_name = _get_active_chrome_profile()
-
     try:
         if resp_file.exists():
             resp_file.unlink()
+        # session_id=0 + preview=true → host responds but skips DB write
         req_file.write_text(
-            json.dumps({"session_id": session_id, "ts": time.time()}),
+            json.dumps({"session_id": 0, "preview": True, "ts": time.time()}),
             encoding="utf-8",
         )
     except Exception:
@@ -714,17 +748,20 @@ def request_tabs_from_extension(session_id: int) -> list[dict]:
                 req_file.unlink(missing_ok=True)
                 resp_file.unlink(missing_ok=True)
 
+                # The host enriches each tab with profile_dir / profile_name.
+                # Use those fields directly — no need to guess from process list.
                 tabs: list[dict] = []
                 for t in payload.get("tabs", []):
-                    raw_url = t.get("url", "")
+                    raw_url      = t.get("url", "")
                     if not raw_url:
                         continue
-                    title = t.get("title") or raw_url
+                    title        = t.get("title") or raw_url
+                    profile_dir  = t.get("profile_dir", "")
+                    profile_name = t.get("profile_name", "")
 
                     if profile_dir:
-                        # Encode profile so launcher can open with --profile-directory
                         path_or_url = f"chrome-profile:{profile_dir}|{raw_url}"
-                        label       = f"[{profile_name}] {title}"
+                        label       = f"[{profile_name or profile_dir}] {title}"
                     else:
                         path_or_url = raw_url
                         label       = title
@@ -743,7 +780,6 @@ def request_tabs_from_extension(session_id: int) -> list[dict]:
     req_file.unlink(missing_ok=True)
     print("[Chrome] Timed out — no response from native host. Is the extension installed and Chrome running?", flush=True)
     return []
-
 
 # ── Scan only (no DB write) — for the picker dialog ──────────────────────────
 

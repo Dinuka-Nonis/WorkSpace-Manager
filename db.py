@@ -246,16 +246,32 @@ def save_chrome_tabs(session_id: int, tabs: list[dict]):
     """
     Called by the native host when Chrome sends a tabs snapshot.
     Upserts tabs as URL items — won't duplicate existing URLs.
+
+    Each tab dict may contain a 'profile_dir' and 'profile_name' key
+    (added by the host) so URLs are stored as 'chrome-profile:<dir>|<url>'
+    enabling restore to open in the correct Chrome profile.
     """
-    items = [
-        {
+    items = []
+    for t in tabs:
+        url = t.get("url", "")
+        if not url:
+            continue
+        title = t.get("title") or url
+        profile_dir  = t.get("profile_dir", "")
+        profile_name = t.get("profile_name", "")
+
+        if profile_dir:
+            path_or_url = f"chrome-profile:{profile_dir}|{url}"
+            label       = f"[{profile_name or profile_dir}] {title}" if profile_name else title
+        else:
+            path_or_url = url
+            label       = title
+
+        items.append({
             "type":        "url",
-            "path_or_url": t["url"],
-            "label":       t.get("title") or t["url"],
-        }
-        for t in tabs
-        if t.get("url")
-    ]
+            "path_or_url": path_or_url,
+            "label":       label,
+        })
     add_items_bulk(session_id, items)
 
 

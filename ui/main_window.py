@@ -1420,12 +1420,13 @@ class MainWindow(QMainWindow):
 
     def _on_snapshot_clicked(self):
         """Entry point for the snapshot flow — opens the picker dialog."""
-        # Use MRU session id as hint for tab-request side-channel;
-        # the actual target session is chosen in step 2.
-        sessions = db.get_all_sessions()
-        hint_sid = sessions[0]["id"] if sessions else 0
-
-        picker = SnapshotPickerDialog(hint_sid, self)
+        # Always pass session_id=0 to SnapshotPickerDialog.  The native host
+        # treats 0 + preview=True as a read-only request: it returns tabs in
+        # tab_response.json but does NOT write them to the database.  Tabs are
+        # only saved to the correct session after the user picks a target in
+        # step 2.  This fixes the bug where Chrome tabs were permanently
+        # written into the wrong (MRU) session before the user chose a target.
+        picker = SnapshotPickerDialog(0, self)
         geo = self.geometry()
         picker.move(geo.center().x() - picker.width() // 2,
                     geo.center().y() - picker.height() // 2)

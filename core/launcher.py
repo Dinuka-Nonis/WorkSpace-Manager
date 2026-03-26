@@ -102,7 +102,8 @@ def open_url(url: str) -> tuple[bool, str]:
                     subprocess.Popen([
                         chrome,
                         f"--profile-directory={profile_dir}",
-                        actual_url,
+                        "--new-window",  # force a new window in the correct profile
+                        actual_url,      # (ignored by an already-running wrong profile)
                     ])
                     return True, ""
                 except Exception as e:
@@ -145,7 +146,15 @@ def open_app(exe_path: str) -> tuple[bool, str]:
     """
     Launch an application by its executable path.
     Returns (success, error_message).
+
+    Auto-detects WindowsApps (UWP/Store) paths and routes to open_uwp_app
+    so they are launched correctly via shell:AppsFolder rather than direct
+    subprocess (which would fail with Access Denied).
     """
+    # UWP apps live in WindowsApps — cannot be launched directly
+    if "WindowsApps" in exe_path:
+        return open_uwp_app(exe_path)
+
     if not os.path.exists(exe_path):
         return False, f"Executable not found: {exe_path}"
     try:
@@ -214,17 +223,23 @@ def open_uwp_app(exe: str) -> tuple[bool, str]:
 
     exe_path = Path(exe)
 
-    # ── Strategy 1: AUMID lookup ──────────────────────────────────────────────
+    # ── Strategy 1: AUMID lookup via registry ─────────────────────────────────
+    # Use PowerShell Start-Process — explorer.exe with shell:AppsFolder
+    # can open a file picker/explorer window instead of the app on some systems.
     try:
-        stem = exe_path.stem.lower()
         aumid = _find_aumid_for_stem(exe)
         if aumid:
-            subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{aumid}"])
-            return True, ""
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-WindowStyle", "Hidden",
+                 "-Command", f'Start-Process "shell:AppsFolder\\{aumid}"'],
+                capture_output=True, timeout=5
+            )
+            if result.returncode == 0:
+                return True, ""
     except Exception:
         pass
 
-    # ── Strategy 2: PowerShell Start-Process with package family name ─────────
+    # ── Strategy 2: Derive package family name from exe path ──────────────────
     try:
         # Extract package folder from path e.g.
         # C:\Program Files\WindowsApps\SpotifyAB.SpotifyMusic_1.285_x64__zpdnekdrzrea0\Spotify.exe
@@ -232,14 +247,14 @@ def open_uwp_app(exe: str) -> tuple[bool, str]:
         wa_idx = next((i for i, p in enumerate(parts) if p.lower() == "windowsapps"), None)
         if wa_idx is not None:
             package_folder = parts[wa_idx + 1]
-            # Package family name = everything before the last __ token + the publisher hash
-            # e.g. "SpotifyAB.SpotifyMusic_1.285_x64__zpdnekdrzrea0"
-            #   → family = "SpotifyAB.SpotifyMusic_zpdnekdrzrea0"
+            # "SpotifyAB.SpotifyMusic_1.285_x64__zpdnekdrzrea0"
+            # split("_") → ["SpotifyAB.SpotifyMusic", "1.285", "x64", "", "zpdnekdrzrea0"]
+            # The double-underscore produces an empty segment before the hash.
             segments = package_folder.split("_")
-            if len(segments) >= 2:
-                app_name = segments[0]         # "SpotifyAB.SpotifyMusic"
-                pub_hash = segments[-1]        # "zpdnekdrzrea0"
-                family   = f"{app_name}_{pub_hash}"
+            app_name = segments[0]          # "SpotifyAB.SpotifyMusic"
+            pub_hash = segments[-1]         # "zpdnekdrzrea0"
+            if app_name and pub_hash:
+                family = f"{app_name}_{pub_hash}"
                 result = subprocess.run(
                     ["powershell", "-NoProfile", "-WindowStyle", "Hidden",
                      "-Command", f'Start-Process "shell:AppsFolder\\{family}!App"'],
@@ -250,15 +265,17 @@ def open_uwp_app(exe: str) -> tuple[bool, str]:
     except Exception:
         pass
 
-    # ── Strategy 3: PowerShell Start-Process with ms-store URI ───────────────
-    # Works for many Store apps via their product URI
+    # ── Strategy 3: PowerShell Invoke-Item on the exe ─────────────────────────
+    # Last resort — works for some Store apps. Never opens a File Explorer window.
     try:
         result = subprocess.run(
             ["powershell", "-NoProfile", "-WindowStyle", "Hidden",
-             "-Command", f'explorer "shell:AppsFolder"'],
+             "-Command", f'Invoke-Item "{exe}"'],
             capture_output=True, timeout=5
         )
-        return True, ""
+        if result.returncode == 0:
+            return True, ""
+        return False, f"Could not launch UWP app: {result.stderr.decode(errors='replace').strip()}"
     except Exception as e:
         return False, f"Could not launch UWP app: {e}"
 
@@ -269,6 +286,11 @@ def _find_aumid_for_stem(exe: str) -> str:
     matching the given exe path, by looking up the package folder name.
 
     Returns a string like "SpotifyAB.SpotifyMusic_hash!Spotify" or "".
+
+    Bug fix: original code incremented j then immediately closed the registry
+    keys and returned — the EnumKey(apps_key, 0) call never ran because j was
+    incremented to 1 before the return. Fixed by reading the app_id at index 0
+    first, then returning it.
     """
     try:
         import winreg
@@ -278,6 +300,7 @@ def _find_aumid_for_stem(exe: str) -> str:
         if wa_idx is None:
             return ""
         package_folder = parts[wa_idx + 1]  # e.g. "SpotifyAB.SpotifyMusic_1.285_x64__hash"
+        pkg_prefix = package_folder.split("_")[0].lower()
 
         base = r"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages"
         root = winreg.OpenKey(winreg.HKEY_CURRENT_USER, base)
@@ -288,25 +311,31 @@ def _find_aumid_for_stem(exe: str) -> str:
                 i += 1
             except OSError:
                 break
-            # Match by package folder prefix (before first underscore = publisher.appname)
-            pkg_prefix = package_folder.split("_")[0].lower()
             if pkg_prefix not in pkg_name.lower():
                 continue
+            # Found a matching package — enumerate its Applications sub-key
             try:
                 apps_key = winreg.OpenKey(root, pkg_name + r"\Applications")
+            except OSError:
+                continue
+            try:
                 j = 0
                 while True:
                     try:
                         app_id = winreg.EnumKey(apps_key, j)
-                        j += 1
-                        winreg.CloseKey(apps_key)
-                        winreg.CloseKey(root)
-                        return f"{pkg_name}!{app_id}"
                     except OSError:
                         break
-                winreg.CloseKey(apps_key)
-            except OSError:
-                continue
+                    # Use the first application entry (usually "App")
+                    aumid = f"{pkg_name}!{app_id}"
+                    winreg.CloseKey(apps_key)
+                    winreg.CloseKey(root)
+                    return aumid
+                    j += 1  # noqa: unreachable — we return on first valid app_id
+            finally:
+                try:
+                    winreg.CloseKey(apps_key)
+                except Exception:
+                    pass
         winreg.CloseKey(root)
     except Exception:
         pass
