@@ -1,22 +1,15 @@
 """
 ui/drop_zone.py — Right-edge drop zone overlay.
 
-Fixes vs original:
-  • drop_zone_final_rect() — returns the FULLY VISIBLE rect, not the
-    animated/partial current position. This was the root cause of drops
-    not saving: the watcher was checking against the wrong coordinates.
-  • Session cards shown during active drag so the user can click to
-    switch the target session before releasing.
-  • "New Session" button shown when no sessions exist, with an inline
-    name input so the user never gets a silent auto-created session.
-  • Session picker shown after drop when multiple sessions exist and
-    none was explicitly pre-selected during the drag.
-  • Snapshot feature removed entirely.
-
-State machine:
-  HIDDEN  → drag_started  → VISIBLE  (slide in, show session cards)
-  VISIBLE → drag_cancelled → HIDDEN   (slide out)
-  VISIBLE → dropped       → PICK/SAVE → CONFIRM → HIDDEN
+Changes in this version:
+  • Cancel button shown in picker/session-select mode so users can
+    dismiss an accidental drop without saving anything.
+  • Esc key press cancels and closes the overlay at any time.
+  • Auto-save timer on the session picker is removed entirely — the
+    overlay now stays open indefinitely until the user picks a session
+    OR explicitly cancels.
+  • All other behaviour (slide in/out, session pre-selection, new
+    session inline input, confirmed flash) is preserved.
 """
 
 import sys
@@ -42,6 +35,7 @@ WALLET_STITCH   = QColor("#3d5635")
 WALLET_GLOW     = QColor("#42d778")
 WALLET_TEXT     = QColor("#a7c59e")
 WALLET_TEXT_DIM = QColor("#698263")
+WALLET_CANCEL   = QColor("#ef4444")
 WALLET_CARD_COLORS = [
     QColor("#635bff"),  # purple
     QColor("#9bd86a"),  # green
@@ -61,6 +55,7 @@ SESSION_LIST_Y  = APP_CARD_Y + APP_CARD_H + 16
 CARD_H          = 52
 CARD_GAP        = 8
 NEW_BTN_H       = 40
+CANCEL_BTN_H    = 36
 
 
 class DropZoneOverlay(QWidget):
@@ -77,7 +72,9 @@ class DropZoneOverlay(QWidget):
         self._drop_confirmed    = False
         self._confirmed_label   = ""
         self._user_selected_session = False   # True once user clicks a card
+        self._picker_mode       = False       # True while waiting for session pick after drop
 
+        # Only used for the post-save confirmation flash — NOT for auto-saving
         self._confirm_timer = QTimer(self)
         self._confirm_timer.setSingleShot(True)
         self._confirm_timer.timeout.connect(self._hide_after_confirm)
@@ -157,6 +154,14 @@ class DropZoneOverlay(QWidget):
         offset = int((ZONE_WIDTH - EDGE_HANDLE) * value)
         self.move(geo.x() + geo.width() - ZONE_WIDTH + offset, geo.y())
 
+    # ── Keyboard ──────────────────────────────────────────────────────────────
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self._cancel()
+        else:
+            super().keyPressEvent(event)
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def drop_zone_final_rect(self) -> tuple[int, int, int, int]:
@@ -183,6 +188,7 @@ class DropZoneOverlay(QWidget):
         self._drop_confirmed        = False
         self._hovered               = False
         self._user_selected_session = False
+        self._picker_mode           = False
         self._new_sess_input.hide()
         self._refresh_sessions()
         self._slide_in()
@@ -199,10 +205,11 @@ class DropZoneOverlay(QWidget):
             # No sessions, or explicitly dropped on "New Session"
             self._show_new_session_input(app_info)
         elif not self._user_selected_session and len(self._sessions) > 1:
-            # Multiple sessions, nothing pre-selected — keep overlay open
-            # so user can pick; show a small "tap a card to save" hint.
+            # Multiple sessions, nothing pre-selected — enter picker mode.
+            # Do NOT auto-save; wait for explicit selection or cancel.
             self._pending_app = app_info
-            self._show_session_picker(app_info)
+            self._picker_mode = True
+            self.update()
         else:
             # Either one session or user already clicked a card
             self._save_to_session(app_info)
@@ -212,7 +219,8 @@ class DropZoneOverlay(QWidget):
         self._show_new_session_input(self._pending_app)
 
     def on_drag_cancelled(self):
-        self._pending_app = None
+        self._pending_app   = None
+        self._picker_mode   = False
         self._new_sess_input.hide()
         if not self._drop_confirmed:
             self._slide_out()
@@ -223,23 +231,23 @@ class DropZoneOverlay(QWidget):
         self._refresh_sessions()
         self.update()
 
-    # ── Session picker mode (shown after drop when ambiguous) ─────────────────
+    # ── Cancel ────────────────────────────────────────────────────────────────
 
-    def _show_session_picker(self, app_info: dict):
-        """
-        Keep the overlay open after the drop and wait for the user to click
-        a session card. A small instruction replaces the "DROP HERE" header.
-        """
-        self._pending_app = app_info
-        self.update()
-        # Auto-save to first session if user doesn't pick within 8 s
-        self._confirm_timer.start(8000)
+    def _cancel(self):
+        """Discard the pending drop and slide out — triggered by Cancel btn or Esc."""
+        self._confirm_timer.stop()
+        self._pending_app   = None
+        self._picker_mode   = False
+        self._drop_confirmed = False
+        self._new_sess_input.hide()
+        self._slide_out()
+
+    # ── Session picker mode (shown after drop when ambiguous) ─────────────────
 
     def _show_new_session_input(self, app_info: dict):
         """Show the inline name input for a brand-new session.
         Positions the input below any existing session cards."""
         self._pending_app = app_info
-        # Position below existing cards so the input never overlaps them
         input_y = SESSION_LIST_Y + len(self._sessions) * (CARD_H + CARD_GAP) + 8
         self._new_sess_input.setGeometry(20, input_y, ZONE_WIDTH - 40, 32)
         self._new_sess_input.clear()
@@ -272,17 +280,10 @@ class DropZoneOverlay(QWidget):
         self._anim.start()
 
     def _hide_after_confirm(self):
+        """Called only after a successful save — just slides out."""
         self._drop_confirmed        = False
         self._user_selected_session = False
-        if self._pending_app:
-            # Timer fired from picker mode — auto-save to first session
-            app = self._pending_app
-            self._pending_app = None
-            if self._sessions:
-                self._active_session_id = self._sessions[0]["id"]
-            self._save_to_session(app)
-        else:
-            self._slide_out()
+        self._slide_out()
 
     # ── Data ──────────────────────────────────────────────────────────────────
 
@@ -294,6 +295,7 @@ class DropZoneOverlay(QWidget):
 
     def _save_to_session(self, app_info: dict):
         self._confirm_timer.stop()
+        self._picker_mode = False
 
         sid = self._active_session_id
         if sid is None:
@@ -320,7 +322,7 @@ class DropZoneOverlay(QWidget):
         self._user_selected_session = False
         self._refresh_sessions()
         self.update()
-        self._confirm_timer.start(2200)
+        self._confirm_timer.start(2200)   # flash then slide out
 
     # ── Mouse events ──────────────────────────────────────────────────────────
 
@@ -335,6 +337,13 @@ class DropZoneOverlay(QWidget):
     def mousePressEvent(self, event):
         y = event.position().y()
 
+        # Cancel button (visible in picker mode)
+        if self._picker_mode or self._new_sess_input.isVisible():
+            cancel_y = self._cancel_btn_y()
+            if cancel_y <= y <= cancel_y + CANCEL_BTN_H:
+                self._cancel()
+                return
+
         # Clicking a session card always selects it as active target
         for i, sess in enumerate(self._sessions):
             card_y = SESSION_LIST_Y + i * (CARD_H + CARD_GAP)
@@ -347,14 +356,21 @@ class DropZoneOverlay(QWidget):
                 if self._pending_app is not None:
                     app = self._pending_app
                     self._pending_app = None
+                    self._picker_mode = False
                     self._save_to_session(app)
                 return
 
-        # "+ New Session" button — shown at the bottom of the card list
-        # regardless of whether sessions already exist.
+        # "+ New Session" button
         new_btn_y = SESSION_LIST_Y + len(self._sessions) * (CARD_H + CARD_GAP) + 8
         if new_btn_y <= y <= new_btn_y + NEW_BTN_H and self._new_sess_input.isHidden():
             self._show_new_session_input(self._pending_app)
+
+    # ── Layout helper ─────────────────────────────────────────────────────────
+
+    def _cancel_btn_y(self) -> int:
+        """Y position of the Cancel button — below sessions and new-session btn."""
+        base = SESSION_LIST_Y + len(self._sessions) * (CARD_H + CARD_GAP) + 8
+        return base + NEW_BTN_H + 10
 
     # ── Paint ─────────────────────────────────────────────────────────────────
 
@@ -381,7 +397,7 @@ class DropZoneOverlay(QWidget):
 
         if self._drop_confirmed:
             self._paint_confirmed(p, w, h)
-        elif self._pending_app is not None:
+        elif self._pending_app is not None or self._picker_mode:
             self._paint_active(p, w, h)
         else:
             self._paint_idle(p, w, h)
@@ -402,18 +418,15 @@ class DropZoneOverlay(QWidget):
 
         self._paint_session_cards(p, w, show_active_dot=True)
 
-        # Bottom hint
         p.setPen(WALLET_TEXT_DIM)
         p.setFont(QFont("Helvetica Neue", 8))
         p.drawText(QRect(20, h - 55, w - 40, 40), Qt.AlignmentFlag.AlignCenter,
                    "Click a card to switch target session")
 
-    # ── Active drag state ─────────────────────────────────────────────────────
+    # ── Active drag / picker state ────────────────────────────────────────────
 
     def _paint_active(self, p, w, h):
         app = self._pending_app
-        if not app:
-            return
 
         # Glow when hovered
         if self._hovered:
@@ -428,16 +441,14 @@ class DropZoneOverlay(QWidget):
             p.drawPath(border)
 
         # Header
-        if not self._user_selected_session and len(self._sessions) > 1 and \
-                self._pending_app is not None and self._pending_app == app:
-            # Picker mode hint
+        if self._picker_mode:
             p.setPen(WALLET_GLOW)
             p.setFont(QFont("Helvetica Neue", 11, QFont.Weight.Bold))
             p.drawText(QRect(20, 18, w - 40, 24), Qt.AlignmentFlag.AlignLeft, "CHOOSE SESSION")
             p.setPen(WALLET_TEXT_DIM)
             p.setFont(QFont("Helvetica Neue", 9))
             p.drawText(QRect(20, 44, w - 40, 18), Qt.AlignmentFlag.AlignLeft,
-                       "Tap a card below to save there")
+                       "Tap a card below · or cancel")
         else:
             p.setPen(WALLET_GLOW)
             p.setFont(QFont("Helvetica Neue", 11, QFont.Weight.Bold))
@@ -447,29 +458,33 @@ class DropZoneOverlay(QWidget):
             p.drawText(QRect(20, 44, w - 40, 18), Qt.AlignmentFlag.AlignLeft,
                        "Release to save to session")
 
-        # App preview card
-        ap = QPainterPath()
-        ap.addRoundedRect(20, APP_CARD_Y, w - 40, APP_CARD_H, 12, 12)
-        p.fillPath(ap, WALLET_CARD_COLORS[0])
+        # App preview card (only when we actually have an app to preview)
+        if app:
+            ap = QPainterPath()
+            ap.addRoundedRect(20, APP_CARD_Y, w - 40, APP_CARD_H, 12, 12)
+            p.fillPath(ap, WALLET_CARD_COLORS[0])
 
-        p.setPen(QColor(255, 255, 255))
-        lf = QFont("Helvetica Neue", 10, QFont.Weight.Bold)
-        p.setFont(lf)
-        label = app.get("label", "Unknown")
-        label = QFontMetrics(lf).elidedText(label, Qt.TextElideMode.ElideRight, w - 70)
-        p.drawText(QRect(30, APP_CARD_Y + 12, w - 60, 26),
-                   Qt.AlignmentFlag.AlignVCenter, label)
-        p.setPen(QColor(255, 255, 255, 130))
-        p.setFont(QFont("Helvetica Neue", 8))
-        p.drawText(QRect(30, APP_CARD_Y + 38, w - 60, 20),
-                   Qt.AlignmentFlag.AlignVCenter, app.get("type", "app").upper())
+            p.setPen(QColor(255, 255, 255))
+            lf = QFont("Helvetica Neue", 10, QFont.Weight.Bold)
+            p.setFont(lf)
+            label = app.get("label", "Unknown")
+            label = QFontMetrics(lf).elidedText(label, Qt.TextElideMode.ElideRight, w - 70)
+            p.drawText(QRect(30, APP_CARD_Y + 12, w - 60, 26),
+                       Qt.AlignmentFlag.AlignVCenter, label)
+            p.setPen(QColor(255, 255, 255, 130))
+            p.setFont(QFont("Helvetica Neue", 8))
+            p.drawText(QRect(30, APP_CARD_Y + 38, w - 60, 20),
+                       Qt.AlignmentFlag.AlignVCenter, app.get("type", "app").upper())
 
-        # Session list (always visible during drag for pre-selection)
+        # Session list
         self._paint_session_cards(p, w, show_active_dot=True)
 
-        # "+ New Session" button — always shown so user can create a new session
+        # "+ New Session" button
         if self._new_sess_input.isHidden():
             self._paint_new_session_btn(p, w)
+
+        # Cancel button — always visible when a drop is pending
+        self._paint_cancel_btn(p, w)
 
     # ── Confirmed state ───────────────────────────────────────────────────────
 
@@ -519,13 +534,10 @@ class DropZoneOverlay(QWidget):
             is_active = (sess["id"] == self._active_session_id)
             card_y   = SESSION_LIST_Y + i * (CARD_H + CARD_GAP)
 
-            # Shadow
             sh = QPainterPath()
             sh.addRoundedRect(22, card_y + 3, w - 44, CARD_H, 10, 10)
-            sc = QColor(0, 0, 0, 40)
-            p.fillPath(sh, sc)
+            p.fillPath(sh, QColor(0, 0, 0, 40))
 
-            # Body — brighter when active
             cp = QPainterPath()
             cp.addRoundedRect(20, card_y, w - 40, CARD_H, 10, 10)
             cc = QColor(color)
@@ -533,13 +545,11 @@ class DropZoneOverlay(QWidget):
                 cc = cc.lighter(115)
             p.fillPath(cp, cc)
 
-            # Active dot
             if is_active and show_active_dot:
                 dp = QPainterPath()
                 dp.addEllipse(w - 28, card_y + 8, 7, 7)
                 p.fillPath(dp, QColor(255, 255, 255, 200))
 
-            # Name
             brightness = (cc.red() * 299 + cc.green() * 587 + cc.blue() * 114) / 1000
             text_color = QColor(0, 0, 0) if brightness > 160 else QColor(255, 255, 255)
             p.setPen(text_color)
@@ -548,7 +558,6 @@ class DropZoneOverlay(QWidget):
                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                        sess.get("name", "Session"))
 
-            # Item count
             items = db.get_items(sess["id"])
             tc    = QColor(text_color)
             tc.setAlpha(140)
@@ -572,3 +581,18 @@ class DropZoneOverlay(QWidget):
         p.setFont(QFont("Helvetica Neue", 10, QFont.Weight.Bold))
         p.drawText(QRect(20, by, w - 40, NEW_BTN_H),
                    Qt.AlignmentFlag.AlignCenter, "+  New Session")
+
+    def _paint_cancel_btn(self, p, w):
+        """Paint a red Cancel button. Shown whenever a drop is awaiting decision."""
+        by = self._cancel_btn_y()
+        bp = QPainterPath()
+        bp.addRoundedRect(20, by, w - 40, CANCEL_BTN_H, 10, 10)
+        bc = QColor(WALLET_CANCEL)
+        bc.setAlpha(40)
+        p.fillPath(bp, bc)
+        p.setPen(QPen(WALLET_CANCEL, 1.0))
+        p.drawPath(bp)
+        p.setPen(WALLET_CANCEL)
+        p.setFont(QFont("Helvetica Neue", 10, QFont.Weight.Bold))
+        p.drawText(QRect(20, by, w - 40, CANCEL_BTN_H),
+                   Qt.AlignmentFlag.AlignCenter, "✕  Cancel  (Esc)")

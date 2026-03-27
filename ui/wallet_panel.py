@@ -1,12 +1,12 @@
 """
 ui/wallet_panel.py — Hotkey-toggled floating wallet panel.
 
-Changes vs original:
-  • SessionRow emits inspect_requested when the row body is clicked (not restore btn).
-  • WalletPanel inserts an _InspectorPanel inline below the clicked session row,
-    showing every saved item with type icon, label, and tooltip for the URL/path.
-  • Clicking the same row again, or pressing ×, closes the inspector.
-  • PANEL_WIDTH widened slightly (360→) to accommodate the inspect hint.
+Changes in this version:
+  • _InspectorPanel now shows a small × remove button on each item row.
+    Clicking it calls db.delete_item() and refreshes the inspector in place,
+    without closing the whole panel or collapsing the session row.
+  • WalletPanel._on_remove_item() added to handle the signal.
+  • All other behaviour (session restore, delete, inspect, animations) unchanged.
 """
 
 import sys
@@ -119,7 +119,6 @@ class SessionRow(QWidget):
         if x > w - 90:
             self.restore_requested.emit(self._session["id"])
         elif x > w - 120 and self._hovered:
-            # Delete button zone (×) — only active when row is hovered
             self.delete_requested.emit(self._session["id"])
         else:
             self.inspect_requested.emit(self._session["id"])
@@ -179,14 +178,12 @@ class SessionRow(QWidget):
         p.setFont(QFont("Helvetica Neue", 9))
         p.drawText(QRect(66, 40, w - 170, 20), Qt.AlignmentFlag.AlignVCenter, subtitle)
 
-        # Tiny hint below subtitle
         hint_text = "▾ inspecting" if self._inspected else "▸ tap to inspect"
         p.setPen(TEXT_MUTED)
         p.setFont(QFont("Helvetica Neue", 8))
         p.drawText(QRect(66, 56, w - 170, 14), Qt.AlignmentFlag.AlignVCenter, hint_text)
 
         if self._hovered:
-            # Delete (×) button
             del_path = QPainterPath()
             del_path.addRoundedRect(w - 120, 22, 24, 28, 6, 6)
             p.fillPath(del_path, QColor(239, 68, 68, 160))
@@ -208,7 +205,8 @@ class SessionRow(QWidget):
 class _InspectorPanel(QWidget):
     """Inline item list shown below a session row when the user taps it."""
 
-    closed = pyqtSignal()
+    closed         = pyqtSignal()
+    item_removed   = pyqtSignal(int)   # emits item_id
 
     TYPE_ICONS = {"url": "🔗", "file": "📄", "app": "⚡"}
 
@@ -219,9 +217,18 @@ class _InspectorPanel(QWidget):
         self._build()
 
     def _build(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 2, 16, 10)
-        layout.setSpacing(3)
+        # Clear existing layout if rebuilding
+        if self.layout():
+            while self.layout().count():
+                item = self.layout().takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+        else:
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(16, 2, 16, 10)
+            layout.setSpacing(3)
+
+        layout = self.layout()
 
         # Header row
         hdr = QHBoxLayout()
@@ -254,7 +261,7 @@ class _InspectorPanel(QWidget):
             row.setFixedHeight(34)
             row.setStyleSheet("background: rgba(255,255,255,0.05); border-radius: 6px;")
             rl = QHBoxLayout(row)
-            rl.setContentsMargins(8, 0, 8, 0)
+            rl.setContentsMargins(8, 0, 4, 0)
             rl.setSpacing(6)
 
             icon = QLabel(self.TYPE_ICONS.get(item["type"], "•"))
@@ -271,7 +278,30 @@ class _InspectorPanel(QWidget):
             type_badge.setStyleSheet("color: #44445a; font-size: 8px; background: transparent;")
             rl.addWidget(type_badge)
 
+            # Per-item remove button
+            remove_btn = QPushButton("×")
+            remove_btn.setFixedSize(20, 20)
+            remove_btn.setToolTip(f"Remove '{item['label']}' from this session")
+            remove_btn.setStyleSheet("""
+                QPushButton {
+                    color: #44445a; background: transparent;
+                    border: none; font-size: 13px; padding: 0;
+                    border-radius: 4px;
+                }
+                QPushButton:hover {
+                    color: #ffffff;
+                    background: rgba(239, 68, 68, 0.6);
+                }
+            """)
+            item_id = item["id"]
+            remove_btn.clicked.connect(lambda checked, iid=item_id: self.item_removed.emit(iid))
+            rl.addWidget(remove_btn)
+
             layout.addWidget(row)
+
+    def refresh(self):
+        """Rebuild item list in place (called after a removal)."""
+        self._build()
 
 
 class WalletPanel(QWidget):
@@ -395,6 +425,7 @@ class WalletPanel(QWidget):
                 row.set_inspected(True)
                 self._inspector_widget = _InspectorPanel(inspected, self._list_widget)
                 self._inspector_widget.closed.connect(self._close_inspector)
+                self._inspector_widget.item_removed.connect(self._on_remove_item)
                 self._list_layout.addWidget(self._inspector_widget)
 
         self._list_layout.addStretch()
@@ -415,6 +446,15 @@ class WalletPanel(QWidget):
     def _close_inspector(self):
         self._inspected_id = None
         self._rebuild_rows()
+
+    def _on_remove_item(self, item_id: int):
+        """Remove a single item from a session without closing the inspector."""
+        db.delete_item(item_id)
+        # Refresh just the inspector panel in place so the row count updates
+        if self._inspector_widget is not None:
+            self._inspector_widget.refresh()
+        # Also update the session row subtitle (item count)
+        self._refresh()
 
     def _on_restore(self, session_id: int):
         for row in self._session_rows:
