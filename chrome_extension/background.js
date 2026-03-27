@@ -1,22 +1,27 @@
 /**
  * background.js — WorkSpace Manager Chrome Extension
- * Service worker that:
- *  1. Communicates with the native host (Python) via Native Messaging
- *  2. Sends current tabs when requested or on interval
- *  3. Receives session info from the native host
+ *
+ * FIX: Removed the automatic tab-push listeners (onCreated, onRemoved,
+ * onUpdated) and the 30-second periodic interval.  These were saving ALL open
+ * Chrome tabs into the active session on every tab event, which is why the
+ * user saw 22 URLs they never explicitly dropped.
+ *
+ * Tabs are now saved ONLY when:
+ *   1. The user explicitly presses "Save tabs" in the popup (force_snapshot).
+ *   2. The native host side-channel requests a snapshot (e.g. from launcher).
+ *
+ * The session-active handshake is kept so the host always knows which session
+ * is current; we just no longer auto-dump every open tab into it.
  */
 
 const NATIVE_HOST_ID = "com.workspace.manager";
-const SEND_INTERVAL_MS = 30_000; // Push tabs every 30s
 
-// Reconnect backoff: starts at 5s, doubles each attempt, caps at 60s.
 const RECONNECT_BASE_MS  = 5_000;
 const RECONNECT_MAX_MS   = 60_000;
 let   reconnectDelay     = RECONNECT_BASE_MS;
 
 let port = null;
 let currentSessionId = null;
-let intervalTimer = null;
 
 // ── Native Messaging ─────────────────────────────────────────────────────────
 
@@ -27,31 +32,22 @@ function connectNative() {
     port.onMessage.addListener((msg) => {
       console.log("[WorkSpace] Native message received:", msg);
 
-      // Native host tells us which session is active
       if (msg.type === "session_active") {
         currentSessionId = msg.session_id;
         console.log(`[WorkSpace] Active session: ${currentSessionId}`);
-        // Immediately send current tabs
-        sendTabs();
+        // NOTE: we no longer call sendTabs() automatically here.
+        // Tabs are only pushed on an explicit user action or host request.
       }
 
-      // Native host requests tabs snapshot
       if (msg.type === "request_tabs") {
-        // If the host sends a real session_id (non-zero), update currentSessionId
-        // so periodic pushes go to the right session.
-        // session_id=0 is a preview/prewarm request — do NOT overwrite
-        // currentSessionId with 0, which would break all future periodic pushes.
+        // Host-initiated snapshot (side-channel from launcher / picker).
         if (msg.session_id && msg.session_id !== 0) {
           currentSessionId = msg.session_id;
         }
-        // For preview requests (session_id=0): respond with tabs so the picker
-        // can display them, but pass 0 as session_id so the host knows not to
-        // save them to the database (preview_only path in host.py).
         const targetId = msg.session_id !== undefined ? msg.session_id : currentSessionId;
         sendTabsForSession(targetId);
       }
 
-      // Native host says no active session
       if (msg.type === "session_none") {
         currentSessionId = null;
       }
@@ -61,15 +57,12 @@ function connectNative() {
       console.log("[WorkSpace] Native host disconnected:", chrome.runtime.lastError?.message);
       port = null;
       currentSessionId = null;
-      // Exponential backoff so a crashed host isn't hammered every 5s.
       setTimeout(connectNative, reconnectDelay);
       reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
     });
 
-    // Reset backoff — we have a working connection.
     reconnectDelay = RECONNECT_BASE_MS;
     console.log("[WorkSpace] Connected to native host.");
-    // Ask which session is currently active
     sendMessage({ type: "get_active_session" });
 
   } catch (err) {
@@ -132,14 +125,9 @@ async function sendTabsForSession(sessionId) {
 
 // ── Event Listeners ───────────────────────────────────────────────────────────
 
-// Send tabs when a tab is created / closed / navigated
-chrome.tabs.onCreated.addListener(() => sendTabs());
-chrome.tabs.onRemoved.addListener(() => sendTabs());
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.status === "complete") {
-    sendTabs();
-  }
-});
+// REMOVED: chrome.tabs.onCreated / onRemoved / onUpdated listeners.
+// Those were the source of the "22 URLs" problem — every tab change
+// was triggering a full dump of all open tabs into the active session.
 
 // Popup / content script messages
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -151,27 +139,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === "force_snapshot") {
+    // Explicit user-initiated save from the popup.
     sendTabs().then(() => sendResponse({ ok: true }));
     return true; // async
   }
 
   if (msg.type === "session_selected") {
-    // User picked a session from popup
     currentSessionId = msg.session_id;
     sendMessage({ type: "set_active_session", session_id: msg.session_id });
-    sendTabs();
+    // Do NOT auto-push tabs here — let the user trigger that explicitly.
     sendResponse({ ok: true });
   }
 });
 
-// ── Periodic push ─────────────────────────────────────────────────────────────
-
-function startInterval() {
-  if (intervalTimer) clearInterval(intervalTimer);
-  intervalTimer = setInterval(sendTabs, SEND_INTERVAL_MS);
-}
-
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 connectNative();
-startInterval();
+
+// REMOVED: startInterval() / setInterval(sendTabs, SEND_INTERVAL_MS)
+// Periodic background dumps were silently inflating session URL counts.

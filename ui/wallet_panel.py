@@ -1,21 +1,12 @@
 """
 ui/wallet_panel.py — Hotkey-toggled floating wallet panel.
 
-This panel shows all sessions as "notification card" style rows —
-inspired by the toast notification design (dark bg, icon, title, time).
-
-Toggled by Ctrl+Alt+W (or whatever hotkey is set in main.py).
-Appears top-right, always on top, slides in/out.
-
-Each session row shows:
-  • Coloured icon square (like the notification app icon)
-  • Session name + item count
-  • Time since last updated
-  • Restore button on hover
-
-The panel is separate from the drop zone:
-  Drop zone  = slides in ONLY during window drags
-  Wallet panel = manually toggled via hotkey to review/restore sessions
+Changes vs original:
+  • SessionRow emits inspect_requested when the row body is clicked (not restore btn).
+  • WalletPanel inserts an _InspectorPanel inline below the clicked session row,
+    showing every saved item with type icon, label, and tooltip for the URL/path.
+  • Clicking the same row again, or pressing ×, closes the inspector.
+  • PANEL_WIDTH widened slightly (360→) to accommodate the inspect hint.
 """
 
 import sys
@@ -35,7 +26,6 @@ from PyQt6.QtGui import (
 
 import db
 
-# ── Design tokens ─────────────────────────────────────────────────────────────
 PANEL_BG     = QColor("#0f0f14")
 PANEL_BG2    = QColor("#1a1a24")
 PANEL_BORDER = QColor("#2a2a3a")
@@ -45,18 +35,17 @@ TEXT_MUTED   = QColor("#44445a")
 ACCENT_GREEN = QColor("#42d778")
 ACCENT_BLUE  = QColor("#635bff")
 
-# Session icon colours (cycles through these)
 ICON_COLORS = [
-    QColor("#635bff"),  # purple
-    QColor("#9bd86a"),  # green
-    QColor("#f59e0b"),  # amber
-    QColor("#ef4444"),  # red
-    QColor("#06b6d4"),  # cyan
-    QColor("#ec4899"),  # pink
+    QColor("#635bff"),
+    QColor("#9bd86a"),
+    QColor("#f59e0b"),
+    QColor("#ef4444"),
+    QColor("#06b6d4"),
+    QColor("#ec4899"),
 ]
 
-PANEL_WIDTH  = 340
-PANEL_HEIGHT = 520  # fixed height, scrollable inside
+PANEL_WIDTH  = 360
+PANEL_HEIGHT = 560
 
 
 def _time_ago(ts: str) -> str:
@@ -66,18 +55,16 @@ def _time_ago(ts: str) -> str:
         dt  = datetime.fromisoformat(ts)
         now = datetime.now()
         s   = int((now - dt).total_seconds())
-        if s < 60:   return "just now"
-        if s < 3600: return f"{s // 60}m ago"
-        if s < 86400:return f"{s // 3600}h ago"
+        if s < 60:    return "just now"
+        if s < 3600:  return f"{s // 60}m ago"
+        if s < 86400: return f"{s // 3600}h ago"
         return f"{s // 86400}d ago"
     except Exception:
         return ""
 
 
-# ── Restore worker ─────────────────────────────────────────────────────────────
-
 class _RestoreWorker(QThread):
-    done = pyqtSignal(dict, int)  # result, session_id
+    done = pyqtSignal(dict, int)
 
     def __init__(self, session_id: int, parent=None):
         super().__init__(parent)
@@ -90,27 +77,18 @@ class _RestoreWorker(QThread):
         self.done.emit(result, self._sid)
 
 
-# ── Session row widget ────────────────────────────────────────────────────────
-
 class SessionRow(QWidget):
-    """
-    A single session displayed as a notification-style card row.
-
-    Looks like:
-    ┌─────────────────────────────────────────────────────┐
-    │  [■]  Session Name                     5m ago       │
-    │       3 apps · 2 urls                  [Restore]    │
-    └─────────────────────────────────────────────────────┘
-    """
-
-    restore_requested = pyqtSignal(int)   # session_id
+    restore_requested = pyqtSignal(int)
+    inspect_requested = pyqtSignal(int)
+    delete_requested  = pyqtSignal(int)
 
     def __init__(self, session: dict, index: int, parent=None):
         super().__init__(parent)
-        self._session = session
-        self._index   = index
-        self._hovered = False
+        self._session   = session
+        self._index     = index
+        self._hovered   = False
         self._restoring = False
+        self._inspected = False
         self.setMouseTracking(True)
         self.setFixedHeight(72)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -123,6 +101,10 @@ class SessionRow(QWidget):
         self._restoring = v
         self.update()
 
+    def set_inspected(self, v: bool):
+        self._inspected = v
+        self.update()
+
     def enterEvent(self, e):
         self._hovered = True
         self.update()
@@ -132,9 +114,15 @@ class SessionRow(QWidget):
         self.update()
 
     def mousePressEvent(self, e):
-        # Hit test the restore button area (right side)
-        if e.position().x() > self.width() - 90:
+        x = e.position().x()
+        w = self.width()
+        if x > w - 90:
             self.restore_requested.emit(self._session["id"])
+        elif x > w - 120 and self._hovered:
+            # Delete button zone (×) — only active when row is hovered
+            self.delete_requested.emit(self._session["id"])
+        else:
+            self.inspect_requested.emit(self._session["id"])
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -145,92 +133,157 @@ class SessionRow(QWidget):
         h = self.height()
         sess = self._session
 
-        # ── Row background ────────────────────────────────────────────────────
-        if self._hovered:
+        if self._hovered or self._inspected:
             bg_path = QPainterPath()
             bg_path.addRoundedRect(0, 2, w, h - 4, 12, 12)
-            hover_col = QColor(255, 255, 255, 8)
-            p.fillPath(bg_path, hover_col)
+            p.fillPath(bg_path, QColor(255, 255, 255, 30 if self._inspected else 18))
 
-        # ── Icon square ───────────────────────────────────────────────────────
+        if self._inspected:
+            p.fillRect(QRect(0, 10, 3, h - 20), ICON_COLORS[self._index % len(ICON_COLORS)])
+
         icon_color = ICON_COLORS[self._index % len(ICON_COLORS)]
         icon_path  = QPainterPath()
         icon_path.addRoundedRect(16, 18, 36, 36, 8, 8)
-
-        # Gradient on icon
         grad = QLinearGradient(16, 18, 52, 54)
         grad.setColorAt(0, icon_color.lighter(130))
         grad.setColorAt(1, icon_color)
         p.fillPath(icon_path, grad)
 
-        # Icon letter
         p.setPen(QColor(255, 255, 255))
-        icon_font = QFont("Helvetica Neue", 14, QFont.Weight.Bold)
-        p.setFont(icon_font)
+        p.setFont(QFont("Helvetica Neue", 14, QFont.Weight.Bold))
         p.drawText(QRect(16, 18, 36, 36), Qt.AlignmentFlag.AlignCenter,
                    sess.get("name", "?")[0].upper())
 
-        # ── Session name ──────────────────────────────────────────────────────
         p.setPen(TEXT_WHITE)
-        name_font = QFont("Helvetica Neue", 11, QFont.Weight.Bold)
-        p.setFont(name_font)
-        name = sess.get("name", "Session")
-        p.drawText(QRect(66, 14, w - 160, 24), Qt.AlignmentFlag.AlignVCenter, name)
+        p.setFont(QFont("Helvetica Neue", 11, QFont.Weight.Bold))
+        p.drawText(QRect(66, 14, w - 170, 24), Qt.AlignmentFlag.AlignVCenter,
+                   sess.get("name", "Session"))
 
-        # ── Time ago ──────────────────────────────────────────────────────────
         p.setPen(TEXT_DIM)
-        time_font = QFont("Helvetica Neue", 9)
-        p.setFont(time_font)
-        ts = sess.get("updated_at", "")
-        p.drawText(QRect(w - 90, 14, 78, 24), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-                   _time_ago(ts))
+        p.setFont(QFont("Helvetica Neue", 9))
+        p.drawText(QRect(w - 90, 14, 78, 24),
+                   Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                   _time_ago(sess.get("updated_at", "")))
 
-        # ── Item count subtitle ───────────────────────────────────────────────
-        items = db.get_items(sess["id"])
+        items  = db.get_items(sess["id"])
         n_apps = sum(1 for i in items if i["type"] == "app")
         n_urls = sum(1 for i in items if i["type"] == "url")
         n_file = sum(1 for i in items if i["type"] == "file")
-        parts = []
+        parts  = []
         if n_apps: parts.append(f"{n_apps} app{'s' if n_apps != 1 else ''}")
         if n_urls: parts.append(f"{n_urls} url{'s' if n_urls != 1 else ''}")
         if n_file: parts.append(f"{n_file} file{'s' if n_file != 1 else ''}")
         subtitle = " · ".join(parts) if parts else "empty"
 
         p.setPen(TEXT_DIM)
-        sub_font = QFont("Helvetica Neue", 9)
-        p.setFont(sub_font)
-        p.drawText(QRect(66, 40, w - 160, 20), Qt.AlignmentFlag.AlignVCenter, subtitle)
+        p.setFont(QFont("Helvetica Neue", 9))
+        p.drawText(QRect(66, 40, w - 170, 20), Qt.AlignmentFlag.AlignVCenter, subtitle)
 
-        # ── Restore button (shown on hover) ───────────────────────────────────
+        # Tiny hint below subtitle
+        hint_text = "▾ inspecting" if self._inspected else "▸ tap to inspect"
+        p.setPen(TEXT_MUTED)
+        p.setFont(QFont("Helvetica Neue", 8))
+        p.drawText(QRect(66, 56, w - 170, 14), Qt.AlignmentFlag.AlignVCenter, hint_text)
+
         if self._hovered:
+            # Delete (×) button
+            del_path = QPainterPath()
+            del_path.addRoundedRect(w - 120, 22, 24, 28, 6, 6)
+            p.fillPath(del_path, QColor(239, 68, 68, 160))
+            p.setPen(QColor(255, 255, 255))
+            p.setFont(QFont("Helvetica Neue", 11, QFont.Weight.Bold))
+            p.drawText(QRect(w - 120, 22, 24, 28), Qt.AlignmentFlag.AlignCenter, "×")
+
             btn_path = QPainterPath()
             btn_path.addRoundedRect(w - 88, 22, 74, 28, 8, 8)
-            btn_col = ACCENT_GREEN if not self._restoring else QColor(255, 255, 255, 20)
-            p.fillPath(btn_path, btn_col)
-
+            p.fillPath(btn_path, ACCENT_GREEN if not self._restoring else QColor(255, 255, 255, 20))
             p.setPen(QColor(0, 0, 0) if not self._restoring else TEXT_DIM)
-            btn_font = QFont("Helvetica Neue", 9, QFont.Weight.Bold)
-            p.setFont(btn_font)
-            text = "Restoring…" if self._restoring else "Restore"
-            p.drawText(QRect(w - 88, 22, 74, 28), Qt.AlignmentFlag.AlignCenter, text)
+            p.setFont(QFont("Helvetica Neue", 9, QFont.Weight.Bold))
+            p.drawText(QRect(w - 88, 22, 74, 28), Qt.AlignmentFlag.AlignCenter,
+                       "Restoring…" if self._restoring else "Restore")
 
         p.end()
 
 
-# ── Wallet panel ──────────────────────────────────────────────────────────────
+class _InspectorPanel(QWidget):
+    """Inline item list shown below a session row when the user taps it."""
+
+    closed = pyqtSignal()
+
+    TYPE_ICONS = {"url": "🔗", "file": "📄", "app": "⚡"}
+
+    def __init__(self, session_id: int, parent=None):
+        super().__init__(parent)
+        self._session_id = session_id
+        self.setStyleSheet("background: transparent;")
+        self._build()
+
+    def _build(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 2, 16, 10)
+        layout.setSpacing(3)
+
+        # Header row
+        hdr = QHBoxLayout()
+        hdr.setContentsMargins(0, 0, 0, 4)
+        lbl = QLabel("Items in this session")
+        lbl.setStyleSheet("color: #888899; font-size: 10px;")
+        hdr.addWidget(lbl)
+        hdr.addStretch()
+        close_btn = QPushButton("×")
+        close_btn.setFixedSize(20, 20)
+        close_btn.setStyleSheet("""
+            QPushButton { color:#44445a; background:transparent; border:none; font-size:14px; padding:0; }
+            QPushButton:hover { color:#ffffff; }
+        """)
+        close_btn.clicked.connect(self.closed.emit)
+        hdr.addWidget(close_btn)
+        layout.addLayout(hdr)
+
+        items = db.get_items(self._session_id)
+
+        if not items:
+            empty = QLabel("No items yet — drag windows or URLs here to save them.")
+            empty.setWordWrap(True)
+            empty.setStyleSheet("color: #44445a; font-size: 10px; padding: 6px 0;")
+            layout.addWidget(empty)
+            return
+
+        for item in items:
+            row = QWidget()
+            row.setFixedHeight(34)
+            row.setStyleSheet("background: rgba(255,255,255,0.05); border-radius: 6px;")
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(8, 0, 8, 0)
+            rl.setSpacing(6)
+
+            icon = QLabel(self.TYPE_ICONS.get(item["type"], "•"))
+            icon.setFixedWidth(16)
+            icon.setStyleSheet("font-size: 11px; background: transparent;")
+            rl.addWidget(icon)
+
+            name_lbl = QLabel(item["label"])
+            name_lbl.setStyleSheet("color: #ccccdd; font-size: 10px; background: transparent;")
+            name_lbl.setToolTip(item["path_or_url"])
+            rl.addWidget(name_lbl, 1)
+
+            type_badge = QLabel(item["type"].upper())
+            type_badge.setStyleSheet("color: #44445a; font-size: 8px; background: transparent;")
+            rl.addWidget(type_badge)
+
+            layout.addWidget(row)
+
 
 class WalletPanel(QWidget):
-    """
-    Floating panel that shows all sessions as notification-style cards.
-    Toggled by hotkey. Appears top-right corner.
-    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._visible_state = False
+        self._visible_state    = False
         self._sessions: list[dict] = []
         self._session_rows: list[SessionRow] = []
         self._restore_workers: list[_RestoreWorker] = []
+        self._inspected_id: int | None = None
+        self._inspector_widget: _InspectorPanel | None = None
 
         self._setup_window()
         self._build_ui()
@@ -257,8 +310,8 @@ class WalletPanel(QWidget):
         if not screen:
             return
         geo = screen.geometry()
-        self._final_x = geo.x() + geo.width() - PANEL_WIDTH - 20
-        self._final_y = geo.y() + 20
+        self._final_x  = geo.x() + geo.width() - PANEL_WIDTH - 20
+        self._final_y  = geo.y() + 20
         self._hidden_x = geo.x() + geo.width() + 10
         self.move(self._hidden_x, self._final_y)
 
@@ -272,8 +325,6 @@ class WalletPanel(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # We paint the background in paintEvent
-        # Build header + scroll area as child widgets
         self._header = _PanelHeader(self)
         outer.addWidget(self._header)
 
@@ -292,7 +343,7 @@ class WalletPanel(QWidget):
         self._list_widget.setStyleSheet("background: transparent;")
         self._list_layout = QVBoxLayout(self._list_widget)
         self._list_layout.setContentsMargins(8, 4, 8, 12)
-        self._list_layout.setSpacing(4)
+        self._list_layout.setSpacing(2)
         self._list_layout.addStretch()
 
         self._scroll_area.setWidget(self._list_widget)
@@ -307,13 +358,18 @@ class WalletPanel(QWidget):
         self.update()
 
     def _rebuild_rows(self):
-        # Clear existing
+        inspected = self._inspected_id
+
         for row in self._session_rows:
             row.setParent(None)
             row.deleteLater()
         self._session_rows.clear()
 
-        # Remove stretch
+        if self._inspector_widget:
+            self._inspector_widget.setParent(None)
+            self._inspector_widget.deleteLater()
+            self._inspector_widget = None
+
         while self._list_layout.count():
             item = self._list_layout.takeAt(0)
             if item.widget():
@@ -330,13 +386,37 @@ class WalletPanel(QWidget):
         for i, sess in enumerate(self._sessions):
             row = SessionRow(sess, i, self._list_widget)
             row.restore_requested.connect(self._on_restore)
+            row.inspect_requested.connect(self._on_inspect)
+            row.delete_requested.connect(self._on_delete)
             self._session_rows.append(row)
             self._list_layout.addWidget(row)
 
+            if inspected is not None and sess["id"] == inspected:
+                row.set_inspected(True)
+                self._inspector_widget = _InspectorPanel(inspected, self._list_widget)
+                self._inspector_widget.closed.connect(self._close_inspector)
+                self._list_layout.addWidget(self._inspector_widget)
+
         self._list_layout.addStretch()
 
+    def _on_delete(self, session_id: int):
+        db.delete_session(session_id)
+        if self._inspected_id == session_id:
+            self._inspected_id = None
+        self._refresh()
+
+    def _on_inspect(self, session_id: int):
+        if self._inspected_id == session_id:
+            self._close_inspector()
+            return
+        self._inspected_id = session_id
+        self._rebuild_rows()
+
+    def _close_inspector(self):
+        self._inspected_id = None
+        self._rebuild_rows()
+
     def _on_restore(self, session_id: int):
-        # Find the row and mark it as restoring
         for row in self._session_rows:
             if row._session["id"] == session_id:
                 row.set_restoring(True)
@@ -352,10 +432,7 @@ class WalletPanel(QWidget):
             if row._session["id"] == session_id:
                 row.set_restoring(False)
                 break
-        # Clean up worker
         self._restore_workers = [w for w in self._restore_workers if w.isRunning()]
-
-    # ── Toggle ────────────────────────────────────────────────────────────────
 
     def toggle(self):
         if self._visible_state:
@@ -389,30 +466,20 @@ class WalletPanel(QWidget):
         except Exception:
             pass
 
-    # ── Paint ─────────────────────────────────────────────────────────────────
-
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
         w = self.width()
         h = self.height()
-
-        # Background
         bg_path = QPainterPath()
         bg_path.addRoundedRect(0, 0, w, h, 16, 16)
         p.fillPath(bg_path, PANEL_BG)
-
-        # Border
         p.setPen(QPen(PANEL_BORDER, 1.0))
         border_path = QPainterPath()
         border_path.addRoundedRect(0.5, 0.5, w - 1, h - 1, 16, 16)
         p.drawPath(border_path)
-
         p.end()
 
-
-# ── Header ────────────────────────────────────────────────────────────────────
 
 class _PanelHeader(QWidget):
     def __init__(self, parent=None):
@@ -424,37 +491,27 @@ class _PanelHeader(QWidget):
 
         title = QLabel("Workspace Sessions")
         title.setStyleSheet(f"""
-            color: {TEXT_WHITE.name()};
-            font-size: 14px;
-            font-weight: 700;
-            font-family: 'Helvetica Neue', 'Helvetica', sans-serif;
-            background: transparent;
+            color: {TEXT_WHITE.name()}; font-size: 14px; font-weight: 700;
+            font-family: 'Helvetica Neue', 'Helvetica', sans-serif; background: transparent;
         """)
         layout.addWidget(title)
         layout.addStretch()
 
         hint = QLabel("Ctrl+Shift+Space")
         hint.setStyleSheet(f"""
-            color: {TEXT_MUTED.name()};
-            font-size: 10px;
+            color: {TEXT_MUTED.name()}; font-size: 10px;
             font-family: 'Helvetica Neue', 'Helvetica', sans-serif;
-            background: rgba(255,255,255,0.05);
-            border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 5px;
-            padding: 3px 7px;
+            background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 5px; padding: 3px 7px;
         """)
         layout.addWidget(hint)
 
     def paintEvent(self, event):
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        # Separator line
         p.setPen(QPen(PANEL_BORDER, 1.0))
         p.drawLine(0, self.height() - 1, self.width(), self.height() - 1)
         p.end()
 
-
-# ── Footer ────────────────────────────────────────────────────────────────────
 
 class _PanelFooter(QWidget):
     def __init__(self, parent=None):
@@ -467,10 +524,8 @@ class _PanelFooter(QWidget):
         hint = QLabel("Drag any window to the right edge of your screen to save it")
         hint.setWordWrap(True)
         hint.setStyleSheet(f"""
-            color: {TEXT_MUTED.name()};
-            font-size: 10px;
-            font-family: 'Helvetica Neue', 'Helvetica', sans-serif;
-            background: transparent;
+            color: {TEXT_MUTED.name()}; font-size: 10px;
+            font-family: 'Helvetica Neue', 'Helvetica', sans-serif; background: transparent;
         """)
         layout.addWidget(hint)
 

@@ -190,8 +190,13 @@ class DropZoneOverlay(QWidget):
 
     def on_dropped(self, app_info: dict):
         """Called when the user releases inside our zone."""
-        if not self._sessions:
-            # No sessions at all — ask user to name a new one
+        # Check if release was over the "+ New Session" button
+        cursor_y = self.mapFromGlobal(self.cursor().pos()).y()
+        new_btn_y = SESSION_LIST_Y + len(self._sessions) * (CARD_H + CARD_GAP) + 8
+        over_new_btn = (new_btn_y <= cursor_y <= new_btn_y + NEW_BTN_H)
+
+        if not self._sessions or over_new_btn:
+            # No sessions, or explicitly dropped on "New Session"
             self._show_new_session_input(app_info)
         elif not self._user_selected_session and len(self._sessions) > 1:
             # Multiple sessions, nothing pre-selected — keep overlay open
@@ -201,6 +206,10 @@ class DropZoneOverlay(QWidget):
         else:
             # Either one session or user already clicked a card
             self._save_to_session(app_info)
+
+    def request_new_session(self):
+        """Called when the user taps '+ New Session' even when sessions exist."""
+        self._show_new_session_input(self._pending_app)
 
     def on_drag_cancelled(self):
         self._pending_app = None
@@ -227,10 +236,11 @@ class DropZoneOverlay(QWidget):
         self._confirm_timer.start(8000)
 
     def _show_new_session_input(self, app_info: dict):
-        """Show the inline name input for a brand-new session."""
+        """Show the inline name input for a brand-new session.
+        Positions the input below any existing session cards."""
         self._pending_app = app_info
-        geo = self._screen_geo if hasattr(self, "_screen_geo") else self.geometry()
-        input_y = SESSION_LIST_Y + 8
+        # Position below existing cards so the input never overlaps them
+        input_y = SESSION_LIST_Y + len(self._sessions) * (CARD_H + CARD_GAP) + 8
         self._new_sess_input.setGeometry(20, input_y, ZONE_WIDTH - 40, 32)
         self._new_sess_input.clear()
         self._new_sess_input.show()
@@ -340,11 +350,10 @@ class DropZoneOverlay(QWidget):
                     self._save_to_session(app)
                 return
 
-        # "+" new session button area (shown when no sessions)
-        new_btn_y = SESSION_LIST_Y + 8
-        if (not self._sessions and
-                new_btn_y <= y <= new_btn_y + NEW_BTN_H and
-                self._new_sess_input.isHidden()):
+        # "+ New Session" button — shown at the bottom of the card list
+        # regardless of whether sessions already exist.
+        new_btn_y = SESSION_LIST_Y + len(self._sessions) * (CARD_H + CARD_GAP) + 8
+        if new_btn_y <= y <= new_btn_y + NEW_BTN_H and self._new_sess_input.isHidden():
             self._show_new_session_input(self._pending_app)
 
     # ── Paint ─────────────────────────────────────────────────────────────────
@@ -458,8 +467,8 @@ class DropZoneOverlay(QWidget):
         # Session list (always visible during drag for pre-selection)
         self._paint_session_cards(p, w, show_active_dot=True)
 
-        # "No sessions" prompt
-        if not self._sessions and self._new_sess_input.isHidden():
+        # "+ New Session" button — always shown so user can create a new session
+        if self._new_sess_input.isHidden():
             self._paint_new_session_btn(p, w)
 
     # ── Confirmed state ───────────────────────────────────────────────────────
@@ -550,8 +559,8 @@ class DropZoneOverlay(QWidget):
                        f"{len(items)} items")
 
     def _paint_new_session_btn(self, p, w):
-        """Paint a '+  New Session' button when no sessions exist."""
-        by = SESSION_LIST_Y + 8
+        """Paint a '+  New Session' button below all existing session cards."""
+        by = SESSION_LIST_Y + len(self._sessions) * (CARD_H + CARD_GAP) + 8
         bp = QPainterPath()
         bp.addRoundedRect(20, by, w - 40, NEW_BTN_H, 10, 10)
         bc = QColor(WALLET_GLOW)
