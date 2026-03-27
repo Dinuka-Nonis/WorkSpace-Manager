@@ -37,14 +37,18 @@ function connectNative() {
 
       // Native host requests tabs snapshot
       if (msg.type === "request_tabs") {
-        // Always honour the session_id from the request — don't rely on
-        // currentSessionId which may be null if the host just started.
-        if (msg.session_id) {
+        // If the host sends a real session_id (non-zero), update currentSessionId
+        // so periodic pushes go to the right session.
+        // session_id=0 is a preview/prewarm request — do NOT overwrite
+        // currentSessionId with 0, which would break all future periodic pushes.
+        if (msg.session_id && msg.session_id !== 0) {
           currentSessionId = msg.session_id;
         }
-        // Send tabs even for the prewarm ping (session_id === 0) so the
-        // host process stays alive and ready for the real request.
-        sendTabsForSession(msg.session_id || currentSessionId);
+        // For preview requests (session_id=0): respond with tabs so the picker
+        // can display them, but pass 0 as session_id so the host knows not to
+        // save them to the database (preview_only path in host.py).
+        const targetId = msg.session_id !== undefined ? msg.session_id : currentSessionId;
+        sendTabsForSession(targetId);
       }
 
       // Native host says no active session

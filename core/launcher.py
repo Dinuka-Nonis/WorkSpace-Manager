@@ -211,71 +211,62 @@ def open_uwp_app(exe: str) -> tuple[bool, str]:
     """
     Launch a UWP / Microsoft Store app.
 
-    WindowsApps exes cannot be launched directly (WinError 5 Access Denied).
-    Strategy:
-      1. Find the AUMID from the registry -> launch via shell:AppsFolder\\<AUMID>
-      2. Derive package family name from the exe path → try uri launch via
-         PowerShell Start-Process
-      3. Last resort: explorer.exe shell:AppsFolder (opens the App list)
+    WindowsApps exes cannot be launched directly (Access Denied).
+    We launch them via shell:AppsFolder/<AUMID> using the user's own token --
+    no PowerShell, no elevation required.
+
+    Strategy 1: AUMID from registry  -> os.startfile("shell:AppsFolder/<AUMID>")
+    Strategy 2: Derive family!App    -> os.startfile("shell:AppsFolder/<family>!App")
+    Strategy 3: ShellExecuteW ctypes → fallback for edge cases
     """
     if not exe:
         return False, "No exe path for UWP app"
 
     exe_path = Path(exe)
 
-    # ── Strategy 1: AUMID lookup via registry ─────────────────────────────────
-    # Use PowerShell Start-Process — explorer.exe with shell:AppsFolder
-    # can open a file picker/explorer window instead of the app on some systems.
+    # ── Strategy 1: AUMID from registry + os.startfile ────────────────────────
+    # os.startfile runs under the user token — unlike PowerShell Invoke-Item
+    # it never hits Access Denied on WindowsApps paths.
     try:
         aumid = _find_aumid_for_stem(exe)
         if aumid:
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-WindowStyle", "Hidden",
-                 "-Command", f'Start-Process "shell:AppsFolder\\{aumid}"'],
-                capture_output=True, timeout=5
-            )
-            if result.returncode == 0:
-                return True, ""
+            os.startfile(f"shell:AppsFolder\\{aumid}")
+            return True, ""
     except Exception:
         pass
 
-    # ── Strategy 2: Derive package family name from exe path ──────────────────
+    # ── Strategy 2: Derive package family name from path ──────────────────────
     try:
-        # Extract package folder from path e.g.
-        # C:\Program Files\WindowsApps\SpotifyAB.SpotifyMusic_1.285_x64__zpdnekdrzrea0\Spotify.exe
-        parts = exe_path.parts
+        parts  = exe_path.parts
         wa_idx = next((i for i, p in enumerate(parts) if p.lower() == "windowsapps"), None)
         if wa_idx is not None:
             package_folder = parts[wa_idx + 1]
-            # "SpotifyAB.SpotifyMusic_1.285_x64__zpdnekdrzrea0"
-            # split("_") → ["SpotifyAB.SpotifyMusic", "1.285", "x64", "", "zpdnekdrzrea0"]
-            # The double-underscore produces an empty segment before the hash.
-            segments = package_folder.split("_")
-            app_name = segments[0]          # "SpotifyAB.SpotifyMusic"
-            pub_hash = segments[-1]         # "zpdnekdrzrea0"
+            segments       = package_folder.split("_")
+            app_name       = segments[0]    # e.g. "SpotifyAB.SpotifyMusic"
+            pub_hash       = segments[-1]   # e.g. "zpdnekdrzrea0"
             if app_name and pub_hash:
                 family = f"{app_name}_{pub_hash}"
-                result = subprocess.run(
-                    ["powershell", "-NoProfile", "-WindowStyle", "Hidden",
-                     "-Command", f'Start-Process "shell:AppsFolder\\{family}!App"'],
-                    capture_output=True, timeout=5
-                )
-                if result.returncode == 0:
-                    return True, ""
+                # Try with exe stem as app id first, then "App"
+                exe_stem = exe_path.stem    # e.g. "Spotify"
+                for app_id in (exe_stem, "App"):
+                    try:
+                        os.startfile(f"shell:AppsFolder\\{family}!{app_id}")
+                        return True, ""
+                    except Exception:
+                        continue
     except Exception:
         pass
 
-    # ── Strategy 3: PowerShell Invoke-Item on the exe ─────────────────────────
-    # Last resort — works for some Store apps. Never opens a File Explorer window.
+    # ── Strategy 3: ShellExecuteW via ctypes ──────────────────────────────────
+    # Direct Win32 call — bypasses PowerShell permission issues entirely.
     try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-WindowStyle", "Hidden",
-             "-Command", f'Invoke-Item "{exe}"'],
-            capture_output=True, timeout=5
+        import ctypes
+        ret = ctypes.windll.shell32.ShellExecuteW(
+            None, "open", exe, None, None, 1  # SW_SHOWNORMAL
         )
-        if result.returncode == 0:
+        if ret > 32:  # >32 means success
             return True, ""
-        return False, f"Could not launch UWP app: {result.stderr.decode(errors='replace').strip()}"
+        return False, f"ShellExecuteW returned {ret}"
     except Exception as e:
         return False, f"Could not launch UWP app: {e}"
 

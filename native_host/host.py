@@ -138,17 +138,16 @@ def _poll_side_channel():
                 is_prewarm = payload.get("prewarm", False)
                 TAB_REQUEST_FILE.unlink(missing_ok=True)
 
-                is_preview = payload.get("preview", False)
-                if is_prewarm or (sid == 0 and not is_preview):
-                    # Pre-warm ping — just stay alive, no snapshot needed
+                if is_prewarm:
+                    # Explicit pre-warm ping — stay alive, nothing to do
                     log("Pre-warm ping received — host is ready")
-                elif sid == 0 and is_preview:
-                    # Picker dialog preview — collect tabs but don't save to DB
-                    log("Preview tab request received")
+                elif sid == 0:
+                    # session_id=0 from picker scan — preview request.
+                    # We still ask the extension for tabs, but handle_tabs_snapshot
+                    # will skip the DB write (preview_only=True path).
+                    log("Preview tab request received — will respond without saving to DB")
                     with _snapshot_lock:
                         _pending_snapshot_session = 0
-                    global _awaiting_preview
-                    _awaiting_preview = True
                 elif sid:
                     log(f"Side-channel snapshot request for session {sid}")
                     with _snapshot_lock:
@@ -180,10 +179,10 @@ def handle_tabs_snapshot(session_id: int, tabs: list[dict],
     """
     Enrich tabs with the active Chrome profile and optionally save to DB.
 
-    When preview_only=True the tabs are written to tab_response.json so the
-    picker UI can display them, but db.save_chrome_tabs() is NOT called.
-    The UI saves them to the correct session after the user picks a target.
-    This is the fix for tabs being written into the wrong (MRU) session.
+    preview_only=True: write tab_response.json for the picker UI to read,
+    but do NOT call db.save_chrome_tabs().  The picker saves tabs to the
+    correct session only after the user confirms the target session.
+    This prevents tabs being written into the wrong (MRU) session.
     """
     if not DB_AVAILABLE:
         return
@@ -203,10 +202,10 @@ def handle_tabs_snapshot(session_id: int, tabs: list[dict],
             db.save_chrome_tabs(session_id, enriched)
             log(f"Saved {len(enriched)} tabs for session {session_id} (profile: {profile_dir or 'none'})")
         else:
-            log(f"Preview mode — {len(enriched)} tabs collected, skipping DB write")
+            log(f"Preview: {len(enriched)} tabs collected, skipping DB write")
 
         if is_side_channel:
-            # Always write response so snapshot.py / picker can read tabs
+            # Always write response so snapshot.py / picker can read it
             TAB_RESPONSE_FILE.write_text(
                 json.dumps({"tabs": enriched, "session_id": session_id}),
                 encoding="utf-8",
@@ -228,7 +227,6 @@ def handle_get_sessions() -> list[dict]:
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 _awaiting_side_channel_tabs = False
-_awaiting_preview           = False  # True when current request is preview-only
 
 
 def main():
@@ -255,7 +253,7 @@ def main():
                 log(f"Sending request_tabs to extension for session {snap_sid}")
                 send_message(sys.stdout, {
                     "type":       "request_tabs",
-                    "session_id": snap_sid,  # 0 for preview, real id for save
+                    "session_id": snap_sid,
                 })
                 _awaiting_side_channel_tabs = True
 
@@ -286,18 +284,19 @@ def main():
             elif msg_type == "tabs_snapshot":
                 session_id = msg.get("session_id")
                 tabs       = msg.get("tabs", [])
+                # IMPORTANT: use `is not None` checks — session_id=0 is valid
+                # (preview request) and `if session_id` would skip it silently.
                 if tabs is not None and session_id is not None:
-                    is_sc    = _awaiting_side_channel_tabs
-                    # preview_only when the side-channel request had session_id=0
-                    is_prev  = _awaiting_preview if is_sc else False
+                    is_sc      = _awaiting_side_channel_tabs
+                    # preview_only when side-channel request had session_id=0
+                    preview    = is_sc and (session_id == 0)
                     handle_tabs_snapshot(
                         session_id, tabs,
                         is_side_channel=is_sc,
-                        preview_only=is_prev,
+                        preview_only=preview,
                     )
                     if is_sc:
                         _awaiting_side_channel_tabs = False
-                        _awaiting_preview           = False
                         with _snapshot_lock:
                             _pending_snapshot_session = None
                     send_message(sys.stdout, {
