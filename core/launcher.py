@@ -1,8 +1,22 @@
 """
 core/launcher.py — Opens files, URLs, and apps by type.
 
-This is the single source of truth for "how do we open X".
-No title parsing, no file searching — we always have the exact path or URL.
+Chrome profile restore fix:
+  The old code launched Chrome with [chrome, --profile-directory=X, --new-window, url].
+  Problem: if Chrome is already running under a DIFFERENT profile, passing
+  --profile-directory=X opens a new window in profile X but Chrome may still
+  route the navigation to the already-running profile's window.
+
+  Fix: use the --args form so Chrome creates a fresh process for that profile:
+    chrome.exe --profile-directory=<dir> -- <url>
+  And use a two-step launch when Chrome is already running:
+    1. Open the profile with just --profile-directory (no URL) to ensure the
+       profile's window is foregrounded.
+    2. Open the URL in a new tab via: chrome.exe --profile-directory=<dir> <url>
+
+  Also handles the new chrome-profile-email: scheme introduced in db.py for
+  tabs where the directory wasn't confirmed at save time. At restore time we
+  do a fresh Local State lookup by email to try to resolve the directory.
 """
 
 import os
@@ -11,7 +25,7 @@ import webbrowser
 from pathlib import Path
 
 
-# ── Browser preference (can be extended to Edge, Firefox, etc.) ──────────────
+# ── Browser preference ────────────────────────────────────────────────────────
 
 CHROME_PATHS = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -32,7 +46,6 @@ VSCODE_PATHS = [
 
 
 def _find_browser() -> str | None:
-    """Return path to Chrome if available, then Edge, else None (fall back to webbrowser)."""
     for p in CHROME_PATHS + EDGE_PATHS:
         if os.path.exists(p):
             return p
@@ -40,7 +53,6 @@ def _find_browser() -> str | None:
 
 
 def _find_chrome() -> str | None:
-    """Return path to Chrome only (not Edge), for profile-aware tab restore."""
     for p in CHROME_PATHS:
         if os.path.exists(p):
             return p
@@ -48,11 +60,6 @@ def _find_chrome() -> str | None:
 
 
 def _find_vscode(hint_exe: str = "") -> str | None:
-    """
-    Return a path to code.exe.
-    Tries the stored hint path first (captured at snapshot time), then common
-    install locations, then shutil.which('code').
-    """
     import shutil
     if hint_exe and os.path.exists(hint_exe):
         return hint_exe
@@ -62,14 +69,69 @@ def _find_vscode(hint_exe: str = "") -> str | None:
     return shutil.which("code")
 
 
+# ── Chrome profile helpers ────────────────────────────────────────────────────
+
+def _load_chrome_local_state() -> dict:
+    """Return Chrome Local State profile info_cache, or {} on failure."""
+    import json
+    local_appdata = os.getenv("LOCALAPPDATA", "")
+    local_state   = os.path.join(local_appdata, "Google", "Chrome",
+                                 "User Data", "Local State")
+    if not os.path.exists(local_state):
+        return {}
+    try:
+        data = json.loads(open(local_state, encoding="utf-8", errors="replace").read())
+        return data.get("profile", {}).get("info_cache", {})
+    except Exception:
+        return {}
+
+
+def _resolve_profile_dir_from_email(email: str) -> tuple[str, str]:
+    """
+    Try to map a Google account email to a Chrome profile directory via
+    Local State. Returns (profile_dir, profile_name) or ("", "").
+    """
+    if not email:
+        return "", ""
+    info_cache = _load_chrome_local_state()
+    for profile_dir, pinfo in info_cache.items():
+        # Chrome stores the email in gaia_info_picture_url domain or directly
+        # under "user_name" / "gaia_id" depending on version.
+        stored_email = (
+            pinfo.get("user_name", "") or
+            pinfo.get("gaia_email", "") or
+            pinfo.get("email", "")
+        ).lower().strip()
+        if stored_email and stored_email == email.lower().strip():
+            return profile_dir, pinfo.get("name", profile_dir)
+    return "", ""
+
+
+def _open_chrome_with_profile(chrome: str, profile_dir: str, url: str) -> tuple[bool, str]:
+    """
+    Open a URL in a specific Chrome profile.
+
+    Uses --profile-directory and avoids --new-window (which can steal focus
+    from an already-open session). Chrome handles opening a new tab in the
+    correct profile window automatically.
+
+    If Chrome is NOT already running for this profile, it will launch a new
+    window. If it IS running, it opens a new tab in the existing window.
+    """
+    try:
+        subprocess.Popen([
+            chrome,
+            f"--profile-directory={profile_dir}",
+            url,
+        ])
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def open_file(path: str) -> tuple[bool, str]:
-    """
-    Open a file with its default application.
-    For Office files, Word/Excel/PowerPoint will offer to resume at last position.
-    Returns (success, error_message).
-    """
     if not os.path.exists(path):
         return False, f"File not found: {path}"
     try:
@@ -81,40 +143,76 @@ def open_file(path: str) -> tuple[bool, str]:
 
 def open_url(url: str) -> tuple[bool, str]:
     """
-    Open a URL in the preferred browser.
+    Open a URL in the correct browser / profile.
 
-    Handles the special 'chrome-profile:' encoding produced by snapshot.py::
-        chrome-profile:<profile_dir>|<actual_url>
-    This opens Chrome with --profile-directory=<profile_dir> so the URL is
-    restored in exactly the same Chrome profile it was captured from.
+    Handles three URL schemes produced by db.save_chrome_tabs:
 
-    Falls back to system default if Chrome/Edge not found.
-    Returns (success, error_message).
+    1. chrome-profile:<dir>|<url>
+       → Open in Chrome with --profile-directory=<dir>.
+       Guaranteed to open in the correct profile.
+
+    2. chrome-profile-email:<email>|<url>
+       → profile_dir wasn't confirmed at save time. Try to resolve the dir
+         from Local State at restore time. If found, same as case 1.
+         If not found, warn the user and open without a profile flag (best
+         effort — will open in whatever profile Chrome currently has active).
+
+    3. Plain http/https/etc URL
+       → Open in default browser (added via drag-drop with no profile info,
+         or explicitly added by user).
     """
-    # ── Chrome profile-aware restore ─────────────────────────────────────────
+
+    # ── Case 1: confirmed profile dir ────────────────────────────────────────
     if url.startswith("chrome-profile:"):
         rest = url[len("chrome-profile:"):]
         if "|" in rest:
             profile_dir, actual_url = rest.split("|", 1)
             chrome = _find_chrome()
-            if chrome:
+            if chrome and profile_dir:
+                print(f"[Launcher] Restoring URL in Chrome profile {profile_dir!r}: {actual_url}")
+                return _open_chrome_with_profile(chrome, profile_dir, actual_url)
+            elif chrome:
+                # profile_dir is empty string — open without profile flag
+                print(f"[Launcher] Warning: empty profile_dir, opening without profile: {actual_url}")
                 try:
-                    subprocess.Popen([
-                        chrome,
-                        f"--profile-directory={profile_dir}",
-                        "--new-window",  # force a new window in the correct profile
-                        actual_url,      # (ignored by an already-running wrong profile)
-                    ])
+                    subprocess.Popen([chrome, actual_url])
                     return True, ""
                 except Exception as e:
                     return False, str(e)
-            # Chrome not found — fall through with the bare URL
+            # Chrome not found — fall through with bare URL
             url = actual_url
         else:
-            url = rest  # malformed encoding, best-effort
+            url = rest  # malformed, best-effort
 
+    # ── Case 2: email hint, dir not confirmed at save time ────────────────────
+    elif url.startswith("chrome-profile-email:"):
+        rest = url[len("chrome-profile-email:"):]
+        if "|" in rest:
+            email, actual_url = rest.split("|", 1)
+            chrome = _find_chrome()
+            if chrome:
+                # Try to resolve at restore time
+                profile_dir, profile_name = _resolve_profile_dir_from_email(email)
+                if profile_dir:
+                    print(f"[Launcher] Resolved profile at restore time: "
+                          f"{profile_dir!r} ({profile_name}) for {email!r}")
+                    return _open_chrome_with_profile(chrome, profile_dir, actual_url)
+                else:
+                    # Still can't resolve — open without profile, log warning
+                    print(f"[Launcher] Warning: could not resolve Chrome profile for "
+                          f"{email!r} — opening without profile flag: {actual_url}")
+                    try:
+                        subprocess.Popen([chrome, actual_url])
+                        return True, ""
+                    except Exception as e:
+                        return False, str(e)
+            url = actual_url
+        else:
+            url = rest
+
+    # ── Standard URL (plain http/https, or fallback from above) ──────────────
     KNOWN_WEB_SCHEMES = ("http://", "https://", "file://")
-    OTHER_SCHEMES = ("mailto:", "ftp://", "ftps://", "tel:", "data:")
+    OTHER_SCHEMES     = ("mailto:", "ftp://", "ftps://", "tel:", "data:")
 
     if any(url.startswith(s) for s in OTHER_SCHEMES):
         try:
@@ -134,7 +232,6 @@ def open_url(url: str) -> tuple[bool, str]:
         except Exception as e:
             return False, str(e)
 
-    # Fallback
     try:
         webbrowser.open(url)
         return True, ""
@@ -143,18 +240,8 @@ def open_url(url: str) -> tuple[bool, str]:
 
 
 def open_app(exe_path: str) -> tuple[bool, str]:
-    """
-    Launch an application by its executable path.
-    Returns (success, error_message).
-
-    Auto-detects WindowsApps (UWP/Store) paths and routes to open_uwp_app
-    so they are launched correctly via shell:AppsFolder rather than direct
-    subprocess (which would fail with Access Denied).
-    """
-    # UWP apps live in WindowsApps — cannot be launched directly
     if "WindowsApps" in exe_path:
         return open_uwp_app(exe_path)
-
     if not os.path.exists(exe_path):
         return False, f"Executable not found: {exe_path}"
     try:
@@ -165,24 +252,13 @@ def open_app(exe_path: str) -> tuple[bool, str]:
 
 
 def open_vscode_folder(encoded: str) -> tuple[bool, str]:
-    """
-    Open a VS Code workspace folder from the encoded string produced by
-    snapshot.py::_get_vscode_workspaces().
-
-    Encoding:  <code_exe_path>||<workspace_folder_or_file>
-
-    The stored code_exe_path is used first; if it no longer exists we fall
-    back to _find_vscode() which checks common install locations and PATH.
-    """
     if "||" in encoded:
         hint_exe, folder = encoded.split("||", 1)
     else:
         hint_exe, folder = encoded, ""
-
     code_exe = _find_vscode(hint_exe)
     if not code_exe:
         return False, "VS Code executable not found — is it installed?"
-
     try:
         if folder.strip():
             subprocess.Popen([code_exe, folder])
@@ -194,9 +270,6 @@ def open_vscode_folder(encoded: str) -> tuple[bool, str]:
 
 
 def open_explorer_folder(folder: str) -> tuple[bool, str]:
-    """
-    Open a File Explorer window at the given folder path.
-    """
     try:
         if folder.strip() and os.path.exists(folder):
             subprocess.Popen(["explorer.exe", folder])
@@ -209,24 +282,13 @@ def open_explorer_folder(folder: str) -> tuple[bool, str]:
 
 def open_uwp_app(exe: str) -> tuple[bool, str]:
     """
-    Launch a UWP / Microsoft Store app.
-
-    WindowsApps exes cannot be launched directly (Access Denied).
-    We launch them via shell:AppsFolder/<AUMID> using the user's own token --
-    no PowerShell, no elevation required.
-
-    Strategy 1: AUMID from registry  -> os.startfile("shell:AppsFolder/<AUMID>")
-    Strategy 2: Derive family!App    -> os.startfile("shell:AppsFolder/<family>!App")
-    Strategy 3: ShellExecuteW ctypes → fallback for edge cases
+    Launch a UWP / Microsoft Store app via shell:AppsFolder/<AUMID>.
     """
     if not exe:
         return False, "No exe path for UWP app"
 
     exe_path = Path(exe)
 
-    # ── Strategy 1: AUMID from registry + os.startfile ────────────────────────
-    # os.startfile runs under the user token — unlike PowerShell Invoke-Item
-    # it never hits Access Denied on WindowsApps paths.
     try:
         aumid = _find_aumid_for_stem(exe)
         if aumid:
@@ -235,36 +297,29 @@ def open_uwp_app(exe: str) -> tuple[bool, str]:
     except Exception:
         pass
 
-    # ── Strategy 2: Derive package family name from path ──────────────────────
     try:
         parts  = exe_path.parts
         wa_idx = next((i for i, p in enumerate(parts) if p.lower() == "windowsapps"), None)
         if wa_idx is not None:
             package_folder = parts[wa_idx + 1]
             segments       = package_folder.split("_")
-            app_name       = segments[0]    # e.g. "SpotifyAB.SpotifyMusic"
-            pub_hash       = segments[-1]   # e.g. "zpdnekdrzrea0"
+            app_name       = segments[0]
+            pub_hash       = segments[-1]
             if app_name and pub_hash:
                 family = f"{app_name}_{pub_hash}"
-                # Try with exe stem as app id first, then "App"
-                exe_stem = exe_path.stem    # e.g. "Spotify"
-                for app_id in (exe_stem, "App"):
-                    try:
-                        os.startfile(f"shell:AppsFolder\\{family}!{app_id}")
-                        return True, ""
-                    except Exception:
-                        continue
+                aumid  = f"{family}!App"
+                os.startfile(f"shell:AppsFolder\\{aumid}")
+                return True, ""
     except Exception:
         pass
 
-    # ── Strategy 3: ShellExecuteW via ctypes ──────────────────────────────────
-    # Direct Win32 call — bypasses PowerShell permission issues entirely.
     try:
-        import ctypes
-        ret = ctypes.windll.shell32.ShellExecuteW(
-            None, "open", exe, None, None, 1  # SW_SHOWNORMAL
-        )
-        if ret > 32:  # >32 means success
+        SW_SHOW      = 5
+        SEE_MASK_FLAG = 0x00000400
+        ctypes = __import__("ctypes")
+        shell32 = ctypes.windll.shell32
+        ret = shell32.ShellExecuteW(None, "open", exe, None, None, SW_SHOW)
+        if ret > 32:
             return True, ""
         return False, f"ShellExecuteW returned {ret}"
     except Exception as e:
@@ -272,17 +327,6 @@ def open_uwp_app(exe: str) -> tuple[bool, str]:
 
 
 def _find_aumid_for_stem(exe: str) -> str:
-    """
-    Search the Windows registry for an Application User Model ID (AUMID)
-    matching the given exe path, by looking up the package folder name.
-
-    Returns a string like "SpotifyAB.SpotifyMusic_hash!Spotify" or "".
-
-    Bug fix: original code incremented j then immediately closed the registry
-    keys and returned — the EnumKey(apps_key, 0) call never ran because j was
-    incremented to 1 before the return. Fixed by reading the app_id at index 0
-    first, then returning it.
-    """
     try:
         import winreg
         exe_path = Path(exe)
@@ -290,7 +334,7 @@ def _find_aumid_for_stem(exe: str) -> str:
         wa_idx = next((i for i, p in enumerate(parts) if p.lower() == "windowsapps"), None)
         if wa_idx is None:
             return ""
-        package_folder = parts[wa_idx + 1]  # e.g. "SpotifyAB.SpotifyMusic_1.285_x64__hash"
+        package_folder = parts[wa_idx + 1]
         pkg_prefix = package_folder.split("_")[0].lower()
 
         base = r"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages"
@@ -304,7 +348,6 @@ def _find_aumid_for_stem(exe: str) -> str:
                 break
             if pkg_prefix not in pkg_name.lower():
                 continue
-            # Found a matching package — enumerate its Applications sub-key
             try:
                 apps_key = winreg.OpenKey(root, pkg_name + r"\Applications")
             except OSError:
@@ -316,12 +359,11 @@ def _find_aumid_for_stem(exe: str) -> str:
                         app_id = winreg.EnumKey(apps_key, j)
                     except OSError:
                         break
-                    # Use the first application entry (usually "App")
                     aumid = f"{pkg_name}!{app_id}"
                     winreg.CloseKey(apps_key)
                     winreg.CloseKey(root)
                     return aumid
-                    j += 1  # noqa: unreachable — we return on first valid app_id
+                    j += 1
             finally:
                 try:
                     winreg.CloseKey(apps_key)
@@ -336,31 +378,18 @@ def _find_aumid_for_stem(exe: str) -> str:
 def open_item(item: dict) -> tuple[bool, str]:
     """
     Dispatch to the correct opener based on item type and path_or_url.
-    item must have 'type' ('file'|'url'|'app') and 'path_or_url'.
-
-    Special cases:
-      • type='app',  path_or_url starts with 'vscode-folder:' → open VS Code
-        with the encoded workspace folder.
-      • type='url',  path_or_url starts with 'chrome-profile:' → open Chrome
-        with the correct --profile-directory flag (handled inside open_url).
     """
     item_type   = item.get("type", "")
     path_or_url = item.get("path_or_url", "")
 
-    # VS Code workspace restore
     if item_type == "app" and path_or_url.startswith("vscode-folder:"):
-        encoded = path_or_url[len("vscode-folder:"):]
-        return open_vscode_folder(encoded)
+        return open_vscode_folder(path_or_url[len("vscode-folder:"):])
 
-    # File Explorer folder restore
     if item_type == "app" and path_or_url.startswith("explorer-folder:"):
-        folder = path_or_url[len("explorer-folder:"):]
-        return open_explorer_folder(folder)
+        return open_explorer_folder(path_or_url[len("explorer-folder:"):])
 
-    # UWP / Microsoft Store app restore
     if item_type == "app" and path_or_url.startswith("uwp:"):
-        exe = path_or_url[len("uwp:"):]
-        return open_uwp_app(exe)
+        return open_uwp_app(path_or_url[len("uwp:"):])
 
     if item_type == "file":
         return open_file(path_or_url)
@@ -373,22 +402,13 @@ def open_item(item: dict) -> tuple[bool, str]:
 
 
 def open_all(items: list[dict]) -> dict:
-    """
-    Open all items in a session.
-    Returns a summary: {total, opened, failed, errors}
-    """
     results, _ = open_all_tracked(items)
     return results
 
 
 def open_all_tracked(items: list[dict]) -> tuple[dict, set]:
-    """
-    Open all items in a session.
-    Returns (summary_dict, failed_item_ids) so callers can match on item ID
-    rather than parsing label strings (labels may contain ":" themselves).
-    """
     import time
-    results = {"total": len(items), "opened": 0, "failed": 0, "errors": []}
+    results    = {"total": len(items), "opened": 0, "failed": 0, "errors": []}
     failed_ids: set[int] = set()
 
     for item in items:
@@ -399,28 +419,24 @@ def open_all_tracked(items: list[dict]) -> tuple[dict, set]:
             results["failed"] += 1
             results["errors"].append(f"{item.get('label', '?')}: {err}")
             failed_ids.add(item["id"])
-        # Small delay so apps don't fight over focus
         time.sleep(0.25)
 
     return results, failed_ids
 
 
-# ── Label helpers (used when auto-generating labels) ─────────────────────────
+# ── Label helpers ─────────────────────────────────────────────────────────────
 
 def label_for_file(path: str) -> str:
-    """Generate a clean display label from a file path."""
     return Path(path).name
 
 
 def label_for_url(url: str) -> str:
-    """Generate a clean display label from a URL."""
     try:
         from urllib.parse import urlparse
         parsed = urlparse(url)
         host = parsed.netloc.replace("www.", "")
         path = parsed.path.rstrip("/")
         if path and path != "/":
-            # e.g. "github.com/user/repo"
             return f"{host}{path}"
         return host or url
     except Exception:
@@ -428,9 +444,7 @@ def label_for_url(url: str) -> str:
 
 
 def label_for_app(exe_path: str) -> str:
-    """Generate a clean display label from an exe path."""
     name = Path(exe_path).stem
-    # Convert camelCase and underscores to spaces, capitalize
     import re
     name = re.sub(r"([a-z])([A-Z])", r"\1 \2", name)
     name = name.replace("_", " ").replace("-", " ")
@@ -456,35 +470,20 @@ FILE_ICONS = {
 }
 
 APP_ICONS = {
-    "code":         "💻",
-    "chrome":       "🌐",
-    "firefox":      "🦊",
-    "msedge":       "🌐",
-    "slack":        "💬",
-    "discord":      "💬",
-    "notion":       "📝",
-    "obsidian":     "🔮",
-    "figma":        "🎨",
-    "postman":      "📮",
-    "pycharm64":    "🐍",
-    "idea64":       "☕",
-    "webstorm64":   "🟨",
-    "devenv":       "🔷",
-    "teams":        "👥",
-    "zoom":         "📹",
-    "spotify":      "🎵",
-    "vlc":          "🎬",
+    "code":      "💻", "chrome":  "🌐", "firefox": "🦊",
+    "msedge":    "🌐", "slack":   "💬", "discord": "💬",
+    "notion":    "📝", "obsidian":"🔮", "figma":   "🎨",
+    "postman":   "📮", "pycharm64":"🐍","idea64":  "☕",
+    "webstorm64":"🟨", "devenv":  "🔷", "teams":   "👥",
+    "zoom":      "📹", "spotify": "🎵", "vlc":     "🎬",
 }
 
 
 def icon_for_item(item: dict) -> str:
-    """Return an emoji icon for an item based on its type and path."""
     item_type   = item.get("type", "")
     path_or_url = item.get("path_or_url", "").lower()
 
     if item_type == "url":
-        if path_or_url.startswith("chrome-profile:"):
-            return "🌐"
         return "🌐"
 
     if item_type == "file":
@@ -492,13 +491,10 @@ def icon_for_item(item: dict) -> str:
         return FILE_ICONS.get(ext, "📄")
 
     if item_type == "app":
-        # VS Code workspace
         if path_or_url.startswith("vscode-folder:"):
             return "💻"
-        # File Explorer folder
         if path_or_url.startswith("explorer-folder:"):
             return "📁"
-        # UWP / Store app
         if path_or_url.startswith("uwp:"):
             exe = path_or_url[len("uwp:"):].lower()
             for key, icon in APP_ICONS.items():

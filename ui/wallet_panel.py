@@ -2,11 +2,13 @@
 ui/wallet_panel.py — Hotkey-toggled floating wallet panel.
 
 Changes in this version:
-  • _InspectorPanel now shows a small × remove button on each item row.
-    Clicking it calls db.delete_item() and refreshes the inspector in place,
-    without closing the whole panel or collapsing the session row.
-  • WalletPanel._on_remove_item() added to handle the signal.
-  • All other behaviour (session restore, delete, inspect, animations) unchanged.
+  • _InspectorPanel item rows now show a profile badge for chrome-profile:
+    and chrome-profile-email: URLs so the user can see exactly which Chrome
+    profile a saved URL belongs to.
+  • ⚠ badge shown when profile_dir was not confirmed at save time
+    (chrome-profile-email: scheme).
+  • Tooltip on each item row shows the full encoded path_or_url for debugging.
+  • All other behaviour unchanged.
 """
 
 import sys
@@ -61,6 +63,28 @@ def _time_ago(ts: str) -> str:
         return f"{s // 86400}d ago"
     except Exception:
         return ""
+
+
+def _profile_badge_for_url(path_or_url: str) -> tuple[str, str]:
+    """
+    Parse a stored URL and return (badge_text, badge_color_hex).
+
+    chrome-profile:<dir>|<url>        → ("<dir>", "#42d778")   green = confirmed
+    chrome-profile-email:<email>|<url>→ ("⚠ unconfirmed", "#f59e0b")  amber = partial
+    anything else                      → ("", "")               no badge
+    """
+    if path_or_url.startswith("chrome-profile:"):
+        rest = path_or_url[len("chrome-profile:"):]
+        if "|" in rest:
+            profile_dir = rest.split("|", 1)[0]
+            return profile_dir, "#42d778"
+    elif path_or_url.startswith("chrome-profile-email:"):
+        rest = path_or_url[len("chrome-profile-email:"):]
+        if "|" in rest:
+            email = rest.split("|", 1)[0]
+            short = email.split("@")[0] if "@" in email else email
+            return f"⚠ {short}", "#f59e0b"
+    return "", ""
 
 
 class _RestoreWorker(QThread):
@@ -205,8 +229,8 @@ class SessionRow(QWidget):
 class _InspectorPanel(QWidget):
     """Inline item list shown below a session row when the user taps it."""
 
-    closed         = pyqtSignal()
-    item_removed   = pyqtSignal(int)   # emits item_id
+    closed       = pyqtSignal()
+    item_removed = pyqtSignal(int)   # emits item_id
 
     TYPE_ICONS = {"url": "🔗", "file": "📄", "app": "⚡"}
 
@@ -257,47 +281,92 @@ class _InspectorPanel(QWidget):
             return
 
         for item in items:
-            row = QWidget()
-            row.setFixedHeight(34)
-            row.setStyleSheet("background: rgba(255,255,255,0.05); border-radius: 6px;")
-            rl = QHBoxLayout(row)
-            rl.setContentsMargins(8, 0, 4, 0)
-            rl.setSpacing(6)
+            self._add_item_row(layout, item)
 
-            icon = QLabel(self.TYPE_ICONS.get(item["type"], "•"))
-            icon.setFixedWidth(16)
-            icon.setStyleSheet("font-size: 11px; background: transparent;")
-            rl.addWidget(icon)
+    def _add_item_row(self, layout, item: dict):
+        """Build one item row with icon, label, optional profile badge, remove button."""
+        path_or_url = item.get("path_or_url", "")
+        label_text  = item.get("label", "")
 
-            name_lbl = QLabel(item["label"])
-            name_lbl.setStyleSheet("color: #ccccdd; font-size: 10px; background: transparent;")
-            name_lbl.setToolTip(item["path_or_url"])
-            rl.addWidget(name_lbl, 1)
+        # For URL items, compute a clean display label (strip [Profile] prefix —
+        # we show profile as a separate badge instead so it's always consistent).
+        display_label = label_text
+        profile_badge_text  = ""
+        profile_badge_color = ""
 
-            type_badge = QLabel(item["type"].upper())
-            type_badge.setStyleSheet("color: #44445a; font-size: 8px; background: transparent;")
-            rl.addWidget(type_badge)
+        if item["type"] == "url":
+            profile_badge_text, profile_badge_color = _profile_badge_for_url(path_or_url)
+            # Strip the [ProfileName] or [⚠ email] from the label text so it
+            # doesn't appear twice (the label was built with it in db.py).
+            if display_label.startswith("[") and "] " in display_label:
+                display_label = display_label.split("] ", 1)[1]
 
-            # Per-item remove button
-            remove_btn = QPushButton("×")
-            remove_btn.setFixedSize(20, 20)
-            remove_btn.setToolTip(f"Remove '{item['label']}' from this session")
-            remove_btn.setStyleSheet("""
-                QPushButton {
-                    color: #44445a; background: transparent;
-                    border: none; font-size: 13px; padding: 0;
-                    border-radius: 4px;
-                }
-                QPushButton:hover {
-                    color: #ffffff;
-                    background: rgba(239, 68, 68, 0.6);
-                }
-            """)
-            item_id = item["id"]
-            remove_btn.clicked.connect(lambda checked, iid=item_id: self.item_removed.emit(iid))
-            rl.addWidget(remove_btn)
+        # ── Row widget ────────────────────────────────────────────────────────
+        row = QWidget()
+        row.setStyleSheet("background: rgba(255,255,255,0.05); border-radius: 6px;")
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(8, 0, 4, 0)
+        rl.setSpacing(5)
 
-            layout.addWidget(row)
+        # Type icon
+        icon_lbl = QLabel(self.TYPE_ICONS.get(item["type"], "•"))
+        icon_lbl.setFixedWidth(16)
+        icon_lbl.setStyleSheet("font-size: 11px; background: transparent;")
+        rl.addWidget(icon_lbl)
+
+        # Label (elided if long)
+        name_lbl = QLabel(display_label)
+        name_lbl.setStyleSheet("color: #ccccdd; font-size: 10px; background: transparent;")
+        name_lbl.setToolTip(
+            f"Path: {path_or_url}\n"
+            f"Label: {label_text}"
+        )
+        rl.addWidget(name_lbl, 1)
+
+        # Profile badge (only for URL items with profile info)
+        if profile_badge_text:
+            badge = QLabel(profile_badge_text)
+            badge.setStyleSheet(
+                f"color: {profile_badge_color}; font-size: 8px; "
+                f"background: rgba(255,255,255,0.07); border-radius: 3px; "
+                f"padding: 1px 4px;"
+            )
+            badge.setToolTip(
+                "Green = profile confirmed (will restore in this Chrome profile)\n"
+                "Amber ⚠ = profile directory not confirmed at save time; "
+                "restore will attempt to resolve from your Google account email"
+                if "⚠" in profile_badge_text
+                else "Will restore in this Chrome profile"
+            )
+            rl.addWidget(badge)
+
+        # Type badge
+        type_badge = QLabel(item["type"].upper())
+        type_badge.setStyleSheet("color: #44445a; font-size: 8px; background: transparent;")
+        rl.addWidget(type_badge)
+
+        # Per-item remove button
+        remove_btn = QPushButton("×")
+        remove_btn.setFixedSize(20, 20)
+        remove_btn.setToolTip(f"Remove '{label_text}' from this session")
+        remove_btn.setStyleSheet("""
+            QPushButton {
+                color: #44445a; background: transparent;
+                border: none; font-size: 13px; padding: 0;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                color: #ffffff;
+                background: rgba(239, 68, 68, 0.6);
+            }
+        """)
+        item_id = item["id"]
+        remove_btn.clicked.connect(lambda checked, iid=item_id: self.item_removed.emit(iid))
+        rl.addWidget(remove_btn)
+
+        # Dynamic height based on whether badge wraps
+        row.setMinimumHeight(34)
+        layout.addWidget(row)
 
     def refresh(self):
         """Rebuild item list in place (called after a removal)."""
@@ -448,12 +517,9 @@ class WalletPanel(QWidget):
         self._rebuild_rows()
 
     def _on_remove_item(self, item_id: int):
-        """Remove a single item from a session without closing the inspector."""
         db.delete_item(item_id)
-        # Refresh just the inspector panel in place so the row count updates
         if self._inspector_widget is not None:
             self._inspector_widget.refresh()
-        # Also update the session row subtitle (item count)
         self._refresh()
 
     def _on_restore(self, session_id: int):

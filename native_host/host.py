@@ -66,13 +66,21 @@ def log(msg: str):
     print(f"[WorkSpace Host] {msg}", file=sys.stderr, flush=True)
 
 
-def _detect_chrome_profile() -> tuple[str, str]:
+def _detect_chrome_profile(profile_email_hint: str = "") -> tuple[str, str]:
     """
-    Detect the active Chrome profile by scanning running chrome.exe processes
-    for --profile-directory=<dir>, then reads Local State to get the display name.
+    Detect the Chrome profile directory and display name.
+
+    Priority order:
+      1. If the extension sends a profile_email hint (from chrome.identity),
+         cross-reference it against Local State profile email cache — this is
+         the most accurate method because the extension itself knows which
+         profile it is running in.
+      2. Fall back to scanning running chrome.exe processes for
+         --profile-directory= flags (least-count heuristic).
+      3. If Chrome is running but no flag found, assume "Default".
+      4. Return ("", "") if Chrome is not running at all.
+
     Returns (profile_dir, profile_name) e.g. ("Profile 3", "Work Account").
-    Returns ("Default", "Default") if Chrome is running with no explicit flag.
-    Returns ("", "") if Chrome is not running.
     """
     import json, os
     try:
@@ -83,15 +91,32 @@ def _detect_chrome_profile() -> tuple[str, str]:
     local_appdata = os.getenv("LOCALAPPDATA", "")
     local_state   = os.path.join(local_appdata, "Google", "Chrome", "User Data", "Local State")
 
-    profile_names: dict[str, str] = {}
+    # Build dir→name and dir→email maps from Local State
+    profile_names:  dict[str, str] = {}
+    profile_emails: dict[str, str] = {}   # dir → account email
     if os.path.exists(local_state):
         try:
             data = json.loads(open(local_state, encoding="utf-8", errors="replace").read())
             for dir_name, info in data.get("profile", {}).get("info_cache", {}).items():
-                profile_names[dir_name] = info.get("name", dir_name)
+                profile_names[dir_name]  = info.get("name", dir_name)
+                # gaia_given_name / user_name / gaia_name differ by sync state
+                email = (info.get("user_name") or info.get("gaia_given_name") or "").lower()
+                if email:
+                    profile_emails[dir_name] = email
         except Exception:
             pass
 
+    # ── Strategy 1: match by email hint from extension ────────────────────────
+    if profile_email_hint:
+        hint_lower = profile_email_hint.lower()
+        for dir_name, email in profile_emails.items():
+            if email == hint_lower:
+                log(f"Profile matched by email hint: {dir_name!r} ({profile_names.get(dir_name, dir_name)})")
+                return dir_name, profile_names.get(dir_name, dir_name)
+        # Email present but not found in cache (e.g. not signed in to Chrome sync)
+        log(f"Profile email hint {profile_email_hint!r} not in Local State cache — falling back to process scan")
+
+    # ── Strategy 2: process scan ──────────────────────────────────────────────
     chrome_running = False
     profile_counts: dict[str, int] = {}
 
@@ -175,20 +200,38 @@ def get_active_session() -> dict | None:
 
 def handle_tabs_snapshot(session_id: int, tabs: list[dict],
                          is_side_channel: bool = False,
-                         preview_only: bool = False):
+                         preview_only: bool = False,
+                         all_tabs: bool = True):
     """
     Enrich tabs with the active Chrome profile and optionally save to DB.
+
+    all_tabs=False  (drag-drop capture): the extension already filtered to the
+    single focused tab. We honour that and do NOT expand it.
+
+    all_tabs=True   (explicit "Save tabs" by user): save everything sent.
 
     preview_only=True: write tab_response.json for the picker UI to read,
     but do NOT call db.save_chrome_tabs().  The picker saves tabs to the
     correct session only after the user confirms the target session.
     This prevents tabs being written into the wrong (MRU) session.
+
+    Profile detection priority:
+      1. profile_email field sent by the extension (most accurate — comes from
+         chrome.identity running inside the actual profile).
+      2. Process-scan fallback in _detect_chrome_profile().
     """
     if not DB_AVAILABLE:
         return
     try:
-        profile_dir, profile_name = _detect_chrome_profile()
-        log(f"Chrome profile: dir={profile_dir!r} name={profile_name!r} preview={preview_only}")
+        # Extract the profile hint that the extension embedded in the tab objects.
+        # All tabs from the same profile share the same hint, so grab the first one.
+        profile_email_hint = ""
+        if tabs:
+            profile_email_hint = tabs[0].get("profile_email") or tabs[0].get("profile_hint") or ""
+
+        profile_dir, profile_name = _detect_chrome_profile(profile_email_hint)
+        log(f"Chrome profile: dir={profile_dir!r} name={profile_name!r} "
+            f"hint={profile_email_hint!r} preview={preview_only} all_tabs={all_tabs}")
 
         enriched = []
         for t in tabs:
@@ -284,6 +327,7 @@ def main():
             elif msg_type == "tabs_snapshot":
                 session_id = msg.get("session_id")
                 tabs       = msg.get("tabs", [])
+                all_tabs   = msg.get("all_tabs", True)   # extension sets False for drag-drop
                 # IMPORTANT: use `is not None` checks — session_id=0 is valid
                 # (preview request) and `if session_id` would skip it silently.
                 if tabs is not None and session_id is not None:
@@ -294,6 +338,7 @@ def main():
                         session_id, tabs,
                         is_side_channel=is_sc,
                         preview_only=preview,
+                        all_tabs=all_tabs,
                     )
                     if is_sc:
                         _awaiting_side_channel_tabs = False

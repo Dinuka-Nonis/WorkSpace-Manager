@@ -4,6 +4,19 @@ db.py — SQLite persistence layer for WorkSpace Manager.
 Tables:
   sessions      — named workspaces
   session_items — files, URLs, and apps belonging to a session
+
+save_chrome_tabs fix:
+  Previously accepted tabs with empty profile_dir and used the bare URL,
+  which meant tabs from ANY Chrome profile (including background ones) would
+  get saved without attribution. Now:
+    • Tabs with a confirmed profile_dir  → stored as chrome-profile:<dir>|<url>
+    • Tabs with profile_email but no dir → stored with email hint so host can
+      resolve later; label includes "?" profile marker so the user can see
+      the profile wasn't fully confirmed.
+    • Tabs with neither               → SKIPPED entirely. A tab with no
+      profile info has no business being auto-added to a session.
+  Plain (non-chrome-profile) URLs can still be added via the drop-zone
+  drag path (which goes through drag_watcher, not this function).
 """
 
 import sqlite3
@@ -244,34 +257,69 @@ def update_item_label(item_id: int, label: str):
 
 def save_chrome_tabs(session_id: int, tabs: list[dict]):
     """
-    Called by the native host when Chrome sends a tabs snapshot.
-    Upserts tabs as URL items — won't duplicate existing URLs.
+    Called by the native host when Chrome sends a tabs_snapshot.
+    Upserts tabs as URL items — skips duplicates.
 
-    Each tab dict may contain a 'profile_dir' and 'profile_name' key
-    (added by the host) so URLs are stored as 'chrome-profile:<dir>|<url>'
-    enabling restore to open in the correct Chrome profile.
+    Profile attribution rules (strict):
+      1. tab has profile_dir  → store as chrome-profile:<dir>|<url>
+                                label: [ProfileName] Title
+      2. tab has profile_email but no profile_dir →
+            host should have resolved the dir from Local State before calling
+            this function. If it still can't, we store with email hint in the
+            path so restore.py can at least try to match, and mark the label
+            with "⚠" so the user sees it wasn't fully resolved.
+      3. tab has neither profile_dir nor profile_email →
+            SKIP — we have no idea which profile this came from.
+            Saving a profileless URL causes the restore to open in whatever
+            profile Chrome happens to have open, which is wrong.
+
+    This function is NOT called for drag-drop adds — those go through
+    drag_watcher._capture_window_info → drop_zone.on_dropped → db.add_item
+    directly with the profile info already encoded in path_or_url.
     """
     items = []
+    skipped = 0
+
     for t in tabs:
-        url = t.get("url", "")
+        url = t.get("url", "").strip()
         if not url:
             continue
-        title = t.get("title") or url
-        profile_dir  = t.get("profile_dir", "")
-        profile_name = t.get("profile_name", "")
+
+        title        = t.get("title") or url
+        profile_dir  = (t.get("profile_dir")  or "").strip()
+        profile_name = (t.get("profile_name") or "").strip()
+        profile_email = (t.get("profile_email") or "").strip()
 
         if profile_dir:
+            # Best case: confirmed profile directory
             path_or_url = f"chrome-profile:{profile_dir}|{url}"
-            label       = f"[{profile_name or profile_dir}] {title}" if profile_name else title
+            display_name = profile_name or profile_dir
+            label = f"[{display_name}] {title}"
+
+        elif profile_email:
+            # Partial info: we have an email but the host couldn't resolve the
+            # directory (maybe Local State doesn't have this email mapped yet).
+            # Store with email hint so restore can attempt a lookup.
+            path_or_url = f"chrome-profile-email:{profile_email}|{url}"
+            label = f"[⚠ {profile_email}] {title}"
+            print(f"[DB] save_chrome_tabs: profile_dir missing for {url!r}, "
+                  f"storing with email hint {profile_email!r}")
+
         else:
-            path_or_url = url
-            label       = title
+            # No profile info at all — skip to avoid wrong-profile restore.
+            skipped += 1
+            print(f"[DB] save_chrome_tabs: skipping {url!r} — no profile info")
+            continue
 
         items.append({
             "type":        "url",
             "path_or_url": path_or_url,
             "label":       label,
         })
+
+    if skipped:
+        print(f"[DB] save_chrome_tabs: skipped {skipped} tab(s) with no profile info")
+
     add_items_bulk(session_id, items)
 
 
