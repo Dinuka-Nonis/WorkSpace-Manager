@@ -2,25 +2,42 @@
 core/launcher.py — Opens files, URLs, and apps by type.
 
 Chrome profile restore fix:
-  The old code launched Chrome with [chrome, --profile-directory=X, --new-window, url].
-  Problem: if Chrome is already running under a DIFFERENT profile, passing
-  --profile-directory=X opens a new window in profile X but Chrome may still
-  route the navigation to the already-running profile's window.
+  The fundamental problem: when Chrome is already running, launching
+    chrome.exe --profile-directory=X <url>
+  sends the request to Chrome's already-running broker process via an IPC pipe.
+  That broker routes the new tab to whichever profile window was last focused —
+  NOT necessarily profile X. The --profile-directory flag is only fully honored
+  on a cold (fresh) Chrome launch.
 
-  Fix: use the --args form so Chrome creates a fresh process for that profile:
-    chrome.exe --profile-directory=<dir> -- <url>
-  And use a two-step launch when Chrome is already running:
-    1. Open the profile with just --profile-directory (no URL) to ensure the
-       profile's window is foregrounded.
-    2. Open the URL in a new tab via: chrome.exe --profile-directory=<dir> <url>
+  Solution — focus-then-open:
+    1. Build a pid→profile_dir map for all running chrome.exe browser processes
+       via WMI (same technique as drag_watcher.py, which avoids the
+       PROCESS_VM_READ AccessDenied issue that psutil.cmdline() hits).
+    2. Find a visible top-level window owned by a PID in that profile.
+    3. SetForegroundWindow() on it — Chrome's IPC broker routes new tabs to
+       the foreground window's profile.
+    4. Sleep briefly so the focus event is processed.
+    5. Then Popen chrome.exe --profile-directory=X <url>.
 
-  Also handles the new chrome-profile-email: scheme introduced in db.py for
+  If the profile is NOT currently running (no matching PID found), skip the
+  focus step — --profile-directory works perfectly on a cold launch.
+
+  Group-and-sort restore:
+    open_all_tracked() now groups URL items by profile_dir and opens them
+    profile-by-profile. Within each profile group it focuses once, then opens
+    all tabs for that profile before moving on. This avoids repeated focus
+    thrashing when restoring multi-tab sessions.
+
+  Also handles the chrome-profile-email: scheme introduced in db.py for
   tabs where the directory wasn't confirmed at save time. At restore time we
   do a fresh Local State lookup by email to try to resolve the directory.
 """
 
+import ctypes
+import ctypes.wintypes
 import os
 import subprocess
+import time
 import webbrowser
 from pathlib import Path
 
@@ -43,6 +60,10 @@ VSCODE_PATHS = [
     r"C:\Program Files\Microsoft VS Code\Code.exe",
     r"C:\Program Files (x86)\Microsoft VS Code\Code.exe",
 ]
+
+# How long (seconds) to wait after SetForegroundWindow before opening the URL.
+# Gives Chrome's IPC broker time to register the new foreground window.
+FOCUS_SETTLE_SECS = 0.35
 
 
 def _find_browser() -> str | None:
@@ -95,8 +116,6 @@ def _resolve_profile_dir_from_email(email: str) -> tuple[str, str]:
         return "", ""
     info_cache = _load_chrome_local_state()
     for profile_dir, pinfo in info_cache.items():
-        # Chrome stores the email in gaia_info_picture_url domain or directly
-        # under "user_name" / "gaia_id" depending on version.
         stored_email = (
             pinfo.get("user_name", "") or
             pinfo.get("gaia_email", "") or
@@ -107,16 +126,109 @@ def _resolve_profile_dir_from_email(email: str) -> tuple[str, str]:
     return "", ""
 
 
-def _open_chrome_with_profile(chrome: str, profile_dir: str, url: str) -> tuple[bool, str]:
+# ── WMI pid→profile map (shared logic with drag_watcher) ─────────────────────
+
+def _build_pid_profile_map() -> dict[int, str]:
     """
-    Open a URL in a specific Chrome profile.
+    Return {pid: profile_dir} for all running Chrome browser processes.
+    Uses WMI so we avoid the PROCESS_VM_READ AccessDenied that psutil hits.
+    Only includes browser (non --type=) processes that have --profile-directory.
+    """
+    pid_profile: dict[int, str] = {}
+    try:
+        out = subprocess.check_output(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "Get-WmiObject Win32_Process -Filter \"Name='chrome.exe'\" | "
+             "ForEach-Object { $_.ProcessId.ToString() + '|' + $_.CommandLine }"],
+            timeout=4,
+            stderr=subprocess.DEVNULL,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
+        ).decode("utf-8", errors="replace")
 
-    Uses --profile-directory and avoids --new-window (which can steal focus
-    from an already-open session). Chrome handles opening a new tab in the
-    correct profile window automatically.
+        for line in out.splitlines():
+            line = line.strip()
+            if "|" not in line:
+                continue
+            pid_str, cmdline = line.split("|", 1)
+            if "--type=" in cmdline:          # skip renderer/gpu/etc processes
+                continue
+            for part in cmdline.split():
+                if part.startswith("--profile-directory="):
+                    d = part.split("=", 1)[1].strip('"').strip("'")
+                    if d:
+                        try:
+                            pid_profile[int(pid_str)] = d
+                        except ValueError:
+                            pass
+                    break
+    except Exception:
+        pass
+    return pid_profile
 
-    If Chrome is NOT already running for this profile, it will launch a new
-    window. If it IS running, it opens a new tab in the existing window.
+
+# ── Focus a Chrome profile window before opening a URL ───────────────────────
+
+def _focus_chrome_window_for_profile(profile_dir: str) -> bool:
+    """
+    Find a visible top-level Chrome window that belongs to profile_dir,
+    bring it to the foreground, and wait for Chrome's IPC to settle.
+
+    Returns True  — a window was found and focused (URL will be routed here).
+    Returns False — profile is not currently running; cold launch is fine.
+
+    Strategy:
+      1. Build pid→profile map via WMI.
+      2. Filter to PIDs that match profile_dir.
+      3. EnumWindows to find a visible top-level window owned by one of those PIDs.
+      4. SetForegroundWindow + SW_RESTORE.
+    """
+    pid_profile = _build_pid_profile_map()
+    target_pids = {pid for pid, d in pid_profile.items() if d == profile_dir}
+
+    if not target_pids:
+        # Profile is not running — cold launch, no focus needed
+        return False
+
+    found_hwnd: list[int] = []   # list so the callback can mutate it
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
+    )
+
+    def _cb(hwnd: int, _: int) -> bool:
+        if found_hwnd:
+            return False          # already found one, stop enum
+        pid_dword = ctypes.wintypes.DWORD(0)
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_dword))
+        if pid_dword.value in target_pids:
+            if ctypes.windll.user32.IsWindowVisible(hwnd):
+                found_hwnd.append(hwnd)
+                return False      # stop enumeration
+        return True               # keep looking
+
+    ctypes.windll.user32.EnumWindows(EnumWindowsProc(_cb), 0)
+
+    if not found_hwnd:
+        # PIDs exist but no visible top-level window yet (still launching?)
+        return False
+
+    hwnd = found_hwnd[0]
+    ctypes.windll.user32.ShowWindow(hwnd, 9)          # SW_RESTORE (unminimise)
+    ctypes.windll.user32.SetForegroundWindow(hwnd)
+    time.sleep(FOCUS_SETTLE_SECS)
+    print(f"[Launcher] Focused Chrome window for profile {profile_dir!r} (hwnd={hwnd})")
+    return True
+
+
+# ── Core Chrome open (single URL) ─────────────────────────────────────────────
+
+def _open_chrome_url_in_profile(chrome: str, profile_dir: str, url: str) -> tuple[bool, str]:
+    """
+    Open url in Chrome under profile_dir.
+
+    Caller is responsible for having already called
+    _focus_chrome_window_for_profile() when opening multiple tabs in a batch,
+    so we don't refocus on every single tab. This function just fires Popen.
     """
     try:
         subprocess.Popen([
@@ -127,6 +239,49 @@ def _open_chrome_with_profile(chrome: str, profile_dir: str, url: str) -> tuple[
         return True, ""
     except Exception as e:
         return False, str(e)
+
+
+def _open_chrome_with_profile(chrome: str, profile_dir: str, url: str) -> tuple[bool, str]:
+    """
+    High-level single-URL open: focus the profile window first, then open.
+    Used when restoring a single URL (not a batch).
+    """
+    _focus_chrome_window_for_profile(profile_dir)
+    return _open_chrome_url_in_profile(chrome, profile_dir, url)
+
+
+# ── URL scheme parser ─────────────────────────────────────────────────────────
+
+def _parse_chrome_url(url: str) -> tuple[str, str, str]:
+    """
+    Parse a chrome-profile: or chrome-profile-email: URL.
+
+    Returns (profile_dir, actual_url, warning_msg).
+      profile_dir  — resolved Chrome profile directory (e.g. "Profile 5"), or ""
+      actual_url   — the real http/https URL to open
+      warning_msg  — non-empty string if resolution failed (log it)
+    """
+    if url.startswith("chrome-profile:"):
+        rest = url[len("chrome-profile:"):]
+        if "|" not in rest:
+            return "", rest, ""
+        profile_dir, actual_url = rest.split("|", 1)
+        return profile_dir, actual_url, ""
+
+    if url.startswith("chrome-profile-email:"):
+        rest = url[len("chrome-profile-email:"):]
+        if "|" not in rest:
+            return "", rest, ""
+        email, actual_url = rest.split("|", 1)
+        profile_dir, profile_name = _resolve_profile_dir_from_email(email)
+        if profile_dir:
+            print(f"[Launcher] Resolved profile at restore time: "
+                  f"{profile_dir!r} ({profile_name}) for {email!r}")
+            return profile_dir, actual_url, ""
+        warn = f"Could not resolve Chrome profile for {email!r}"
+        return "", actual_url, warn
+
+    return "", url, ""
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -148,72 +303,42 @@ def open_url(url: str) -> tuple[bool, str]:
     Handles three URL schemes produced by db.save_chrome_tabs:
 
     1. chrome-profile:<dir>|<url>
-       → Open in Chrome with --profile-directory=<dir>.
-       Guaranteed to open in the correct profile.
+       → Focus the profile window, then open with --profile-directory=<dir>.
 
     2. chrome-profile-email:<email>|<url>
-       → profile_dir wasn't confirmed at save time. Try to resolve the dir
-         from Local State at restore time. If found, same as case 1.
-         If not found, warn the user and open without a profile flag (best
-         effort — will open in whatever profile Chrome currently has active).
+       → Resolve dir from Local State, then same as case 1.
+         If unresolvable, open without profile (best effort).
 
     3. Plain http/https/etc URL
-       → Open in default browser (added via drag-drop with no profile info,
-         or explicitly added by user).
+       → Open in default browser.
     """
-
-    # ── Case 1: confirmed profile dir ────────────────────────────────────────
-    if url.startswith("chrome-profile:"):
-        rest = url[len("chrome-profile:"):]
-        if "|" in rest:
-            profile_dir, actual_url = rest.split("|", 1)
-            chrome = _find_chrome()
-            if chrome and profile_dir:
-                print(f"[Launcher] Restoring URL in Chrome profile {profile_dir!r}: {actual_url}")
-                return _open_chrome_with_profile(chrome, profile_dir, actual_url)
-            elif chrome:
-                # profile_dir is empty string — open without profile flag
-                print(f"[Launcher] Warning: empty profile_dir, opening without profile: {actual_url}")
-                try:
-                    subprocess.Popen([chrome, actual_url])
-                    return True, ""
-                except Exception as e:
-                    return False, str(e)
-            # Chrome not found — fall through with bare URL
-            url = actual_url
-        else:
-            url = rest  # malformed, best-effort
-
-    # ── Case 2: email hint, dir not confirmed at save time ────────────────────
-    elif url.startswith("chrome-profile-email:"):
-        rest = url[len("chrome-profile-email:"):]
-        if "|" in rest:
-            email, actual_url = rest.split("|", 1)
-            chrome = _find_chrome()
-            if chrome:
-                # Try to resolve at restore time
-                profile_dir, profile_name = _resolve_profile_dir_from_email(email)
-                if profile_dir:
-                    print(f"[Launcher] Resolved profile at restore time: "
-                          f"{profile_dir!r} ({profile_name}) for {email!r}")
-                    return _open_chrome_with_profile(chrome, profile_dir, actual_url)
-                else:
-                    # Still can't resolve — open without profile, log warning
-                    print(f"[Launcher] Warning: could not resolve Chrome profile for "
-                          f"{email!r} — opening without profile flag: {actual_url}")
-                    try:
-                        subprocess.Popen([chrome, actual_url])
-                        return True, ""
-                    except Exception as e:
-                        return False, str(e)
-            url = actual_url
-        else:
-            url = rest
-
-    # ── Standard URL (plain http/https, or fallback from above) ──────────────
     KNOWN_WEB_SCHEMES = ("http://", "https://", "file://")
     OTHER_SCHEMES     = ("mailto:", "ftp://", "ftps://", "tel:", "data:")
 
+    # ── Chrome-profile schemes ────────────────────────────────────────────────
+    if url.startswith("chrome-profile:") or url.startswith("chrome-profile-email:"):
+        profile_dir, actual_url, warning = _parse_chrome_url(url)
+        chrome = _find_chrome()
+
+        if warning:
+            print(f"[Launcher] Warning: {warning} — opening without profile flag: {actual_url}")
+
+        if chrome and profile_dir:
+            print(f"[Launcher] Restoring URL in Chrome profile {profile_dir!r}: {actual_url}")
+            return _open_chrome_with_profile(chrome, profile_dir, actual_url)
+
+        if chrome:
+            # No profile dir — open without profile (best effort)
+            try:
+                subprocess.Popen([chrome, actual_url])
+                return True, ""
+            except Exception as e:
+                return False, str(e)
+
+        # Chrome not installed — fall through to webbrowser
+        url = actual_url
+
+    # ── Standard URL ──────────────────────────────────────────────────────────
     if any(url.startswith(s) for s in OTHER_SCHEMES):
         try:
             webbrowser.open(url)
@@ -314,10 +439,9 @@ def open_uwp_app(exe: str) -> tuple[bool, str]:
         pass
 
     try:
-        SW_SHOW      = 5
-        SEE_MASK_FLAG = 0x00000400
-        ctypes = __import__("ctypes")
-        shell32 = ctypes.windll.shell32
+        SW_SHOW = 5
+        _ctypes = __import__("ctypes")
+        shell32 = _ctypes.windll.shell32
         ret = shell32.ShellExecuteW(None, "open", exe, None, None, SW_SHOW)
         if ret > 32:
             return True, ""
@@ -407,11 +531,45 @@ def open_all(items: list[dict]) -> dict:
 
 
 def open_all_tracked(items: list[dict]) -> tuple[dict, set]:
-    import time
+    """
+    Open all items in the session.
+
+    URL items are grouped by Chrome profile so we focus each profile window
+    once and then open all its tabs in sequence — avoiding repeated focus
+    thrashing. Non-URL items (files, apps) are opened first, in order.
+
+    Open order:
+      1. Files and apps  (preserves original order)
+      2. URL groups      (sorted so same-profile tabs are batched together;
+                          within each group the original order is preserved)
+    """
     results    = {"total": len(items), "opened": 0, "failed": 0, "errors": []}
     failed_ids: set[int] = set()
 
+    chrome = _find_chrome()
+
+    # ── Split items into non-URLs and URL groups ──────────────────────────────
+    non_url_items: list[dict] = []
+    # profile_dir (or "" for plain URLs) → list of (item, actual_url)
+    url_groups: dict[str, list[tuple[dict, str, str]]] = {}
+
     for item in items:
+        if item.get("type") != "url":
+            non_url_items.append(item)
+            continue
+
+        raw = item.get("path_or_url", "")
+        if (raw.startswith("chrome-profile:") or raw.startswith("chrome-profile-email:")):
+            profile_dir, actual_url, warning = _parse_chrome_url(raw)
+            if warning:
+                print(f"[Launcher] Warning: {warning}")
+        else:
+            profile_dir, actual_url = "", raw
+
+        url_groups.setdefault(profile_dir, []).append((item, profile_dir, actual_url))
+
+    # ── 1. Open files and apps ────────────────────────────────────────────────
+    for item in non_url_items:
         success, err = open_item(item)
         if success:
             results["opened"] += 1
@@ -419,7 +577,44 @@ def open_all_tracked(items: list[dict]) -> tuple[dict, set]:
             results["failed"] += 1
             results["errors"].append(f"{item.get('label', '?')}: {err}")
             failed_ids.add(item["id"])
-        time.sleep(0.25)
+        time.sleep(0.2)
+
+    # ── 2. Open URL groups (one focus per profile) ────────────────────────────
+    for profile_dir, group in url_groups.items():
+        if not group:
+            continue
+
+        if profile_dir and chrome:
+            # Focus the profile window ONCE for the whole group
+            already_running = _focus_chrome_window_for_profile(profile_dir)
+            if not already_running:
+                print(f"[Launcher] Profile {profile_dir!r} not running — cold launch")
+
+            for item, _pd, actual_url in group:
+                print(f"[Launcher] Opening in Chrome profile {profile_dir!r}: {actual_url}")
+                success, err = _open_chrome_url_in_profile(chrome, profile_dir, actual_url)
+                if success:
+                    results["opened"] += 1
+                else:
+                    results["failed"] += 1
+                    results["errors"].append(f"{item.get('label', '?')}: {err}")
+                    failed_ids.add(item["id"])
+                time.sleep(0.25)   # small gap between tabs in same profile
+
+        else:
+            # Plain URLs or no Chrome — open normally
+            for item, _pd, actual_url in group:
+                success, err = open_url(actual_url)
+                if success:
+                    results["opened"] += 1
+                else:
+                    results["failed"] += 1
+                    results["errors"].append(f"{item.get('label', '?')}: {err}")
+                    failed_ids.add(item["id"])
+                time.sleep(0.25)
+
+        # Small gap between profile groups to let Chrome settle
+        time.sleep(0.4)
 
     return results, failed_ids
 
@@ -470,12 +665,12 @@ FILE_ICONS = {
 }
 
 APP_ICONS = {
-    "code":      "💻", "chrome":  "🌐", "firefox": "🦊",
-    "msedge":    "🌐", "slack":   "💬", "discord": "💬",
-    "notion":    "📝", "obsidian":"🔮", "figma":   "🎨",
-    "postman":   "📮", "pycharm64":"🐍","idea64":  "☕",
-    "webstorm64":"🟨", "devenv":  "🔷", "teams":   "👥",
-    "zoom":      "📹", "spotify": "🎵", "vlc":     "🎬",
+    "code":       "💻", "chrome":   "🌐", "firefox": "🦊",
+    "msedge":     "🌐", "slack":    "💬", "discord": "💬",
+    "notion":     "📝", "obsidian": "🔮", "figma":   "🎨",
+    "postman":    "📮", "pycharm64":"🐍", "idea64":  "☕",
+    "webstorm64": "🟨", "devenv":   "🔷", "teams":   "👥",
+    "zoom":       "📹", "spotify":  "🎵", "vlc":     "🎬",
 }
 
 
