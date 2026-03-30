@@ -66,23 +66,93 @@ def log(msg: str):
     print(f"[WorkSpace Host] {msg}", file=sys.stderr, flush=True)
 
 
+def _load_local_state_names() -> dict[str, str]:
+    """Return profile_dir → display_name from Chrome Local State."""
+    local_appdata = os.getenv("LOCALAPPDATA", "")
+    local_state   = os.path.join(local_appdata, "Google", "Chrome", "User Data", "Local State")
+    if not os.path.exists(local_state):
+        return {}
+    try:
+        data = json.loads(open(local_state, encoding="utf-8", errors="replace").read())
+        return {
+            d: info.get("name", d)
+            for d, info in data.get("profile", {}).get("info_cache", {}).items()
+        }
+    except Exception:
+        return {}
+
+
+def _resolve_profile_for_extension(extension_id: str) -> tuple[str, str]:
+    """
+    Find the Chrome profile that loaded this specific extension instance.
+
+    Method: iterate all chrome.exe browser processes (no --type= flag),
+    read --user-data-dir and --profile-directory from each, then check
+    whether <user_data_dir>/<profile_dir>/Extensions/<extension_id> exists
+    on disk. The first match is the correct profile.
+
+    This is the ONLY reliable method when multiple profiles are open or
+    when profiles have no Google account (so identity email is empty).
+
+    Returns (profile_dir, profile_name) e.g. ("Profile 2", "Work").
+    """
+    try:
+        import psutil
+    except ImportError:
+        return "", ""
+
+    local_appdata     = os.getenv("LOCALAPPDATA", "")
+    default_user_data = os.path.join(local_appdata, "Google", "Chrome", "User Data")
+    names             = _load_local_state_names()
+
+    def _is_browser(proc) -> bool:
+        try:
+            if "chrome.exe" not in (proc.exe() or "").lower():
+                return False
+            return not any(a.startswith("--type=") for a in (proc.cmdline() or []))
+        except Exception:
+            return False
+
+    def _arg(cmdline, prefix) -> str:
+        for a in cmdline:
+            if a.startswith(prefix):
+                return a.split("=", 1)[1].strip('"').strip("'")
+        return ""
+
+    try:
+        for proc in psutil.process_iter(["exe", "cmdline"]):
+            try:
+                if not _is_browser(proc):
+                    continue
+                cmdline      = proc.cmdline() or []
+                profile_dir  = _arg(cmdline, "--profile-directory=")
+                user_data    = _arg(cmdline, "--user-data-dir=") or default_user_data
+                if not profile_dir:
+                    continue
+                ext_path = os.path.join(user_data, profile_dir, "Extensions", extension_id)
+                if os.path.isdir(ext_path):
+                    name = names.get(profile_dir, profile_dir)
+                    log(f"Profile resolved for ext {extension_id}: {profile_dir!r} ({name})")
+                    return profile_dir, name
+            except Exception:
+                continue
+    except Exception as e:
+        log(f"_resolve_profile_for_extension error: {e}")
+
+    return "", ""
+
+
 def _detect_chrome_profile(profile_email_hint: str = "") -> tuple[str, str]:
     """
-    Detect the Chrome profile directory and display name.
+    Legacy fallback used only by handle_tabs_snapshot when the extension
+    did NOT send a confirmed profile_dir.
 
-    Priority order:
-      1. If the extension sends a profile_email hint (from chrome.identity),
-         cross-reference it against Local State profile email cache — this is
-         the most accurate method because the extension itself knows which
-         profile it is running in.
-      2. Fall back to scanning running chrome.exe processes for
-         --profile-directory= flags (least-count heuristic).
-      3. If Chrome is running but no flag found, assume "Default".
-      4. Return ("", "") if Chrome is not running at all.
-
-    Returns (profile_dir, profile_name) e.g. ("Profile 3", "Work Account").
+    Priority:
+      1. Match email hint against Local State cache.
+      2. Process scan — pick the profile_dir seen most often across all
+         chrome.exe browser processes (catches single-profile setups).
+      3. Return ("", "") — never guess "Default" for multi-profile setups.
     """
-    import json, os
     try:
         import psutil
     except ImportError:
@@ -91,55 +161,58 @@ def _detect_chrome_profile(profile_email_hint: str = "") -> tuple[str, str]:
     local_appdata = os.getenv("LOCALAPPDATA", "")
     local_state   = os.path.join(local_appdata, "Google", "Chrome", "User Data", "Local State")
 
-    # Build dir→name and dir→email maps from Local State
     profile_names:  dict[str, str] = {}
-    profile_emails: dict[str, str] = {}   # dir → account email
+    profile_emails: dict[str, str] = {}
     if os.path.exists(local_state):
         try:
             data = json.loads(open(local_state, encoding="utf-8", errors="replace").read())
             for dir_name, info in data.get("profile", {}).get("info_cache", {}).items():
-                profile_names[dir_name]  = info.get("name", dir_name)
-                # gaia_given_name / user_name / gaia_name differ by sync state
+                profile_names[dir_name] = info.get("name", dir_name)
                 email = (info.get("user_name") or info.get("gaia_given_name") or "").lower()
                 if email:
                     profile_emails[dir_name] = email
         except Exception:
             pass
 
-    # ── Strategy 1: match by email hint from extension ────────────────────────
+    # Strategy 1: email hint
     if profile_email_hint:
         hint_lower = profile_email_hint.lower()
         for dir_name, email in profile_emails.items():
             if email == hint_lower:
-                log(f"Profile matched by email hint: {dir_name!r} ({profile_names.get(dir_name, dir_name)})")
+                log(f"Profile matched by email: {dir_name!r}")
                 return dir_name, profile_names.get(dir_name, dir_name)
-        # Email present but not found in cache (e.g. not signed in to Chrome sync)
-        log(f"Profile email hint {profile_email_hint!r} not in Local State cache — falling back to process scan")
+        log(f"Email hint {profile_email_hint!r} not in Local State — falling back to process scan")
 
-    # ── Strategy 2: process scan ──────────────────────────────────────────────
-    chrome_running = False
+    # Strategy 2: process scan
     profile_counts: dict[str, int] = {}
-
-    for proc in psutil.process_iter(["exe", "cmdline"]):
-        try:
-            exe = proc.info.get("exe") or ""
-            if "chrome.exe" not in exe.lower():
+    chrome_running = False
+    try:
+        for proc in psutil.process_iter(["exe", "cmdline"]):
+            try:
+                if "chrome.exe" not in (proc.info.get("exe") or "").lower():
+                    continue
+                chrome_running = True
+                # Only count browser processes (no --type=)
+                cmdline = proc.info.get("cmdline") or []
+                if any(a.startswith("--type=") for a in cmdline):
+                    continue
+                for arg in cmdline:
+                    if arg.startswith("--profile-directory="):
+                        prof = arg.split("=", 1)[1].strip('"').strip("'")
+                        profile_counts[prof] = profile_counts.get(prof, 0) + 1
+            except Exception:
                 continue
-            chrome_running = True
-            for arg in (proc.info.get("cmdline") or []):
-                if arg.startswith("--profile-directory="):
-                    prof = arg.split("=", 1)[1].strip('"').strip("'")
-                    profile_counts[prof] = profile_counts.get(prof, 0) + 1
-        except Exception:
-            continue
+    except Exception:
+        pass
 
     if not chrome_running:
         return "", ""
-    if not profile_counts:
-        name = profile_names.get("Default", "Default")
-        return "Default", name
-    best = max(profile_counts, key=lambda k: profile_counts[k])
-    return best, profile_names.get(best, best)
+    if len(profile_counts) == 1:
+        best = next(iter(profile_counts))
+        return best, profile_names.get(best, best)
+    # Multiple profiles running and no email hint — cannot guess safely
+    log("Multiple Chrome profiles running and no email hint — cannot determine profile")
+    return "", ""
 
 
 # ── Side-channel poller ───────────────────────────────────────────────────────
@@ -198,57 +271,80 @@ def get_active_session() -> dict | None:
     return None
 
 
+def handle_resolve_profile(extension_id: str):
+    """
+    Called when the extension sends { type: "resolve_profile", extension_id: ... }.
+    Finds the exact Chrome profile that loaded this extension by checking
+    the Extensions folder on disk, then sends back profile_confirmed.
+    """
+    profile_dir, profile_name = _resolve_profile_for_extension(extension_id)
+    send_message(sys.stdout, {
+        "type":         "profile_confirmed",
+        "profile_dir":  profile_dir,
+        "profile_name": profile_name,
+    })
+    if profile_dir:
+        log(f"Sent profile_confirmed: {profile_dir!r} ({profile_name})")
+    else:
+        log("Could not resolve profile — sent empty profile_confirmed")
+
+
 def handle_tabs_snapshot(session_id: int, tabs: list[dict],
                          is_side_channel: bool = False,
                          preview_only: bool = False,
                          all_tabs: bool = True):
     """
-    Enrich tabs with the active Chrome profile and optionally save to DB.
+    Save tabs to DB, enriched with the correct Chrome profile.
 
-    all_tabs=False  (drag-drop capture): the extension already filtered to the
-    single focused tab. We honour that and do NOT expand it.
+    Profile resolution order (most → least reliable):
+      1. tab["profile_dir"] set by the extension (confirmed via resolve_profile
+         handshake at connect time) — use this directly, no host-side guessing.
+      2. tab["profile_email"] hint — try Local State email lookup.
+      3. Process scan fallback (_detect_chrome_profile).
 
-    all_tabs=True   (explicit "Save tabs" by user): save everything sent.
-
-    preview_only=True: write tab_response.json for the picker UI to read,
-    but do NOT call db.save_chrome_tabs().  The picker saves tabs to the
-    correct session only after the user confirms the target session.
-    This prevents tabs being written into the wrong (MRU) session.
-
-    Profile detection priority:
-      1. profile_email field sent by the extension (most accurate — comes from
-         chrome.identity running inside the actual profile).
-      2. Process-scan fallback in _detect_chrome_profile().
+    all_tabs=False (drag-drop): extension already filtered to one tab.
+    preview_only=True: write tab_response.json but skip DB write.
     """
     if not DB_AVAILABLE:
         return
     try:
-        # Extract the profile hint that the extension embedded in the tab objects.
-        # All tabs from the same profile share the same hint, so grab the first one.
-        profile_email_hint = ""
+        # Determine profile from the first tab's fields.
+        # The extension sets profile_dir after the resolve_profile handshake.
+        ext_profile_dir  = ""
+        ext_profile_name = ""
+        email_hint       = ""
         if tabs:
-            profile_email_hint = tabs[0].get("profile_email") or tabs[0].get("profile_hint") or ""
+            ext_profile_dir  = (tabs[0].get("profile_dir")  or "").strip()
+            ext_profile_name = (tabs[0].get("profile_name") or "").strip()
+            email_hint       = (tabs[0].get("profile_email") or
+                                tabs[0].get("profile_hint")  or "").strip()
 
-        profile_dir, profile_name = _detect_chrome_profile(profile_email_hint)
-        log(f"Chrome profile: dir={profile_dir!r} name={profile_name!r} "
-            f"hint={profile_email_hint!r} preview={preview_only} all_tabs={all_tabs}")
+        if ext_profile_dir:
+            # Best case: extension confirmed the profile via resolve_profile.
+            profile_dir  = ext_profile_dir
+            profile_name = ext_profile_name or _load_local_state_names().get(ext_profile_dir, ext_profile_dir)
+            log(f"Using extension-confirmed profile: {profile_dir!r} ({profile_name})")
+        else:
+            # Fallback: try email hint then process scan.
+            profile_dir, profile_name = _detect_chrome_profile(email_hint)
+            if profile_dir:
+                log(f"Profile via fallback detection: {profile_dir!r} ({profile_name})")
+            else:
+                log("Profile unknown — tabs will be saved without profile tag")
 
-        enriched = []
-        for t in tabs:
-            enriched.append({
-                **t,
-                "profile_dir":  profile_dir,
-                "profile_name": profile_name,
-            })
+        enriched = [
+            {**t, "profile_dir": profile_dir, "profile_name": profile_name}
+            for t in tabs
+        ]
 
         if not preview_only:
             db.save_chrome_tabs(session_id, enriched)
-            log(f"Saved {len(enriched)} tabs for session {session_id} (profile: {profile_dir or 'none'})")
+            log(f"Saved {len(enriched)} tab(s) → session {session_id} "
+                f"(profile: {profile_dir or 'none'})")
         else:
-            log(f"Preview: {len(enriched)} tabs collected, skipping DB write")
+            log(f"Preview: {len(enriched)} tab(s) collected, skipping DB write")
 
         if is_side_channel:
-            # Always write response so snapshot.py / picker can read it
             TAB_RESPONSE_FILE.write_text(
                 json.dumps({"tabs": enriched, "session_id": session_id}),
                 encoding="utf-8",
@@ -297,6 +393,8 @@ def main():
                 send_message(sys.stdout, {
                     "type":       "request_tabs",
                     "session_id": snap_sid,
+                    "all_tabs":   False,
+                    "authorized": "drop_zone",   # extension ignores request_tabs without this
                 })
                 _awaiting_side_channel_tabs = True
 
@@ -313,7 +411,11 @@ def main():
         log(f"Received: {msg_type}")
 
         try:
-            if msg_type == "get_active_session":
+            if msg_type == "resolve_profile":
+                extension_id = msg.get("extension_id", "")
+                handle_resolve_profile(extension_id)
+
+            elif msg_type == "get_active_session":
                 session = get_active_session()
                 if session:
                     send_message(sys.stdout, {

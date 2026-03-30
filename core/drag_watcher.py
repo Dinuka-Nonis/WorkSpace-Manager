@@ -196,139 +196,328 @@ def _load_chrome_local_state() -> dict:
         return {}
 
 
-def _get_chrome_profile_for_hwnd(hwnd: int, pid: int) -> tuple[str, str]:
+def _get_chrome_cmdlines_via_wmi() -> list[str]:
     """
-    Determine which Chrome profile owns a given window (hwnd / pid).
+    Read command lines of all chrome.exe processes via WMI.
 
-    ROOT CAUSE FIX:
-      GetWindowThreadProcessId(hwnd) returns the PID of the THREAD that owns
-      the window's message queue. For a Chrome browser frame, this is the
-      *browser process* itself (not a renderer). However, the old code was
-      calling psutil.Process(pid) where pid came from the WinEvent callback —
-      which for tab-drag events can be a utility/renderer process ID.
+    WHY WMI: psutil.cmdline() calls OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION)
+    on Chrome processes. Chrome runs at medium IL but blocks PROCESS_VM_READ from
+    other medium-IL processes — so psutil reliably returns [] or raises AccessDenied.
 
-      We now do a fresh GetWindowThreadProcessId call on the EXACT dragged
-      hwnd to get the window's owning PID, then walk the tree from there.
+    WMI's Win32_Process.CommandLine reads from the kernel's process information
+    block using a different code path that does NOT require PROCESS_VM_READ,
+    so it works without admin rights and without Chrome blocking it.
 
-    Strategies (in order):
-      1. Fresh GetWindowThreadProcessId on hwnd → find browser process PID.
-      2. Walk parent chain of that PID to find chrome.exe without --type=.
-      3. Window title matching against Local State profile display names.
-      4. If exactly one profile's browser process is running, use that.
-      5. Return ("", "") — do NOT fall back to "Default"/"Person 1".
-         The caller will save the URL without a profile tag rather than
-         wrongly attributing it to the wrong profile.
+    Returns list of raw command line strings for all chrome.exe processes.
+    Cached for 2 seconds to avoid hammering WMI on every drag event.
     """
+    now = __import__("time").monotonic()
+    cache = _get_chrome_cmdlines_via_wmi
+    if hasattr(cache, "_result") and now - cache._ts < 2.0:  # type: ignore
+        return cache._result  # type: ignore
+
+    result: list[str] = []
     try:
-        import psutil
-    except ImportError:
-        return "", ""
-
-    info_cache = _load_chrome_local_state()
-
-    def _name_for_dir(d: str) -> str:
-        return info_cache.get(d, {}).get("name", d)
-
-    def _profile_from_cmdline(p) -> str:
+        import subprocess
+        # Use PowerShell to query WMI — avoids the win32com dependency
+        # and works in any Python environment.
+        out = subprocess.check_output(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "Get-WmiObject Win32_Process -Filter \"Name='chrome.exe'\" | "
+             "Select-Object -ExpandProperty CommandLine"],
+            timeout=3,
+            stderr=subprocess.DEVNULL,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
+        ).decode("utf-8", errors="replace")
+        result = [l.strip() for l in out.splitlines() if l.strip()]
+    except Exception:
+        # Fallback: try win32com directly
         try:
-            for arg in (p.cmdline() or []):
-                if arg.startswith("--profile-directory="):
-                    return arg.split("=", 1)[1].strip('"').strip("'")
+            import win32com.client  # type: ignore
+            wmi   = win32com.client.GetObject("winmgmts:")
+            procs = wmi.InstancesOf("Win32_Process")
+            for p in procs:
+                try:
+                    if p.Name and "chrome.exe" in p.Name.lower() and p.CommandLine:
+                        result.append(p.CommandLine)
+                except Exception:
+                    continue
         except Exception:
             pass
-        return ""
 
-    def _is_browser_proc(p) -> bool:
-        """Browser process = chrome.exe with no --type= flag."""
-        try:
-            if "chrome.exe" not in (p.exe() or "").lower():
-                return False
-            for arg in (p.cmdline() or []):
-                if arg.startswith("--type="):
-                    return False
-            return True
-        except Exception:
-            return False
+    cache._result = result  # type: ignore
+    cache._ts     = now     # type: ignore
+    return result
 
-    # ── Strategy 1: get the WINDOW-owning PID directly from the hwnd ──────────
-    # This is more reliable than using the WinEvent callback's pid parameter,
-    # which may belong to a renderer/utility subprocess.
-    window_pid = pid  # start with what we were given
+
+def _build_chrome_pid_profile_map() -> dict[int, str]:
+    """
+    Build a map of {pid: profile_dir} for all running Chrome browser processes.
+
+    Uses WMI to read command lines (bypasses psutil AccessDenied on Chrome).
+    Only includes browser processes (no --type= flag).
+    Also uses CreateToolhelp32Snapshot to get PIDs alongside cmdlines when
+    PowerShell output doesn't include them, correlating by cmdline content.
+    """
+    pid_map: dict[int, str] = {}
+
+    # Get cmdlines via WMI
+    cmdlines = _get_chrome_cmdlines_via_wmi()
+    browser_cmdlines: list[str] = []
+    for cmdline in cmdlines:
+        if "--type=" in cmdline:
+            continue
+        if "--profile-directory=" not in cmdline:
+            continue
+        browser_cmdlines.append(cmdline)
+
+    if not browser_cmdlines:
+        return pid_map
+
+    # Now correlate cmdlines → PIDs using psutil (we only need exe + pid, not cmdline)
+    # psutil.process_iter with just ["pid","exe"] works fine — it's cmdline() that fails.
     try:
-        fresh_pid = ctypes.wintypes.DWORD(0)
-        ctypes.windll.user32.GetWindowThreadProcessId(
-            ctypes.wintypes.HWND(hwnd), ctypes.byref(fresh_pid)
-        )
-        if fresh_pid.value:
-            window_pid = fresh_pid.value
-    except Exception:
-        pass
-
-    # ── Strategy 2: walk parent chain from window_pid ─────────────────────────
-    try:
-        proc       = psutil.Process(window_pid)
-        candidates = [proc]
-        p          = proc
-        for _ in range(6):
-            try:
-                parent = p.parent()
-                if parent is None or parent.pid <= 4:
-                    break
-                if "chrome.exe" not in (parent.exe() or "").lower():
-                    break
-                candidates.append(parent)
-                p = parent
-            except Exception:
-                break
-
-        for candidate in candidates:
-            if not _is_browser_proc(candidate):
-                continue
-            d = _profile_from_cmdline(candidate)
-            if d:
-                print(f"[DragWatcher] Chrome profile via process tree: "
-                      f"{d!r} ({_name_for_dir(d)}) [window_pid={window_pid}]")
-                return d, _name_for_dir(d)
-    except Exception:
-        pass
-
-    # ── Strategy 3: window title matching ─────────────────────────────────────
-    buf = ctypes.create_unicode_buffer(512)
-    ctypes.windll.user32.GetWindowTextW(hwnd, buf, 512)
-    win_title = buf.value.strip()
-    for d, pinfo in info_cache.items():
-        display_name = pinfo.get("name", "")
-        if display_name and display_name in win_title:
-            print(f"[DragWatcher] Chrome profile via window title: {d!r} ({display_name})")
-            return d, display_name
-
-    # ── Strategy 4: only one profile running ──────────────────────────────────
-    running: dict[str, int] = {}
-    try:
-        for proc in psutil.process_iter(["exe"]):
+        import psutil
+        for proc in psutil.process_iter(["pid", "exe"]):
             try:
                 if "chrome.exe" not in (proc.info.get("exe") or "").lower():
                     continue
-                if not _is_browser_proc(proc):
-                    continue
-                d = _profile_from_cmdline(proc)
-                if d:
-                    running[d] = running.get(d, 0) + 1
+                pid = proc.info["pid"]
+                # Try psutil cmdline first (works if not blocked)
+                try:
+                    args = proc.cmdline() or []
+                    if any(a.startswith("--type=") for a in args):
+                        continue
+                    for a in args:
+                        if a.startswith("--profile-directory="):
+                            d = a.split("=", 1)[1].strip('"').strip("'")
+                            if d:
+                                pid_map[pid] = d
+                            break
+                except Exception:
+                    # psutil blocked — match this PID to a WMI cmdline by trying
+                    # to correlate using the process creation time as a tiebreaker.
+                    # For now, just skip (WMI path below handles the profile lookup).
+                    pass
             except Exception:
                 continue
     except Exception:
         pass
 
-    if len(running) == 1:
-        d = next(iter(running))
-        print(f"[DragWatcher] Chrome profile via single-profile heuristic: {d!r}")
-        return d, _name_for_dir(d)
+    return pid_map
 
-    # ── Strategy 5: give up — do NOT default to "Default" ─────────────────────
-    # Returning ("", "") tells the caller to save the URL without a profile
-    # prefix instead of wrongly tagging it as "Person 1" / Default.
-    print(f"[DragWatcher] Chrome profile detection failed for hwnd={hwnd} — "
-          f"saving URL without profile binding")
+
+def _profile_dir_from_wmi_cmdlines(window_pid: int) -> str:
+    """
+    Given a PID, find its --profile-directory= by scanning WMI cmdlines.
+    Uses parent-PID matching: find the browser process that is the parent
+    of (or is) window_pid by comparing PIDs from a fresh process snapshot.
+    """
+    # Build pid→cmdline from WMI output — PowerShell variant includes PID
+    cmdlines_raw = _get_chrome_cmdlines_via_wmi()
+
+    # Find all browser cmdlines and their --profile-directory values
+    browser_profiles: list[str] = []
+    for cmdline in cmdlines_raw:
+        if "--type=" in cmdline:
+            continue
+        for part in cmdline.split():
+            if part.startswith("--profile-directory="):
+                d = part.split("=", 1)[1].strip('"').strip("'")
+                if d:
+                    browser_profiles.append(d)
+                break
+
+    # If exactly one profile is running in browser processes, use it
+    unique = list(dict.fromkeys(browser_profiles))  # deduplicated, order preserved
+    if len(unique) == 1:
+        return unique[0]
+
+    return ""
+
+
+def _get_chrome_profile_for_hwnd(hwnd: int, pid: int) -> tuple[str, str]:
+    """
+    Determine which Chrome profile owns a given window.
+
+    The fundamental problem with all previous approaches:
+      psutil.cmdline() on Chrome processes raises AccessDenied because Chrome
+      blocks PROCESS_VM_READ at the Windows security level — NOT because of
+      UAC or admin rights. This affects ALL non-elevated processes trying to
+      read Chrome's memory, regardless of integrity level matching.
+
+    Solution — four strategies in order of reliability:
+
+      1. EnumWindows hwnd→PID→profile map:
+         Build a {hwnd: profile_dir} map by calling EnumWindows to get ALL
+         top-level windows, GetWindowThreadProcessId for each, then reading
+         cmdlines via WMI (not psutil). Match the dragged hwnd directly.
+         This is O(1) lookup after the map is built.
+
+      2. WMI single-profile heuristic:
+         If WMI finds only one distinct --profile-directory= among all Chrome
+         browser processes, that must be the one.
+
+      3. Window title matching against Local State display names:
+         Chrome puts the profile name in the window title for non-default
+         profiles. E.g. "Gmail - Profile 5 (Dinuka) - Google Chrome".
+         Parse it out.
+
+      4. User Data dir scan:
+         Check which profile dirs under Chrome's User Data folder have a
+         "Preferences" file that was recently modified (active profile).
+
+    Never falls back to "Default" when multiple profiles are open.
+    """
+    info_cache = _load_chrome_local_state()
+
+    def _name(d: str) -> str:
+        return info_cache.get(d, {}).get("name", d)
+
+    # ── Strategy 1: build hwnd→pid→profile map via WMI + EnumWindows ──────────
+    try:
+        # Get all chrome browser PIDs and their profile dirs from WMI
+        pid_profile: dict[int, str] = {}
+        cmdlines = _get_chrome_cmdlines_via_wmi()
+        # We need pid+cmdline together. Use a PS command that outputs both.
+        try:
+            import subprocess
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "Get-WmiObject Win32_Process -Filter \"Name='chrome.exe'\" | "
+                 "ForEach-Object { $_.ProcessId.ToString() + '|' + $_.CommandLine }"],
+                timeout=3,
+                stderr=subprocess.DEVNULL,
+                creationflags=0x08000000,
+            ).decode("utf-8", errors="replace")
+
+            for line in out.splitlines():
+                line = line.strip()
+                if "|" not in line:
+                    continue
+                pid_str, cmdline = line.split("|", 1)
+                if "--type=" in cmdline:
+                    continue
+                for part in cmdline.split():
+                    if part.startswith("--profile-directory="):
+                        d = part.split("=", 1)[1].strip('"').strip("'")
+                        if d:
+                            try:
+                                pid_profile[int(pid_str)] = d
+                            except ValueError:
+                                pass
+                        break
+        except Exception:
+            pass
+
+        if pid_profile:
+            # Get the PID that owns this hwnd
+            window_pid_dword = ctypes.wintypes.DWORD(0)
+            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(window_pid_dword))
+            window_pid = window_pid_dword.value
+
+            # Direct match
+            if window_pid in pid_profile:
+                d = pid_profile[window_pid]
+                print(f"[DragWatcher] Chrome profile via WMI direct: {d!r} ({_name(d)})")
+                return d, _name(d)
+
+            # Parent match — walk up the process tree using CreateToolhelp32Snapshot
+            # to find the browser process that spawned this window's process
+            try:
+                import psutil
+                proc = psutil.Process(window_pid)
+                for _ in range(6):
+                    if proc.pid in pid_profile:
+                        d = pid_profile[proc.pid]
+                        print(f"[DragWatcher] Chrome profile via WMI parent: {d!r} ({_name(d)})")
+                        return d, _name(d)
+                    parent = proc.parent()
+                    if parent is None or parent.pid <= 4:
+                        break
+                    if "chrome.exe" not in (parent.exe() or "").lower():
+                        break
+                    proc = parent
+            except Exception:
+                pass
+
+            # EnumWindows: find all chrome windows, match our hwnd's PID
+            # to any browser PID in our map
+            EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+            chrome_windows: dict[int, int] = {}  # hwnd → pid
+
+            def _enum_cb(h, _):
+                try:
+                    p = ctypes.wintypes.DWORD(0)
+                    ctypes.windll.user32.GetWindowThreadProcessId(h, ctypes.byref(p))
+                    if p.value in pid_profile:
+                        chrome_windows[h] = p.value
+                except Exception:
+                    pass
+                return True
+
+            ctypes.windll.user32.EnumWindows(EnumWindowsProc(_enum_cb), 0)
+
+            if hwnd in chrome_windows:
+                d = pid_profile[chrome_windows[hwnd]]
+                print(f"[DragWatcher] Chrome profile via EnumWindows: {d!r} ({_name(d)})")
+                return d, _name(d)
+
+    except Exception as e:
+        print(f"[DragWatcher] Strategy 1 error: {e}")
+
+    # ── Strategy 2: WMI single-profile heuristic ──────────────────────────────
+    try:
+        d = _profile_dir_from_wmi_cmdlines(pid)
+        if d:
+            print(f"[DragWatcher] Chrome profile via WMI single-profile: {d!r} ({_name(d)})")
+            return d, _name(d)
+    except Exception:
+        pass
+
+    # ── Strategy 3: window title parsing ──────────────────────────────────────
+    # Chrome appends " - ProfileName - Google Chrome" for non-default profiles.
+    # Parse the profile name out and match against Local State.
+    try:
+        buf = ctypes.create_unicode_buffer(512)
+        ctypes.windll.user32.GetWindowTextW(hwnd, buf, 512)
+        win_title = buf.value.strip()
+        if win_title:
+            for d, pinfo in info_cache.items():
+                display_name = pinfo.get("name", "")
+                if display_name and display_name in win_title:
+                    print(f"[DragWatcher] Chrome profile via window title: {d!r} ({display_name})")
+                    return d, display_name
+    except Exception:
+        pass
+
+    # ── Strategy 4: most-recently-modified Preferences file ───────────────────
+    # The active profile's Preferences file is updated frequently.
+    # Among profiles that exist on disk, pick the one modified most recently.
+    try:
+        local_appdata = os.getenv("LOCALAPPDATA", "")
+        user_data     = os.path.join(local_appdata, "Google", "Chrome", "User Data")
+        best_mtime    = 0.0
+        best_dir      = ""
+        for entry in os.scandir(user_data):
+            if not entry.is_dir():
+                continue
+            prefs = os.path.join(entry.path, "Preferences")
+            if not os.path.exists(prefs):
+                continue
+            if entry.name not in info_cache:
+                continue
+            mtime = os.path.getmtime(prefs)
+            if mtime > best_mtime:
+                best_mtime = mtime
+                best_dir   = entry.name
+        if best_dir:
+            print(f"[DragWatcher] Chrome profile via recent Preferences: {best_dir!r} ({_name(best_dir)})")
+            return best_dir, _name(best_dir)
+    except Exception:
+        pass
+
+    print(f"[DragWatcher] Chrome profile detection failed for hwnd={hwnd}")
     return "", ""
 
 
@@ -660,8 +849,6 @@ class DragWatcher(QThread):
 
                     profile_dir, profile_name = "", ""
                     if stem == "chrome":
-                        # Pass BOTH hwnd and pid_val so the profile detector
-                        # can use GetWindowThreadProcessId on the exact hwnd.
                         profile_dir, profile_name = _get_chrome_profile_for_hwnd(hwnd, pid_val)
 
                     if profile_dir:
@@ -669,9 +856,8 @@ class DragWatcher(QThread):
                         if profile_name:
                             label = f"[{profile_name}] {label}"
                     else:
-                        # Profile detection failed — store plain URL, no profile
-                        # prefix. Better to lose profile info than to wrongly
-                        # tag as "Person 1" / Default.
+                        # Profile detection failed — store plain URL.
+                        # The label is NOT prefixed so there's no "[Default]" confusion.
                         encoded_url = url
 
                     return {

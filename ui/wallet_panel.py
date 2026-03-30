@@ -1,14 +1,11 @@
 """
 ui/wallet_panel.py — Hotkey-toggled floating wallet panel.
 
-Changes in this version:
-  • _InspectorPanel item rows now show a profile badge for chrome-profile:
-    and chrome-profile-email: URLs so the user can see exactly which Chrome
-    profile a saved URL belongs to.
-  • ⚠ badge shown when profile_dir was not confirmed at save time
-    (chrome-profile-email: scheme).
-  • Tooltip on each item row shows the full encoded path_or_url for debugging.
-  • All other behaviour unchanged.
+Changes:
+  • Inspector rows show a profile badge for Chrome URLs.
+    Green  = chrome-profile:<dir>   → confirmed, restores in correct profile.
+    Amber  = chrome-profile-email:  → unconfirmed at save, restore will try to resolve.
+  • [ProfileName] prefix stripped from display label (shown as badge instead).
 """
 
 import sys
@@ -22,10 +19,8 @@ from PyQt6.QtCore import (
     QRect, QPoint, pyqtProperty, QThread, pyqtSignal
 )
 from PyQt6.QtGui import (
-    QPainter, QColor, QPainterPath, QFont, QPen,
-    QLinearGradient
+    QPainter, QColor, QPainterPath, QFont, QPen, QLinearGradient
 )
-
 import db
 
 PANEL_BG     = QColor("#0f0f14")
@@ -38,46 +33,36 @@ ACCENT_GREEN = QColor("#42d778")
 ACCENT_BLUE  = QColor("#635bff")
 
 ICON_COLORS = [
-    QColor("#635bff"),
-    QColor("#9bd86a"),
-    QColor("#f59e0b"),
-    QColor("#ef4444"),
-    QColor("#06b6d4"),
-    QColor("#ec4899"),
+    QColor("#635bff"), QColor("#9bd86a"), QColor("#f59e0b"),
+    QColor("#ef4444"), QColor("#06b6d4"), QColor("#ec4899"),
 ]
-
 PANEL_WIDTH  = 360
 PANEL_HEIGHT = 560
 
 
 def _time_ago(ts: str) -> str:
-    if not ts:
-        return ""
+    if not ts: return ""
     try:
-        dt  = datetime.fromisoformat(ts)
-        now = datetime.now()
-        s   = int((now - dt).total_seconds())
+        from datetime import datetime as dt
+        s = int((dt.now() - dt.fromisoformat(ts)).total_seconds())
         if s < 60:    return "just now"
-        if s < 3600:  return f"{s // 60}m ago"
-        if s < 86400: return f"{s // 3600}h ago"
-        return f"{s // 86400}d ago"
-    except Exception:
-        return ""
+        if s < 3600:  return f"{s//60}m ago"
+        if s < 86400: return f"{s//3600}h ago"
+        return f"{s//86400}d ago"
+    except Exception: return ""
 
 
-def _profile_badge_for_url(path_or_url: str) -> tuple[str, str]:
+def _profile_badge(path_or_url: str) -> tuple[str, str]:
     """
-    Parse a stored URL and return (badge_text, badge_color_hex).
-
-    chrome-profile:<dir>|<url>        → ("<dir>", "#42d778")   green = confirmed
-    chrome-profile-email:<email>|<url>→ ("⚠ unconfirmed", "#f59e0b")  amber = partial
-    anything else                      → ("", "")               no badge
+    Returns (badge_text, color_hex) for a saved URL.
+    Green  = confirmed profile dir
+    Amber  = email hint only (unconfirmed)
+    Empty  = no profile info (plain URL)
     """
     if path_or_url.startswith("chrome-profile:"):
         rest = path_or_url[len("chrome-profile:"):]
         if "|" in rest:
-            profile_dir = rest.split("|", 1)[0]
-            return profile_dir, "#42d778"
+            return rest.split("|", 1)[0], "#42d778"
     elif path_or_url.startswith("chrome-profile-email:"):
         rest = path_or_url[len("chrome-profile-email:"):]
         if "|" in rest:
@@ -89,16 +74,12 @@ def _profile_badge_for_url(path_or_url: str) -> tuple[str, str]:
 
 class _RestoreWorker(QThread):
     done = pyqtSignal(dict, int)
-
-    def __init__(self, session_id: int, parent=None):
-        super().__init__(parent)
-        self._sid = session_id
+    def __init__(self, session_id, parent=None):
+        super().__init__(parent); self._sid = session_id
         self.finished.connect(self.deleteLater)
-
     def run(self):
         import restore
-        result = restore.restore_session(self._sid)
-        self.done.emit(result, self._sid)
+        self.done.emit(restore.restore_session(self._sid), self._sid)
 
 
 class SessionRow(QWidget):
@@ -106,537 +87,345 @@ class SessionRow(QWidget):
     inspect_requested = pyqtSignal(int)
     delete_requested  = pyqtSignal(int)
 
-    def __init__(self, session: dict, index: int, parent=None):
+    def __init__(self, session, index, parent=None):
         super().__init__(parent)
-        self._session   = session
-        self._index     = index
-        self._hovered   = False
-        self._restoring = False
-        self._inspected = False
-        self.setMouseTracking(True)
-        self.setFixedHeight(72)
+        self._session = session; self._index = index
+        self._hovered = self._restoring = self._inspected = False
+        self.setMouseTracking(True); self.setFixedHeight(72)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-    def update_session(self, session: dict):
-        self._session = session
-        self.update()
-
-    def set_restoring(self, v: bool):
-        self._restoring = v
-        self.update()
-
-    def set_inspected(self, v: bool):
-        self._inspected = v
-        self.update()
-
-    def enterEvent(self, e):
-        self._hovered = True
-        self.update()
-
-    def leaveEvent(self, e):
-        self._hovered = False
-        self.update()
+    def update_session(self, s): self._session = s; self.update()
+    def set_restoring(self, v): self._restoring = v; self.update()
+    def set_inspected(self, v): self._inspected = v; self.update()
+    def enterEvent(self, e): self._hovered = True;  self.update()
+    def leaveEvent(self, e): self._hovered = False; self.update()
 
     def mousePressEvent(self, e):
-        x = e.position().x()
-        w = self.width()
-        if x > w - 90:
-            self.restore_requested.emit(self._session["id"])
-        elif x > w - 120 and self._hovered:
-            self.delete_requested.emit(self._session["id"])
-        else:
-            self.inspect_requested.emit(self._session["id"])
+        x, w = e.position().x(), self.width()
+        if x > w - 90:                        self.restore_requested.emit(self._session["id"])
+        elif x > w - 120 and self._hovered:   self.delete_requested.emit(self._session["id"])
+        else:                                  self.inspect_requested.emit(self._session["id"])
 
     def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-
-        w = self.width()
-        h = self.height()
-        sess = self._session
+        p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h, sess = self.width(), self.height(), self._session
 
         if self._hovered or self._inspected:
-            bg_path = QPainterPath()
-            bg_path.addRoundedRect(0, 2, w, h - 4, 12, 12)
-            p.fillPath(bg_path, QColor(255, 255, 255, 30 if self._inspected else 18))
-
+            bg = QPainterPath(); bg.addRoundedRect(0, 2, w, h-4, 12, 12)
+            p.fillPath(bg, QColor(255,255,255, 30 if self._inspected else 18))
         if self._inspected:
-            p.fillRect(QRect(0, 10, 3, h - 20), ICON_COLORS[self._index % len(ICON_COLORS)])
+            p.fillRect(QRect(0,10,3,h-20), ICON_COLORS[self._index % len(ICON_COLORS)])
 
-        icon_color = ICON_COLORS[self._index % len(ICON_COLORS)]
-        icon_path  = QPainterPath()
-        icon_path.addRoundedRect(16, 18, 36, 36, 8, 8)
-        grad = QLinearGradient(16, 18, 52, 54)
-        grad.setColorAt(0, icon_color.lighter(130))
-        grad.setColorAt(1, icon_color)
-        p.fillPath(icon_path, grad)
+        ic = ICON_COLORS[self._index % len(ICON_COLORS)]
+        ip = QPainterPath(); ip.addRoundedRect(16,18,36,36,8,8)
+        g  = QLinearGradient(16,18,52,54)
+        g.setColorAt(0, ic.lighter(130)); g.setColorAt(1, ic)
+        p.fillPath(ip, g)
+        p.setPen(QColor(255,255,255)); p.setFont(QFont("Helvetica Neue",14,QFont.Weight.Bold))
+        p.drawText(QRect(16,18,36,36), Qt.AlignmentFlag.AlignCenter, sess.get("name","?")[0].upper())
 
-        p.setPen(QColor(255, 255, 255))
-        p.setFont(QFont("Helvetica Neue", 14, QFont.Weight.Bold))
-        p.drawText(QRect(16, 18, 36, 36), Qt.AlignmentFlag.AlignCenter,
-                   sess.get("name", "?")[0].upper())
+        p.setPen(TEXT_WHITE); p.setFont(QFont("Helvetica Neue",11,QFont.Weight.Bold))
+        p.drawText(QRect(66,14,w-170,24), Qt.AlignmentFlag.AlignVCenter, sess.get("name","Session"))
 
-        p.setPen(TEXT_WHITE)
-        p.setFont(QFont("Helvetica Neue", 11, QFont.Weight.Bold))
-        p.drawText(QRect(66, 14, w - 170, 24), Qt.AlignmentFlag.AlignVCenter,
-                   sess.get("name", "Session"))
-
-        p.setPen(TEXT_DIM)
-        p.setFont(QFont("Helvetica Neue", 9))
-        p.drawText(QRect(w - 90, 14, 78, 24),
-                   Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-                   _time_ago(sess.get("updated_at", "")))
+        p.setPen(TEXT_DIM); p.setFont(QFont("Helvetica Neue",9))
+        p.drawText(QRect(w-90,14,78,24), Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter,
+                   _time_ago(sess.get("updated_at","")))
 
         items  = db.get_items(sess["id"])
-        n_apps = sum(1 for i in items if i["type"] == "app")
-        n_urls = sum(1 for i in items if i["type"] == "url")
-        n_file = sum(1 for i in items if i["type"] == "file")
-        parts  = []
-        if n_apps: parts.append(f"{n_apps} app{'s' if n_apps != 1 else ''}")
-        if n_urls: parts.append(f"{n_urls} url{'s' if n_urls != 1 else ''}")
-        if n_file: parts.append(f"{n_file} file{'s' if n_file != 1 else ''}")
-        subtitle = " · ".join(parts) if parts else "empty"
-
-        p.setPen(TEXT_DIM)
-        p.setFont(QFont("Helvetica Neue", 9))
-        p.drawText(QRect(66, 40, w - 170, 20), Qt.AlignmentFlag.AlignVCenter, subtitle)
-
-        hint_text = "▾ inspecting" if self._inspected else "▸ tap to inspect"
-        p.setPen(TEXT_MUTED)
-        p.setFont(QFont("Helvetica Neue", 8))
-        p.drawText(QRect(66, 56, w - 170, 14), Qt.AlignmentFlag.AlignVCenter, hint_text)
+        n_a    = sum(1 for i in items if i["type"]=="app")
+        n_u    = sum(1 for i in items if i["type"]=="url")
+        n_f    = sum(1 for i in items if i["type"]=="file")
+        parts  = ([f"{n_a} app{'s' if n_a!=1 else ''}"] if n_a else []) + \
+                 ([f"{n_u} url{'s' if n_u!=1 else ''}"] if n_u else []) + \
+                 ([f"{n_f} file{'s' if n_f!=1 else ''}"] if n_f else [])
+        p.setPen(TEXT_DIM); p.setFont(QFont("Helvetica Neue",9))
+        p.drawText(QRect(66,40,w-170,20), Qt.AlignmentFlag.AlignVCenter,
+                   " · ".join(parts) if parts else "empty")
+        p.setPen(TEXT_MUTED); p.setFont(QFont("Helvetica Neue",8))
+        p.drawText(QRect(66,56,w-170,14), Qt.AlignmentFlag.AlignVCenter,
+                   "▾ inspecting" if self._inspected else "▸ tap to inspect")
 
         if self._hovered:
-            del_path = QPainterPath()
-            del_path.addRoundedRect(w - 120, 22, 24, 28, 6, 6)
-            p.fillPath(del_path, QColor(239, 68, 68, 160))
-            p.setPen(QColor(255, 255, 255))
-            p.setFont(QFont("Helvetica Neue", 11, QFont.Weight.Bold))
-            p.drawText(QRect(w - 120, 22, 24, 28), Qt.AlignmentFlag.AlignCenter, "×")
-
-            btn_path = QPainterPath()
-            btn_path.addRoundedRect(w - 88, 22, 74, 28, 8, 8)
-            p.fillPath(btn_path, ACCENT_GREEN if not self._restoring else QColor(255, 255, 255, 20))
-            p.setPen(QColor(0, 0, 0) if not self._restoring else TEXT_DIM)
-            p.setFont(QFont("Helvetica Neue", 9, QFont.Weight.Bold))
-            p.drawText(QRect(w - 88, 22, 74, 28), Qt.AlignmentFlag.AlignCenter,
+            dp = QPainterPath(); dp.addRoundedRect(w-120,22,24,28,6,6)
+            p.fillPath(dp, QColor(239,68,68,160))
+            p.setPen(QColor(255,255,255)); p.setFont(QFont("Helvetica Neue",11,QFont.Weight.Bold))
+            p.drawText(QRect(w-120,22,24,28), Qt.AlignmentFlag.AlignCenter, "×")
+            bp = QPainterPath(); bp.addRoundedRect(w-88,22,74,28,8,8)
+            p.fillPath(bp, ACCENT_GREEN if not self._restoring else QColor(255,255,255,20))
+            p.setPen(QColor(0,0,0) if not self._restoring else TEXT_DIM)
+            p.setFont(QFont("Helvetica Neue",9,QFont.Weight.Bold))
+            p.drawText(QRect(w-88,22,74,28), Qt.AlignmentFlag.AlignCenter,
                        "Restoring…" if self._restoring else "Restore")
-
         p.end()
 
 
 class _InspectorPanel(QWidget):
-    """Inline item list shown below a session row when the user taps it."""
-
     closed       = pyqtSignal()
-    item_removed = pyqtSignal(int)   # emits item_id
+    item_removed = pyqtSignal(int)
+    TYPE_ICONS   = {"url":"🔗","file":"📄","app":"⚡"}
 
-    TYPE_ICONS = {"url": "🔗", "file": "📄", "app": "⚡"}
-
-    def __init__(self, session_id: int, parent=None):
+    def __init__(self, session_id, parent=None):
         super().__init__(parent)
         self._session_id = session_id
         self.setStyleSheet("background: transparent;")
         self._build()
 
     def _build(self):
-        # Clear existing layout if rebuilding
         if self.layout():
             while self.layout().count():
-                item = self.layout().takeAt(0)
-                if item.widget():
-                    item.widget().deleteLater()
+                it = self.layout().takeAt(0)
+                if it.widget(): it.widget().deleteLater()
         else:
-            layout = QVBoxLayout(self)
-            layout.setContentsMargins(16, 2, 16, 10)
-            layout.setSpacing(3)
+            lay = QVBoxLayout(self)
+            lay.setContentsMargins(16,2,16,10); lay.setSpacing(3)
 
-        layout = self.layout()
+        lay = self.layout()
 
-        # Header row
-        hdr = QHBoxLayout()
-        hdr.setContentsMargins(0, 0, 0, 4)
+        hdr = QHBoxLayout(); hdr.setContentsMargins(0,0,0,4)
         lbl = QLabel("Items in this session")
-        lbl.setStyleSheet("color: #888899; font-size: 10px;")
-        hdr.addWidget(lbl)
-        hdr.addStretch()
-        close_btn = QPushButton("×")
-        close_btn.setFixedSize(20, 20)
-        close_btn.setStyleSheet("""
-            QPushButton { color:#44445a; background:transparent; border:none; font-size:14px; padding:0; }
-            QPushButton:hover { color:#ffffff; }
-        """)
-        close_btn.clicked.connect(self.closed.emit)
-        hdr.addWidget(close_btn)
-        layout.addLayout(hdr)
+        lbl.setStyleSheet("color:#888899;font-size:10px;")
+        hdr.addWidget(lbl); hdr.addStretch()
+        cb = QPushButton("×"); cb.setFixedSize(20,20)
+        cb.setStyleSheet("QPushButton{color:#44445a;background:transparent;border:none;font-size:14px;padding:0;}"
+                         "QPushButton:hover{color:#fff;}")
+        cb.clicked.connect(self.closed.emit); hdr.addWidget(cb)
+        lay.addLayout(hdr)
 
         items = db.get_items(self._session_id)
-
         if not items:
-            empty = QLabel("No items yet — drag windows or URLs here to save them.")
-            empty.setWordWrap(True)
-            empty.setStyleSheet("color: #44445a; font-size: 10px; padding: 6px 0;")
-            layout.addWidget(empty)
-            return
+            e = QLabel("No items yet — drag windows or URLs here.")
+            e.setWordWrap(True); e.setStyleSheet("color:#44445a;font-size:10px;padding:6px 0;")
+            lay.addWidget(e); return
 
         for item in items:
-            self._add_item_row(layout, item)
+            self._add_row(lay, item)
 
-    def _add_item_row(self, layout, item: dict):
-        """Build one item row with icon, label, optional profile badge, remove button."""
-        path_or_url = item.get("path_or_url", "")
-        label_text  = item.get("label", "")
+    def _add_row(self, lay, item):
+        pou   = item.get("path_or_url","")
+        label = item.get("label","")
 
-        # For URL items, compute a clean display label (strip [Profile] prefix —
-        # we show profile as a separate badge instead so it's always consistent).
-        display_label = label_text
-        profile_badge_text  = ""
-        profile_badge_color = ""
+        # Strip [Profile] / [⚠ email] prefix from label — show as badge instead.
+        display = label
+        if item["type"] == "url" and display.startswith("[") and "] " in display:
+            display = display.split("] ", 1)[1]
 
-        if item["type"] == "url":
-            profile_badge_text, profile_badge_color = _profile_badge_for_url(path_or_url)
-            # Strip the [ProfileName] or [⚠ email] from the label text so it
-            # doesn't appear twice (the label was built with it in db.py).
-            if display_label.startswith("[") and "] " in display_label:
-                display_label = display_label.split("] ", 1)[1]
+        badge_text, badge_color = _profile_badge(pou) if item["type"] == "url" else ("","")
 
-        # ── Row widget ────────────────────────────────────────────────────────
         row = QWidget()
-        row.setStyleSheet("background: rgba(255,255,255,0.05); border-radius: 6px;")
-        rl = QHBoxLayout(row)
-        rl.setContentsMargins(8, 0, 4, 0)
-        rl.setSpacing(5)
+        row.setMinimumHeight(34)
+        row.setStyleSheet("background:rgba(255,255,255,0.05);border-radius:6px;")
+        rl = QHBoxLayout(row); rl.setContentsMargins(8,0,4,0); rl.setSpacing(5)
 
-        # Type icon
-        icon_lbl = QLabel(self.TYPE_ICONS.get(item["type"], "•"))
+        icon_lbl = QLabel(self.TYPE_ICONS.get(item["type"],"•"))
         icon_lbl.setFixedWidth(16)
-        icon_lbl.setStyleSheet("font-size: 11px; background: transparent;")
+        icon_lbl.setStyleSheet("font-size:11px;background:transparent;")
         rl.addWidget(icon_lbl)
 
-        # Label (elided if long)
-        name_lbl = QLabel(display_label)
-        name_lbl.setStyleSheet("color: #ccccdd; font-size: 10px; background: transparent;")
-        name_lbl.setToolTip(
-            f"Path: {path_or_url}\n"
-            f"Label: {label_text}"
-        )
+        name_lbl = QLabel(display)
+        name_lbl.setStyleSheet("color:#ccccdd;font-size:10px;background:transparent;")
+        name_lbl.setToolTip(f"Stored: {pou}\nLabel: {label}")
         rl.addWidget(name_lbl, 1)
 
-        # Profile badge (only for URL items with profile info)
-        if profile_badge_text:
-            badge = QLabel(profile_badge_text)
-            badge.setStyleSheet(
-                f"color: {profile_badge_color}; font-size: 8px; "
-                f"background: rgba(255,255,255,0.07); border-radius: 3px; "
-                f"padding: 1px 4px;"
-            )
-            badge.setToolTip(
-                "Green = profile confirmed (will restore in this Chrome profile)\n"
-                "Amber ⚠ = profile directory not confirmed at save time; "
-                "restore will attempt to resolve from your Google account email"
-                if "⚠" in profile_badge_text
-                else "Will restore in this Chrome profile"
-            )
-            rl.addWidget(badge)
+        if badge_text:
+            b = QLabel(badge_text)
+            tip = ("✓ Will restore in this Chrome profile" if "⚠" not in badge_text else
+                   "⚠ Profile not confirmed at save time — restore will try to resolve from your Google account email")
+            b.setToolTip(tip)
+            b.setStyleSheet(
+                f"color:{badge_color};font-size:8px;"
+                f"background:rgba(255,255,255,0.07);border-radius:3px;padding:1px 4px;")
+            rl.addWidget(b)
 
-        # Type badge
         type_badge = QLabel(item["type"].upper())
-        type_badge.setStyleSheet("color: #44445a; font-size: 8px; background: transparent;")
+        type_badge.setStyleSheet("color:#44445a;font-size:8px;background:transparent;")
         rl.addWidget(type_badge)
 
-        # Per-item remove button
-        remove_btn = QPushButton("×")
-        remove_btn.setFixedSize(20, 20)
-        remove_btn.setToolTip(f"Remove '{label_text}' from this session")
-        remove_btn.setStyleSheet("""
-            QPushButton {
-                color: #44445a; background: transparent;
-                border: none; font-size: 13px; padding: 0;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                color: #ffffff;
-                background: rgba(239, 68, 68, 0.6);
-            }
-        """)
-        item_id = item["id"]
-        remove_btn.clicked.connect(lambda checked, iid=item_id: self.item_removed.emit(iid))
-        rl.addWidget(remove_btn)
+        rm = QPushButton("×"); rm.setFixedSize(20,20)
+        rm.setToolTip(f"Remove '{label}'")
+        rm.setStyleSheet("QPushButton{color:#44445a;background:transparent;border:none;"
+                         "font-size:13px;padding:0;border-radius:4px;}"
+                         "QPushButton:hover{color:#fff;background:rgba(239,68,68,0.6);}")
+        iid = item["id"]
+        rm.clicked.connect(lambda _, i=iid: self.item_removed.emit(i))
+        rl.addWidget(rm)
+        lay.addWidget(row)
 
-        # Dynamic height based on whether badge wraps
-        row.setMinimumHeight(34)
-        layout.addWidget(row)
-
-    def refresh(self):
-        """Rebuild item list in place (called after a removal)."""
-        self._build()
+    def refresh(self): self._build()
 
 
 class WalletPanel(QWidget):
-
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._visible_state    = False
-        self._sessions: list[dict] = []
-        self._session_rows: list[SessionRow] = []
-        self._restore_workers: list[_RestoreWorker] = []
-        self._inspected_id: int | None = None
-        self._inspector_widget: _InspectorPanel | None = None
-
-        self._setup_window()
-        self._build_ui()
-        self._position_on_screen()
-        self._setup_animation()
-        self._refresh()
-
-        _t = QTimer(self)
-        _t.timeout.connect(self._refresh)
-        _t.start(4000)
+        self._visible_state   = False
+        self._sessions        = []
+        self._session_rows    = []
+        self._restore_workers = []
+        self._inspected_id    = None
+        self._inspector_widget= None
+        self._setup_window(); self._build_ui()
+        self._position_on_screen(); self._setup_animation(); self._refresh()
+        t = QTimer(self); t.timeout.connect(self._refresh); t.start(4000)
 
     def _setup_window(self):
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
-        )
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
+                            Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setFixedSize(PANEL_WIDTH, PANEL_HEIGHT)
 
     def _position_on_screen(self):
-        screen = QApplication.primaryScreen()
-        if not screen:
-            return
-        geo = screen.geometry()
-        self._final_x  = geo.x() + geo.width() - PANEL_WIDTH - 20
-        self._final_y  = geo.y() + 20
-        self._hidden_x = geo.x() + geo.width() + 10
+        s = QApplication.primaryScreen()
+        if not s: return
+        g = s.geometry()
+        self._final_x  = g.x() + g.width() - PANEL_WIDTH - 20
+        self._final_y  = g.y() + 20
+        self._hidden_x = g.x() + g.width() + 10
         self.move(self._hidden_x, self._final_y)
 
     def _setup_animation(self):
         self._anim = QPropertyAnimation(self, b"pos", self)
-        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._anim.setDuration(280)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic); self._anim.setDuration(280)
 
     def _build_ui(self):
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-
-        self._header = _PanelHeader(self)
-        outer.addWidget(self._header)
-
+        outer = QVBoxLayout(self); outer.setContentsMargins(0,0,0,0); outer.setSpacing(0)
+        self._header = _PanelHeader(self); outer.addWidget(self._header)
         self._scroll_area = QScrollArea(self)
         self._scroll_area.setWidgetResizable(True)
         self._scroll_area.setFrameShape(QFrame.Shape.NoFrame)
         self._scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._scroll_area.setStyleSheet("""
-            QScrollArea { background: transparent; border: none; }
-            QScrollBar:vertical { background: transparent; width: 4px; margin: 0; }
-            QScrollBar::handle:vertical { background: rgba(255,255,255,0.12); border-radius: 2px; }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-        """)
-
-        self._list_widget = QWidget()
-        self._list_widget.setStyleSheet("background: transparent;")
+            QScrollArea{background:transparent;border:none;}
+            QScrollBar:vertical{background:transparent;width:4px;margin:0;}
+            QScrollBar::handle:vertical{background:rgba(255,255,255,0.12);border-radius:2px;}
+            QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}""")
+        self._list_widget = QWidget(); self._list_widget.setStyleSheet("background:transparent;")
         self._list_layout = QVBoxLayout(self._list_widget)
-        self._list_layout.setContentsMargins(8, 4, 8, 12)
-        self._list_layout.setSpacing(2)
+        self._list_layout.setContentsMargins(8,4,8,12); self._list_layout.setSpacing(2)
         self._list_layout.addStretch()
-
-        self._scroll_area.setWidget(self._list_widget)
-        outer.addWidget(self._scroll_area, 1)
-
-        self._footer = _PanelFooter(self)
-        outer.addWidget(self._footer)
+        self._scroll_area.setWidget(self._list_widget); outer.addWidget(self._scroll_area, 1)
+        self._footer = _PanelFooter(self); outer.addWidget(self._footer)
 
     def _refresh(self):
-        self._sessions = db.get_all_sessions()
-        self._rebuild_rows()
-        self.update()
+        self._sessions = db.get_all_sessions(); self._rebuild_rows(); self.update()
 
     def _rebuild_rows(self):
         inspected = self._inspected_id
-
-        for row in self._session_rows:
-            row.setParent(None)
-            row.deleteLater()
+        for r in self._session_rows: r.setParent(None); r.deleteLater()
         self._session_rows.clear()
-
         if self._inspector_widget:
-            self._inspector_widget.setParent(None)
-            self._inspector_widget.deleteLater()
+            self._inspector_widget.setParent(None); self._inspector_widget.deleteLater()
             self._inspector_widget = None
-
         while self._list_layout.count():
-            item = self._list_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            it = self._list_layout.takeAt(0)
+            if it.widget(): it.widget().deleteLater()
 
         if not self._sessions:
-            empty = QLabel("No sessions yet.\nDrag a window to the right edge\nto create one.")
-            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            empty.setStyleSheet("color: #44445a; font-size: 13px; padding: 40px 20px;")
-            self._list_layout.addWidget(empty)
-            self._list_layout.addStretch()
-            return
+            e = QLabel("No sessions yet.\nDrag a window to the right edge\nto create one.")
+            e.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            e.setStyleSheet("color:#44445a;font-size:13px;padding:40px 20px;")
+            self._list_layout.addWidget(e); self._list_layout.addStretch(); return
 
         for i, sess in enumerate(self._sessions):
             row = SessionRow(sess, i, self._list_widget)
             row.restore_requested.connect(self._on_restore)
             row.inspect_requested.connect(self._on_inspect)
             row.delete_requested.connect(self._on_delete)
-            self._session_rows.append(row)
-            self._list_layout.addWidget(row)
-
+            self._session_rows.append(row); self._list_layout.addWidget(row)
             if inspected is not None and sess["id"] == inspected:
                 row.set_inspected(True)
                 self._inspector_widget = _InspectorPanel(inspected, self._list_widget)
                 self._inspector_widget.closed.connect(self._close_inspector)
                 self._inspector_widget.item_removed.connect(self._on_remove_item)
                 self._list_layout.addWidget(self._inspector_widget)
-
         self._list_layout.addStretch()
 
-    def _on_delete(self, session_id: int):
-        db.delete_session(session_id)
-        if self._inspected_id == session_id:
-            self._inspected_id = None
+    def _on_delete(self, sid):
+        db.delete_session(sid)
+        if self._inspected_id == sid: self._inspected_id = None
         self._refresh()
 
-    def _on_inspect(self, session_id: int):
-        if self._inspected_id == session_id:
-            self._close_inspector()
-            return
-        self._inspected_id = session_id
-        self._rebuild_rows()
+    def _on_inspect(self, sid):
+        if self._inspected_id == sid: self._close_inspector(); return
+        self._inspected_id = sid; self._rebuild_rows()
 
-    def _close_inspector(self):
-        self._inspected_id = None
-        self._rebuild_rows()
+    def _close_inspector(self): self._inspected_id = None; self._rebuild_rows()
 
-    def _on_remove_item(self, item_id: int):
+    def _on_remove_item(self, item_id):
         db.delete_item(item_id)
-        if self._inspector_widget is not None:
-            self._inspector_widget.refresh()
+        if self._inspector_widget: self._inspector_widget.refresh()
         self._refresh()
 
-    def _on_restore(self, session_id: int):
-        for row in self._session_rows:
-            if row._session["id"] == session_id:
-                row.set_restoring(True)
-                break
+    def _on_restore(self, sid):
+        for r in self._session_rows:
+            if r._session["id"] == sid: r.set_restoring(True); break
+        w = _RestoreWorker(sid, parent=self)
+        w.done.connect(self._on_restore_done); self._restore_workers.append(w); w.start()
 
-        worker = _RestoreWorker(session_id, parent=self)
-        worker.done.connect(self._on_restore_done)
-        self._restore_workers.append(worker)
-        worker.start()
-
-    def _on_restore_done(self, result: dict, session_id: int):
-        for row in self._session_rows:
-            if row._session["id"] == session_id:
-                row.set_restoring(False)
-                break
+    def _on_restore_done(self, result, sid):
+        for r in self._session_rows:
+            if r._session["id"] == sid: r.set_restoring(False); break
         self._restore_workers = [w for w in self._restore_workers if w.isRunning()]
 
     def toggle(self):
-        if self._visible_state:
-            self.hide_panel()
-        else:
-            self.show_panel()
+        if self._visible_state: self.hide_panel()
+        else: self.show_panel()
 
     def show_panel(self):
-        self._visible_state = True
-        self._refresh()
-        self.show()
-        self.raise_()
+        self._visible_state = True; self._refresh(); self.show(); self.raise_()
         self._anim.stop()
-        self._anim.setStartValue(self.pos())
-        self._anim.setEndValue(QPoint(self._final_x, self._final_y))
+        self._anim.setStartValue(self.pos()); self._anim.setEndValue(QPoint(self._final_x, self._final_y))
         self._anim.start()
 
     def hide_panel(self):
-        self._visible_state = False
-        self._anim.stop()
-        self._anim.setStartValue(self.pos())
-        self._anim.setEndValue(QPoint(self._hidden_x, self._final_y))
-        self._anim.finished.connect(self._on_hide_anim_done)
-        self._anim.start()
+        self._visible_state = False; self._anim.stop()
+        self._anim.setStartValue(self.pos()); self._anim.setEndValue(QPoint(self._hidden_x, self._final_y))
+        self._anim.finished.connect(self._on_hide_anim_done); self._anim.start()
 
     def _on_hide_anim_done(self):
-        if not self._visible_state:
-            self.hide()
-        try:
-            self._anim.finished.disconnect(self._on_hide_anim_done)
-        except Exception:
-            pass
+        if not self._visible_state: self.hide()
+        try: self._anim.finished.disconnect(self._on_hide_anim_done)
+        except Exception: pass
 
     def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w = self.width()
-        h = self.height()
-        bg_path = QPainterPath()
-        bg_path.addRoundedRect(0, 0, w, h, 16, 16)
-        p.fillPath(bg_path, PANEL_BG)
+        p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        bg = QPainterPath(); bg.addRoundedRect(0,0,w,h,16,16)
+        p.fillPath(bg, PANEL_BG)
         p.setPen(QPen(PANEL_BORDER, 1.0))
-        border_path = QPainterPath()
-        border_path.addRoundedRect(0.5, 0.5, w - 1, h - 1, 16, 16)
-        p.drawPath(border_path)
-        p.end()
+        bd = QPainterPath(); bd.addRoundedRect(0.5,0.5,w-1,h-1,16,16)
+        p.drawPath(bd); p.end()
 
 
 class _PanelHeader(QWidget):
     def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(60)
-        self.setStyleSheet("background: transparent;")
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(18, 0, 18, 0)
-
-        title = QLabel("Workspace Sessions")
-        title.setStyleSheet(f"""
-            color: {TEXT_WHITE.name()}; font-size: 14px; font-weight: 700;
-            font-family: 'Helvetica Neue', 'Helvetica', sans-serif; background: transparent;
-        """)
-        layout.addWidget(title)
-        layout.addStretch()
-
-        hint = QLabel("Ctrl+Shift+Space")
-        hint.setStyleSheet(f"""
-            color: {TEXT_MUTED.name()}; font-size: 10px;
-            font-family: 'Helvetica Neue', 'Helvetica', sans-serif;
-            background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 5px; padding: 3px 7px;
-        """)
-        layout.addWidget(hint)
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setPen(QPen(PANEL_BORDER, 1.0))
-        p.drawLine(0, self.height() - 1, self.width(), self.height() - 1)
-        p.end()
+        super().__init__(parent); self.setFixedHeight(60)
+        self.setStyleSheet("background:transparent;")
+        lay = QHBoxLayout(self); lay.setContentsMargins(18,0,18,0)
+        t = QLabel("Workspace Sessions")
+        t.setStyleSheet(f"color:{TEXT_WHITE.name()};font-size:14px;font-weight:700;"
+                        f"font-family:'Helvetica Neue','Helvetica',sans-serif;background:transparent;")
+        lay.addWidget(t); lay.addStretch()
+        h = QLabel("Ctrl+Shift+Space")
+        h.setStyleSheet(f"color:{TEXT_MUTED.name()};font-size:10px;"
+                        f"font-family:'Helvetica Neue','Helvetica',sans-serif;"
+                        f"background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.08);"
+                        f"border-radius:5px;padding:3px 7px;")
+        lay.addWidget(h)
+    def paintEvent(self, e):
+        p = QPainter(self); p.setPen(QPen(PANEL_BORDER, 1.0))
+        p.drawLine(0, self.height()-1, self.width(), self.height()-1); p.end()
 
 
 class _PanelFooter(QWidget):
     def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(52)
-        self.setStyleSheet("background: transparent;")
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(18, 0, 18, 0)
-
-        hint = QLabel("Drag any window to the right edge of your screen to save it")
-        hint.setWordWrap(True)
-        hint.setStyleSheet(f"""
-            color: {TEXT_MUTED.name()}; font-size: 10px;
-            font-family: 'Helvetica Neue', 'Helvetica', sans-serif; background: transparent;
-        """)
-        layout.addWidget(hint)
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setPen(QPen(PANEL_BORDER, 1.0))
-        p.drawLine(0, 0, self.width(), 0)
-        p.end()
+        super().__init__(parent); self.setFixedHeight(52)
+        self.setStyleSheet("background:transparent;")
+        lay = QHBoxLayout(self); lay.setContentsMargins(18,0,18,0)
+        h = QLabel("Drag any window to the right edge of your screen to save it")
+        h.setWordWrap(True)
+        h.setStyleSheet(f"color:{TEXT_MUTED.name()};font-size:10px;"
+                        f"font-family:'Helvetica Neue','Helvetica',sans-serif;background:transparent;")
+        lay.addWidget(h)
+    def paintEvent(self, e):
+        p = QPainter(self); p.setPen(QPen(PANEL_BORDER, 1.0))
+        p.drawLine(0, 0, self.width(), 0); p.end()
