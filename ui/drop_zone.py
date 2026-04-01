@@ -16,12 +16,12 @@ from PyQt6.QtWidgets import QWidget, QApplication, QLineEdit
 from PyQt6.QtCore import (
     Qt, QTimer, QPropertyAnimation, QEasingCurve,
     QRect, QRectF, pyqtProperty, QPoint,
-    QSequentialAnimationGroup, QPauseAnimation 
+    QSequentialAnimationGroup, QPauseAnimation
 )
 from PyQt6.QtGui import (
     QPainter, QColor, QPainterPath, QLinearGradient, QConicalGradient,
     QFont, QFontMetrics, QPen, QRadialGradient,
-    QBrush  
+    QBrush
 )
 
 import db
@@ -124,7 +124,7 @@ class DropZoneOverlay(QWidget):
         self._refresh_sessions()
         self._build_slide_anim()
         self._build_input_anim()
-        self._build_confirm_anim()  # New animation for confirmation text
+        self._build_confirm_anim()
 
         self._new_sess_input = QLineEdit(self)
         self._new_sess_input.setPlaceholderText("Session name…")
@@ -203,7 +203,6 @@ class DropZoneOverlay(QWidget):
         """Triggers the fade in -> hold -> fade out sequence"""
         self._confirm_anim.stop()
         
-        # Create a sequential animation: fade in -> pause -> fade out
         seq = QSequentialAnimationGroup(self)
         
         fade_in = QPropertyAnimation(self, b"confirmAlpha", self)
@@ -226,7 +225,6 @@ class DropZoneOverlay(QWidget):
         seq.finished.connect(self._on_confirm_anim_finished)
         seq.start()
         
-        # Keep reference to prevent GC
         self._current_confirm_seq = seq
 
     def _on_confirm_anim_finished(self):
@@ -547,9 +545,8 @@ class DropZoneOverlay(QWidget):
         self._refresh_sessions()
         self.update()
         
-        # Trigger the text animation instead of using a timer for the whole state
         self._trigger_confirm_animation()
-        self._confirm_timer.start(1500)  # Total time before sliding out
+        self._confirm_timer.start(1500)
 
     def _create_new_session(self):
         name = self._new_sess_input.text().strip() or "My Workspace"
@@ -687,15 +684,13 @@ class DropZoneOverlay(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
 
-        if self._drop_confirmed or self._confirm_alpha > 0.01:
-            self._paint_folder(p)
+        self._paint_folder(p)
+        
+        if self._cards_visible or self._picker_mode or self._drop_confirmed:
             self._paint_cards(p)
-        else:
-            self._paint_folder(p)
-            if self._cards_visible or self._picker_mode:
-                self._paint_cards(p)
-            if self._picker_mode:
-                self._paint_picker_hint(p)
+            
+        if self._picker_mode and not self._drop_confirmed:
+            self._paint_picker_hint(p)
 
         p.end()
 
@@ -954,7 +949,6 @@ class DropZoneOverlay(QWidget):
         hover_strength = max(0.0, (scale - 1.0) / 0.05)
         angle = self._glow_angle(card_index)
 
-        # Paint glow border
         if hover_strength > 0.01:
             self._paint_glow_border(
                 p, cx, cy, cw, ch, angle,
@@ -963,20 +957,16 @@ class DropZoneOverlay(QWidget):
                 hover_strength, r,
             )
 
-        # Background: Always use normal colors, never green
         if scale > 1.01:
             p.fillPath(bg_path, CARD_HOVER_BG)
         else:
             p.fillPath(bg_path, CARD_BG)
 
-        # Icon
         icon_x, icon_y, icon_w, icon_h = cx + 10, cy + 10, 50, 50
         icon_path = QPainterPath()
         icon_path.addRoundedRect(icon_x, icon_y, icon_w, icon_h, 10, 10)
 
-        # If confirmed, icon turns green temporarily; otherwise normal
         if is_confirmed and self._confirm_alpha > 0.01:
-            # Blend to green based on confirm alpha
             ig = QLinearGradient(icon_x, icon_y, icon_x, icon_y + icon_h)
             ig.setColorAt(0, QColor("#42d778"))
             ig.setColorAt(1, QColor("#1a8a40"))
@@ -990,7 +980,6 @@ class DropZoneOverlay(QWidget):
             ig.setColorAt(1, GRAD_BOT)
         p.fillPath(icon_path, ig)
 
-        # Icon content: Checkmark appears with animation when confirmed
         if is_confirmed and self._confirm_alpha > 0.01:
             p.setOpacity(self._confirm_alpha)
             p.setPen(TEXT_WHITE)
@@ -1007,7 +996,6 @@ class DropZoneOverlay(QWidget):
         tx = cx + 70
         tw = cw - 80
         
-        # Session name (always visible, never replaced)
         name = sess.get("name", "Session") if sess else "Session"
         items = db.get_items(sess["id"]) if sess else []
         n_items = len(items)
@@ -1015,17 +1003,13 @@ class DropZoneOverlay(QWidget):
         p.setPen(TEXT_WHITE)
         p.setFont(QFont("Helvetica Neue", 11, QFont.Weight.Bold))
         fm = QFontMetrics(p.font())
-        name_width = tw - 60  # Reserve space for "Saved" badge
+        name_width = tw - 60
         p.drawText(QRect(tx, cy + 10, name_width, 22),
                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                    fm.elidedText(name, Qt.TextElideMode.ElideRight, name_width))
 
-        # Item count or "Saved!" badge with animation
         if is_confirmed:
-            # Animate the "Saved!" text sliding in from right
             slide_offset = int((1.0 - self._confirm_alpha) * 20)
-            
-            # Draw "Saved!" in green, sliding in and fading in
             badge_x = cx + cw - 60 - slide_offset
             badge_rect = QRect(badge_x, cy + 10, 50, 20)
             
@@ -1037,13 +1021,11 @@ class DropZoneOverlay(QWidget):
                        "Saved!")
             p.setOpacity(1.0)
             
-            # Subtle green glow behind the badge
             if self._confirm_alpha > 0.1:
                 glow_rect = QRectF(badge_x - 5, cy + 8, 60, 24)
                 glow_color = QColor(66, 215, 120, int(40 * self._confirm_alpha))
                 p.fillRect(glow_rect, glow_color)
         else:
-            # Normal item count on the right
             time_str = "active" if is_active else f"{n_items} items"
             p.setPen(TEXT_DIM)
             p.setFont(QFont("Helvetica Neue", 8))
@@ -1051,21 +1033,17 @@ class DropZoneOverlay(QWidget):
                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
                        time_str)
 
-        # Subtitle: item count (or confirmed label during confirmation)
         p.setPen(TEXT_DIM)
         p.setFont(QFont("Helvetica Neue", 9))
         if is_confirmed and self._confirm_alpha > 0.01 and self._confirmed_label:
-            # Fade between normal subtitle and confirmed label
             subtitle_text = f"{n_items} item{'s' if n_items != 1 else ''} saved"
             confirmed_text = self._confirmed_label
             
-            # Draw normal subtitle fading out
             p.setOpacity(1.0 - self._confirm_alpha * 0.8)
             p.drawText(QRect(tx, cy + 36, tw, 20),
                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                        subtitle_text)
             
-            # Draw confirmed label fading in (green tint)
             p.setOpacity(self._confirm_alpha)
             p.setPen(QColor(100, 200, 140))
             elided = QFontMetrics(p.font()).elidedText(
