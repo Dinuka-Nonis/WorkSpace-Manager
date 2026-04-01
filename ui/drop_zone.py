@@ -35,18 +35,18 @@ from PyQt6.QtGui import (
 import db
 
 # ── Dimensions ────────────────────────────────────────────────────────────────
-FOLDER_W        = 110          # folder icon width
-FOLDER_H        = 90           # folder icon height
-EDGE_PEEK       = 18           # px visible when hidden (just the tab)
-TOP_MARGIN      = 40           # distance from screen top
-WIDGET_W        = 340          # total overlay width (folder + cards)
-WIDGET_H        = 560          # total overlay height
+FOLDER_W        = 130          # folder icon width
+FOLDER_H        = 108          # folder icon height
+EDGE_PEEK       = 0            # px visible when hidden — fully off screen
+TOP_MARGIN      = 60           # distance from screen top
+WIDGET_W        = 360          # total overlay width (folder + cards)
+WIDGET_H        = 600          # total overlay height
 
-CARD_W          = 290
-CARD_H          = 70
+CARD_W          = 310
+CARD_H          = 72
 CARD_X          = 20           # x offset of cards inside widget
 CARD_GAP        = 10
-CARDS_START_Y   = FOLDER_H + 20   # y where first card rests (fully dropped)
+CARDS_START_Y   = FOLDER_H + 24   # y where first card rests (fully dropped)
 
 # Paper layers (3 sheets that fan out behind folder lid)
 PAPER_COUNT     = 3
@@ -58,16 +58,17 @@ FOLDER_TAB      = QColor("#C87A10")   # tab / top flap
 FOLDER_LID      = QColor("#F5A623")
 PAPER_COLORS    = [QColor("#E0E0E0"), QColor("#ECECEC"), QColor("#F5F5F5")]
 
-CARD_BG         = QColor("#353535")
-CARD_HOVER_BG   = QColor("#424242")
+# Card colors — match wallet_panel dark theme
+CARD_BG         = QColor("#1a1a24")
+CARD_HOVER_BG   = QColor("#252535")
 GRAD_TOP        = QColor("#d7cfcf")
 GRAD_BOT        = QColor("#9198e5")
 GRAD_HOVER_TOP  = QColor("#9198e5")
 GRAD_HOVER_BOT  = QColor("#712020")
-NEW_CARD_GRAD_T = QColor("#2a9d8f")
-NEW_CARD_GRAD_B = QColor("#264653")
+NEW_CARD_BG     = QColor("#1a1a24")
+NEW_CARD_ICON   = QColor("#635bff")
 TEXT_WHITE      = QColor(255, 255, 255)
-TEXT_DIM        = QColor(180, 180, 180)
+TEXT_DIM        = QColor(136, 136, 153)   # matches wallet #888899
 CONFIRM_GREEN   = QColor("#42d778")
 
 
@@ -125,10 +126,13 @@ class DropZoneOverlay(QWidget):
         self._new_sess_input.returnPressed.connect(self._create_new_session)
         self._new_sess_input.setStyleSheet("""
             QLineEdit {
-                background: #2a2a2a; color: #ffffff;
-                border: 1px solid #555; border-radius: 8px;
-                padding: 0 10px; font-size: 13px;
-                font-family: 'Poppins', 'Segoe UI', sans-serif;
+                background: #252535; color: #ffffff;
+                border: none; border-radius: 10px;
+                padding: 0 12px; font-size: 13px;
+                font-family: 'Helvetica Neue', 'Helvetica', sans-serif;
+            }
+            QLineEdit:focus {
+                background: #2e2e42;
             }
         """)
 
@@ -187,8 +191,8 @@ class DropZoneOverlay(QWidget):
         if not hasattr(self, "_screen_geo"):
             return
         geo    = self._screen_geo
-        # slide so only EDGE_PEEK px of the folder tab is visible when hidden
-        offset = int((FOLDER_W - EDGE_PEEK) * v)
+        # v=0 → fully visible, v=1 → completely off screen (no peek)
+        offset = int(WIDGET_W * v)
         self.move(
             geo.x() + geo.width() - WIDGET_W + offset,
             geo.y() + TOP_MARGIN
@@ -199,6 +203,8 @@ class DropZoneOverlay(QWidget):
         self._slide_anim.setStartValue(self._slide_x)
         self._slide_anim.setEndValue(0.0)
         self._slide_anim.start()
+        # Install global event filter so Esc works without focus
+        QApplication.instance().installEventFilter(self)
 
     def _slide_out(self):
         self._cards_visible = False
@@ -211,6 +217,11 @@ class DropZoneOverlay(QWidget):
         self._slide_anim.setStartValue(self._slide_x)
         self._slide_anim.setEndValue(1.0)
         self._slide_anim.start()
+        # Remove global event filter once hidden
+        try:
+            QApplication.instance().removeEventFilter(self)
+        except Exception:
+            pass
 
     # ── Fan property ──────────────────────────────────────────────────────────
 
@@ -246,48 +257,58 @@ class DropZoneOverlay(QWidget):
     # ── Card drop animations ──────────────────────────────────────────────────
 
     def _drop_cards(self):
-        """Drop session cards down one by one with stagger."""
+        """Drop session cards down one by one with stagger.
+        Cards already at 1.0 are NOT re-animated — they stay put."""
         n = len(self._sessions) + 1  # +1 for New Session card
-        # Rebuild drop progress list if needed
+
+        # Grow lists without resetting existing values
         while len(self._card_drops) < n:
             self._card_drops.append(0.0)
         while len(self._card_scales) < n:
             self._card_scales.append(1.0)
-        self._card_drops = self._card_drops[:n]
+        self._card_drops  = self._card_drops[:n]
         self._card_scales = self._card_scales[:n]
 
-        # Kill old anims
+        # Kill old pending anims and timers
         if hasattr(self, "_drop_anims"):
             for a in self._drop_anims:
                 a.stop()
+        if hasattr(self, "_drop_timers"):
+            for t in self._drop_timers:
+                t.stop()
 
-        self._drop_anims = []
+        self._drop_anims  = []
+        self._drop_timers = []
+
         for i in range(n):
-            prop = f"cardDrop{i}".encode()
-            # Dynamically create property per card index
+            # Skip cards that are already fully dropped
+            if self._card_drops[i] >= 0.99:
+                continue
+
             anim = _CardDropAnim(self, i, self._card_drops)
             anim.setDuration(340)
             anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-            anim.setStartValue(0.0)
+            anim.setStartValue(self._card_drops[i])   # resume from wherever they are
             anim.setEndValue(1.0)
-            # stagger
+
             delay_timer = QTimer(self)
             delay_timer.setSingleShot(True)
-            delay_index = i
-            delay_anim  = anim
-            def _start(a=delay_anim): a.start()
+            def _start(a=anim): a.start()
             delay_timer.timeout.connect(_start)
             delay_timer.start(i * 80)
             self._drop_anims.append(anim)
+            self._drop_timers.append(delay_timer)
 
     def _hide_cards(self):
-        """Slide all cards back up."""
+        """Slide all cards back up and reset drop state fully."""
+        if hasattr(self, "_drop_timers"):
+            for t in self._drop_timers:
+                t.stop()
         if hasattr(self, "_drop_anims"):
             for a in self._drop_anims:
                 a.stop()
-        n = len(self._card_drops)
-        for i in range(n):
-            self._card_drops[i] = 0.0
+        self._card_drops  = []
+        self._card_scales = []
         self.update()
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -310,8 +331,12 @@ class DropZoneOverlay(QWidget):
         self._drop_confirmed   = False
         self._picker_mode      = False
         self._cards_visible    = False
+        self._cards_dropped_once = False   # reset so first hover re-animates
         self._folder_hovered   = False
         self._new_sess_input.hide()
+        # Fully reset card drop state for fresh animation
+        self._hide_cards()
+        self._fan = 0.0
         self._refresh_sessions()
         self._slide_in()
         self.update()
@@ -328,25 +353,26 @@ class DropZoneOverlay(QWidget):
                 # New session card
                 self._show_new_session_input(app_info)
             else:
+                # Always show cards and enter picker mode to confirm
+                self._pending_app   = app_info
+                self._picker_mode   = True
                 self._active_session_id = self._sessions[card_i]["id"]
-                self._save_to_session(app_info, confirmed_card=card_i)
+                self.update()
             return
 
-        # Dropped on folder body
-        if not self._sessions:
-            self._show_new_session_input(app_info)
-        elif len(self._sessions) == 1:
-            self._active_session_id = self._sessions[0]["id"]
-            self._save_to_session(app_info, confirmed_card=0)
-        else:
-            # Multiple sessions — enter picker mode (cards should already be visible)
-            self._pending_app = app_info
-            self._picker_mode = True
-            self.update()
+        # Dropped on folder body — enter picker mode always (ask user)
+        self._pending_app = app_info
+        self._picker_mode = True
+        if not self._cards_visible:
+            self._cards_visible = True
+            self._open_fan()
+            self._drop_cards()
+        self.update()
 
     def on_drag_cancelled(self):
-        self._pending_app  = None
-        self._picker_mode  = False
+        self._pending_app        = None
+        self._picker_mode        = False
+        self._cards_dropped_once = False
         self._new_sess_input.hide()
         if not self._drop_confirmed:
             self._slide_out()
@@ -416,15 +442,17 @@ class DropZoneOverlay(QWidget):
             self._save_to_session(self._pending_app, confirmed_card=idx)
 
     def _finish_confirm(self):
-        self._drop_confirmed   = False
-        self._confirmed_card_i = -1
+        self._drop_confirmed     = False
+        self._confirmed_card_i   = -1
+        self._cards_dropped_once = False
         self._slide_out()
 
     def _cancel(self):
         self._confirm_timer.stop()
-        self._pending_app    = None
-        self._picker_mode    = False
-        self._drop_confirmed = False
+        self._pending_app        = None
+        self._picker_mode        = False
+        self._drop_confirmed     = False
+        self._cards_dropped_once = False
         self._new_sess_input.hide()
         self._slide_out()
 
@@ -465,13 +493,16 @@ class DropZoneOverlay(QWidget):
 
         if now_over_folder and not self._folder_hovered:
             self._folder_hovered = True
-            self._cards_visible  = True
             self._open_fan()
-            self._drop_cards()
+            # Only animate cards dropping the very first time per drag session
+            if not getattr(self, "_cards_dropped_once", False):
+                self._cards_dropped_once = True
+                self._cards_visible = True
+                self._drop_cards()
             self.update()
         elif not now_over_folder and self._folder_hovered:
             self._folder_hovered = False
-            # Don't hide cards once shown during a drag
+            # Cards stay visible once shown — don't hide or re-trigger
 
         # Update card hover states
         changed = False
@@ -508,6 +539,15 @@ class DropZoneOverlay(QWidget):
         # Cancel button area (bottom of widget)
         if y > WIDGET_H - 52:
             self._cancel()
+
+    def eventFilter(self, obj, event):
+        """Global event filter — catches Esc from any focused widget."""
+        from PyQt6.QtCore import QEvent
+        if event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Escape:
+                self._cancel()
+                return True
+        return False
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
@@ -553,22 +593,30 @@ class DropZoneOverlay(QWidget):
         fw   = fr.width()
         fh   = fr.height()
 
-        # ── Paper sheets behind folder (fan effect) ──
+        # ── Paper sheets — fan UPWARD out of the open folder ──────────────────
+        # When fan=0 papers are hidden inside body. fan=1 they stick up above.
         for sheet in range(PAPER_COUNT):
-            max_angle = 14 + sheet * 9           # degrees of rotation at full fan
-            angle     = fan * max_angle
-            color     = PAPER_COLORS[sheet]
+            if fan < 0.05:
+                break
+            # Each sheet sticks up a different amount and angles slightly
+            angle       = (sheet - 1) * 6 * fan           # -6, 0, +6 degrees
+            rise        = int(fan * (14 + sheet * 8))      # how far above body top
+            paper_h     = int(fh * 0.55)
+            paper_w     = fw - 14
+            paper_x     = fx + 7
+            paper_y     = fy + 14 - rise                   # rises upward
+            color       = PAPER_COLORS[PAPER_COUNT - 1 - sheet]
+
             p.save()
-            # Rotate from bottom-centre of folder
-            p.translate(fx + fw / 2, fy + fh)
-            p.rotate(-angle + (PAPER_COUNT - sheet - 1) * 3)
-            p.translate(-(fx + fw / 2), -(fy + fh))
+            p.translate(fx + fw / 2, fy + 14)             # rotate from hinge
+            p.rotate(angle)
+            p.translate(-(fx + fw / 2), -(fy + 14))
             pp = QPainterPath()
-            pp.addRoundedRect(fx + 6, fy + 10, fw - 12, fh - 10, 10, 10)
+            pp.addRoundedRect(paper_x, paper_y, paper_w, paper_h, 6, 6)
             p.fillPath(pp, color)
             p.restore()
 
-        # ── Folder body ──────────────────────────────
+        # ── Folder body ───────────────────────────────────────────────────────
         body = QPainterPath()
         body.addRoundedRect(fx, fy + 14, fw, fh - 14, 12, 12)
         grad = QLinearGradient(fx, fy + 14, fx, fy + fh)
@@ -576,55 +624,44 @@ class DropZoneOverlay(QWidget):
         grad.setColorAt(1, FOLDER_BODY2)
         p.fillPath(body, grad)
 
-        # Tab (top-left bump)
+        # Tab (top-left bump on back of folder)
         tab = QPainterPath()
-        tab.addRoundedRect(fx, fy + 4, fw * 0.45, 14, 6, 6)
+        tab.addRoundedRect(fx, fy + 4, fw * 0.42, 14, 6, 6)
         p.fillPath(tab, FOLDER_TAB)
 
-        # ── Lid (top flap, rotates open with fan) ────
-        lid_angle = fan * -46          # matches original CSS rotateX(-46deg) feel
+        # ── Lid — flips BACKWARD (upward) from hinge at top of body ──────────
+        # fan=0: lid is flat covering the top of the body.
+        # fan=1: lid has rotated ~180deg back (scale_y goes 1 → 0 → slightly negative).
+        # We clamp at a small positive so it never fully disappears.
+        hinge_y = fy + 14
         p.save()
-        p.translate(fx + fw / 2, fy + 14)
-        # We fake perspective with a vertical scale
-        scale_y = max(0.05, 1.0 - fan * 0.92)
+        p.translate(fx + fw / 2, hinge_y)
+        # scale_y: 1.0 at fan=0 (closed), shrinks to 0 at fan=0.5, then flips
+        # We only show the closing sweep (fan 0→0.5 → lid shrinks to nothing)
+        # beyond that the lid is behind the folder — invisible.
+        raw_scale = 1.0 - fan * 2.0          # 1 → -1
+        scale_y   = max(-0.08, raw_scale)    # allow a tiny flip-past for realism
         p.scale(1.0, scale_y)
-        p.translate(-(fx + fw / 2), -(fy + 14))
-        lid_right_w = fw * 0.55
+        p.translate(-(fx + fw / 2), -hinge_y)
+
         lid = QPainterPath()
-        lid.moveTo(fx + fw * 0.45, fy + 14)
-        lid.lineTo(fx + fw, fy + 14)
-        lid.lineTo(fx + fw, fy + fh * 0.38)
-        lid.lineTo(fx + fw * 0.45, fy + fh * 0.38)
-        lid.closeSubpath()
-        # Small connector triangle
-        tri = QPainterPath()
-        tri.moveTo(fx + fw * 0.45 - 6, fy + 14)
-        tri.lineTo(fx + fw * 0.45, fy + 4)
-        tri.lineTo(fx + fw * 0.45, fy + 14)
-        tri.closeSubpath()
-        lid_grad = QLinearGradient(fx, fy, fx, fy + fh * 0.5)
-        lid_grad.setColorAt(0, FOLDER_LID.lighter(108))
+        lid.addRoundedRect(fx + 1, fy, fw - 2, 18, 6, 6)
+        lid_grad = QLinearGradient(fx, fy, fx, fy + 18)
+        lid_grad.setColorAt(0, FOLDER_LID.lighter(118))
         lid_grad.setColorAt(1, FOLDER_LID)
         p.fillPath(lid, lid_grad)
-        p.fillPath(tri, FOLDER_BODY2)
-
-        # Glow rim on lid when hovered
-        if self._folder_hovered or fan > 0.1:
-            p.setPen(QPen(QColor(255, 200, 80, 120), 1.5))
-            p.drawPath(lid)
         p.restore()
 
-        # Drop-target glow ring when dragging
-        if self._pending_app and not self._drop_confirmed:
-            glow = QPainterPath()
-            glow.addRoundedRect(fx - 3, fy - 3, fw + 6, fh + 6, 14, 14)
-            p.setPen(QPen(QColor(245, 166, 35, 160), 2.0))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawPath(glow)
+        # ── Interior shadow when open — gives depth ───────────────────────────
+        if fan > 0.5:
+            alpha = int((fan - 0.5) * 2 * 60)
+            inner = QPainterPath()
+            inner.addRoundedRect(fx + 4, fy + 16, fw - 8, 20, 4, 4)
+            p.fillPath(inner, QColor(0, 0, 0, alpha))
 
         # Label
-        p.setPen(QColor(80, 50, 10))
-        f = QFont("Segoe UI", 7, QFont.Weight.Bold)
+        p.setPen(QColor(100, 60, 10))
+        f = QFont("Helvetica Neue", 7, QFont.Weight.Bold)
         p.setFont(f)
         p.drawText(QRect(fx, fy + fh - 20, fw, 18),
                    Qt.AlignmentFlag.AlignCenter, "WORKSPACE")
@@ -664,27 +701,25 @@ class DropZoneOverlay(QWidget):
             p.scale(scale, scale)
             p.translate(-cx_centre, -cy_centre)
 
-            # Card background
+            # Card background — hover just lightens, no outline ever
             cr = QRectF(CARD_X, cy, CARD_W, CARD_H)
             bg_path = QPainterPath()
-            bg_path.addRoundedRect(cr, 20, 20)
+            bg_path.addRoundedRect(cr, 14, 14)
 
             if is_confirmed:
                 p.fillPath(bg_path, CONFIRM_GREEN.darker(110))
             elif is_new:
-                grad = QLinearGradient(CARD_X, cy, CARD_X, cy + CARD_H)
-                grad.setColorAt(0, NEW_CARD_GRAD_T)
-                grad.setColorAt(1, NEW_CARD_GRAD_B)
-                p.fillPath(bg_path, grad)
+                # New session card — same dark background, purple icon accent
+                hover_alpha = 255 if scale > 1.01 else 230
+                bg = QColor(CARD_BG)
+                bg.setAlpha(hover_alpha)
+                new_bg = QColor("#1e1e2e") if scale <= 1.01 else QColor("#262638")
+                p.fillPath(bg_path, new_bg)
             else:
-                bg_col = CARD_HOVER_BG if scale > 1.01 else CARD_BG
-                p.fillPath(bg_path, bg_col)
-
-            # Active session indicator (subtle border)
-            if is_active and not is_new:
-                p.setPen(QPen(QColor(245, 166, 35, 200), 2.0))
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                p.drawPath(bg_path)
+                if scale > 1.01:
+                    p.fillPath(bg_path, CARD_HOVER_BG)
+                else:
+                    p.fillPath(bg_path, CARD_BG)
 
             # Gradient square (icon area)  — matches your HTML .img
             icon_x = CARD_X + 10
@@ -700,10 +735,9 @@ class DropZoneOverlay(QWidget):
                 icon_grad.setColorAt(1, QColor("#1a8a40"))
             elif is_new:
                 icon_grad = QLinearGradient(icon_x, icon_y, icon_x, icon_y + icon_h)
-                icon_grad.setColorAt(0, NEW_CARD_GRAD_B)
-                icon_grad.setColorAt(1, NEW_CARD_GRAD_T)
+                icon_grad.setColorAt(0, QColor("#7c74ff"))
+                icon_grad.setColorAt(1, QColor("#635bff"))
             elif scale > 1.01:
-                # hover state — matches .card:hover > .img
                 icon_grad = QLinearGradient(icon_x, icon_y, icon_x, icon_y + icon_h)
                 icon_grad.setColorAt(0, GRAD_HOVER_TOP)
                 icon_grad.setColorAt(1, GRAD_HOVER_BOT)
@@ -715,7 +749,7 @@ class DropZoneOverlay(QWidget):
 
             # Icon centre text
             p.setPen(TEXT_WHITE)
-            p.setFont(QFont("Segoe UI", 16))
+            p.setFont(QFont("Helvetica Neue", 16))
             p.drawText(QRect(icon_x, icon_y, icon_w, icon_h),
                        Qt.AlignmentFlag.AlignCenter,
                        "✓" if is_confirmed else ("＋" if is_new else "◈"))
@@ -727,13 +761,13 @@ class DropZoneOverlay(QWidget):
             if is_confirmed:
                 # Title
                 p.setPen(TEXT_WHITE)
-                p.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+                p.setFont(QFont("Helvetica Neue", 11, QFont.Weight.Bold))
                 p.drawText(QRect(tx, cy + 10, tw, 22),
                            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                            "Saved!")
                 # Body
                 p.setPen(TEXT_DIM)
-                p.setFont(QFont("Segoe UI", 9))
+                p.setFont(QFont("Helvetica Neue", 9))
                 fm  = QFontMetrics(p.font())
                 lbl = fm.elidedText(self._confirmed_label,
                                     Qt.TextElideMode.ElideRight, tw)
@@ -743,12 +777,12 @@ class DropZoneOverlay(QWidget):
 
             elif is_new:
                 p.setPen(TEXT_WHITE)
-                p.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+                p.setFont(QFont("Helvetica Neue", 11, QFont.Weight.Bold))
                 p.drawText(QRect(tx, cy + 10, tw - 10, 22),
                            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                            "New Session")
                 p.setPen(TEXT_DIM)
-                p.setFont(QFont("Segoe UI", 9))
+                p.setFont(QFont("Helvetica Neue", 9))
                 p.drawText(QRect(tx, cy + 36, tw, 20),
                            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                            "Create a new workspace")
@@ -758,25 +792,22 @@ class DropZoneOverlay(QWidget):
                 n_items  = len(items)
                 time_str = "active" if is_active else f"{n_items} items"
 
-                # .h1 — session name (bold, 16px equivalent)
                 p.setPen(TEXT_WHITE)
-                p.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+                p.setFont(QFont("Helvetica Neue", 11, QFont.Weight.Bold))
                 fm   = QFontMetrics(p.font())
                 name_elided = fm.elidedText(name, Qt.TextElideMode.ElideRight, tw - 60)
                 p.drawText(QRect(tx, cy + 10, tw - 60, 22),
                            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                            name_elided)
 
-                # .span — time / status (10px, right side)
                 p.setPen(TEXT_DIM)
-                p.setFont(QFont("Segoe UI", 8))
+                p.setFont(QFont("Helvetica Neue", 8))
                 p.drawText(QRect(tx, cy + 10, tw - 4, 22),
                            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
                            time_str)
 
-                # .p — item count (lighter, 12px)
                 p.setPen(TEXT_DIM)
-                p.setFont(QFont("Segoe UI", 9))
+                p.setFont(QFont("Helvetica Neue", 9))
                 p.drawText(QRect(tx, cy + 36, tw, 20),
                            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                            f"{n_items} item{'s' if n_items != 1 else ''} saved")
@@ -801,15 +832,15 @@ class DropZoneOverlay(QWidget):
 
     def _paint_picker_hint(self, p: QPainter):
         fr = self._folder_rect()
-        p.setPen(QColor(245, 166, 35, 200))
-        p.setFont(QFont("Segoe UI", 8))
+        p.setPen(QColor(136, 136, 153, 200))
+        p.setFont(QFont("Helvetica Neue", 8))
         p.drawText(QRect(fr.x() - 10, fr.y() + FOLDER_H + 4, FOLDER_W + 20, 16),
                    Qt.AlignmentFlag.AlignCenter, "tap a session ↓")
 
     def _paint_cancel_hint(self, p: QPainter):
         if self._pending_app or self._picker_mode:
-            p.setPen(QColor(180, 180, 180, 120))
-            p.setFont(QFont("Segoe UI", 8))
+            p.setPen(QColor(136, 136, 153, 140))
+            p.setFont(QFont("Helvetica Neue", 8))
             p.drawText(QRect(0, WIDGET_H - 28, WIDGET_W, 20),
                        Qt.AlignmentFlag.AlignCenter, "Esc to cancel")
 

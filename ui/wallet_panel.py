@@ -398,19 +398,40 @@ class WalletPanel(QWidget):
 
 class _PanelHeader(QWidget):
     def __init__(self, parent=None):
-        super().__init__(parent); self.setFixedHeight(60)
+        super().__init__(parent); self.setFixedHeight(64)
         self.setStyleSheet("background:transparent;")
-        lay = QHBoxLayout(self); lay.setContentsMargins(18,0,18,0)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 12, 18, 8)
+        lay.setSpacing(4)
+
+        # Title row
+        title_row = QHBoxLayout()
+        title_row.setSpacing(0)
         t = QLabel("Workspace Sessions")
         t.setStyleSheet(f"color:{TEXT_WHITE.name()};font-size:14px;font-weight:700;"
                         f"font-family:'Helvetica Neue','Helvetica',sans-serif;background:transparent;")
-        lay.addWidget(t); lay.addStretch()
-        h = QLabel("Ctrl+Shift+Space")
-        h.setStyleSheet(f"color:{TEXT_MUTED.name()};font-size:10px;"
-                        f"font-family:'Helvetica Neue','Helvetica',sans-serif;"
-                        f"background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.08);"
-                        f"border-radius:5px;padding:3px 7px;")
-        lay.addWidget(h)
+        title_row.addWidget(t)
+        title_row.addStretch()
+        lay.addLayout(title_row)
+
+        # Hotkey row — bar style
+        hotkey_row = QHBoxLayout()
+        hotkey_row.setSpacing(4)
+        hotkey_label = QLabel("Hotkey")
+        hotkey_label.setStyleSheet(f"color:{TEXT_MUTED.name()};font-size:9px;"
+                                   f"font-family:'Helvetica Neue','Helvetica',sans-serif;"
+                                   f"background:transparent;")
+        hotkey_row.addWidget(hotkey_label)
+        for key in ["Ctrl", "Shift", "Space"]:
+            k = QLabel(key)
+            k.setStyleSheet(f"color:rgba(255,255,255,0.45);font-size:9px;font-weight:600;"
+                            f"font-family:'Helvetica Neue','Helvetica',sans-serif;"
+                            f"background:rgba(255,255,255,0.06);border-radius:4px;"
+                            f"padding:1px 6px;")
+            hotkey_row.addWidget(k)
+        hotkey_row.addStretch()
+        lay.addLayout(hotkey_row)
+
     def paintEvent(self, e):
         p = QPainter(self); p.setPen(QPen(PANEL_BORDER, 1.0))
         p.drawLine(0, self.height()-1, self.width(), self.height()-1); p.end()
@@ -418,12 +439,12 @@ class _PanelHeader(QWidget):
 
 class _PanelFooter(QWidget):
     def __init__(self, parent=None):
-        super().__init__(parent); self.setFixedHeight(52)
+        super().__init__(parent); self.setFixedHeight(44)
         self.setStyleSheet("background:transparent;")
         lay = QHBoxLayout(self); lay.setContentsMargins(18,0,18,0)
-        h = QLabel("Drag any window to the right edge of your screen to save it")
-        h.setWordWrap(True)
-        h.setStyleSheet(f"color:{TEXT_MUTED.name()};font-size:10px;"
+        h = QLabel("Drag any window to the right edge to save")
+        h.setWordWrap(False)
+        h.setStyleSheet(f"color:{TEXT_MUTED.name()};font-size:9px;"
                         f"font-family:'Helvetica Neue','Helvetica',sans-serif;background:transparent;")
         lay.addWidget(h)
     def paintEvent(self, e):
