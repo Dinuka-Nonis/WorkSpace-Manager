@@ -1,15 +1,10 @@
 """
 ui/wallet_panel.py — Hotkey-toggled floating wallet panel.
 
-v6 changes:
-  • Fixed square bottom corners — panel now fully rounded everywhere
-  • Glow animation is more vivid and visible (higher opacity, brighter colours)
-  • Animation duration slowed to 420 ms (expand) and 400 ms (slide-in)
-  • Delete × moved below the session name so it never overlaps the timestamp
-  • Item rows use soft blended backgrounds — no harsh separator lines
-  • Header simplified to just the title (keyboard hint removed)
-  • Font: Helvetica Neue Bold throughout
-  • "Restore Session" bar uses a blended gradient, no hard top line
+v10 changes:
+  • Skeleton shimmer animation completely removed (no vertical line artifacts)
+  • Clean solid color transition between states
+  • Simplified paint logic, no timer-based background animations
 """
 
 from datetime import datetime
@@ -24,40 +19,33 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QPainter, QColor, QPainterPath, QFont, QPen,
-    QLinearGradient, QConicalGradient, QRadialGradient,
-    QFontMetrics,
+    QLinearGradient, QFontMetrics,
 )
 import db
 
-# ── Palette ───────────────────────────────────────────────────────────────────
-BG_PANEL      = QColor("#0d0d14")
-BG_CARD       = QColor("#13131e")
-BG_CARD_HOV   = QColor("#1c1c2e")
-BG_ITEM_ROW   = QColor("#181828")
-BORDER        = QColor("#1e1e2e")
-BORDER_CARD   = QColor("#252538")
-TEXT_PRIMARY  = QColor("#e9e9f0")
-TEXT_DIM      = QColor("#7a7a90")
-TEXT_MUTED    = QColor("#3a3a54")
-ACCENT_DEL    = QColor("#e3616a")
-ACCENT_GREEN  = QColor("#42d778")
-ACCENT_AMBER  = QColor("#f59e0b")
-RESTORE_BG    = QColor("#14142a")
-RESTORE_HOV   = QColor("#1e1e40")
+# ── Grayscale Palette ─────────────────────────────────────────────────────────
+GRAY_BASE     = QColor("#2a2a2a")  # Card default
+GRAY_HOVER    = QColor("#454545")  # Hover state - noticeably different
+GRAY_DARK     = QColor("#1f1f1f")  # Deep background
+GRAY_DEEP     = QColor("#1a1a1a")  # Panel background
+GRAY_ROW      = QColor("#353535")  # Item rows
 
-# Vivid glow colours — brighter so the animation is clearly visible
-GLOW_A        = QColor("#3a55cc")
-GLOW_B        = QColor("#9a28b8")
-GLOW_PURPLE   = QColor("#b8a8f0")
-GLOW_PINK2    = QColor("#f0b8e8")
+BORDER        = QColor("#505050")  # Subtle borders
+BORDER_CARD   = QColor("#555555")  # Card borders
+TEXT_PRIMARY  = QColor("#e9e9e9")  # Near white
+TEXT_DIM      = QColor("#999999")  # Medium gray
+TEXT_MUTED    = QColor("#666666")  # Darker gray
+ACCENT_DEL    = QColor("#e3616a")  # Keep red for delete
+ACCENT_GREEN  = QColor("#5cb85c")  # Softer green
+ACCENT_AMBER  = QColor("#f0ad4e")  # Softer amber
 
-ICON_GRADS = [
-    (QColor("#d7cfcf"), QColor("#9198e5")),
-    (QColor("#9198e5"), QColor("#712020")),
-    (QColor("#5a9e6f"), QColor("#2d6b42")),
-    (QColor("#5a8a9e"), QColor("#2d5a6b")),
-    (QColor("#9e8a5a"), QColor("#6b5a2d")),
-    (QColor("#7a5a9e"), QColor("#4a2d6b")),
+ICON_TINTS = [
+    (QColor("#555555"), QColor("#2a2a2a")),
+    (QColor("#4a4a4a"), QColor("#333333")),
+    (QColor("#525252"), QColor("#2e2e2e")),
+    (QColor("#484848"), QColor("#2c2c2c")),
+    (QColor("#505050"), QColor("#303030")),
+    (QColor("#464646"), QColor("#2d2d2d")),
 ]
 
 PANEL_WIDTH      = 340
@@ -66,6 +54,10 @@ CARD_H_COLL      = 76
 CARD_ITEM_H      = 38
 CARD_FOOTER_H    = 48
 CARD_EXPAND_CAP  = 6
+
+DEL_W, DEL_H   = 26, 18
+DEL_MARGIN_R   = 10
+DEL_MARGIN_T   = 10
 
 _FONT_FAMILY = "'Helvetica Neue', Helvetica, Arial, sans-serif"
 
@@ -137,19 +129,11 @@ class SessionCard(QWidget):
         self._restoring  = False
         self._items: list = []
 
-        # ── Expand animation (slower: 420 ms) ────────────────────────────────
+        # Expand animation (height only)
         self._t = 0.0
         self._anim = QPropertyAnimation(self, b"expandT", self)
         self._anim.setDuration(420)
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-
-        # ── Glow angle state ──────────────────────────────────────────────────
-        self._glow_angle  = 83.0
-        self._glow_target = 83.0
-
-        self._glow_timer = QTimer(self)
-        self._glow_timer.setInterval(16)
-        self._glow_timer.timeout.connect(self._tick_glow)
 
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -159,19 +143,6 @@ class SessionCard(QWidget):
         self._sync_height()
         self._restore_bar_y = 9999
 
-    # ── Glow tick ─────────────────────────────────────────────────────────────
-    def _tick_glow(self):
-        diff = self._glow_target - self._glow_angle
-        if abs(diff) > 0.3:
-            # Slower lerp factor (0.04 vs 0.06) for a more languid spin
-            self._glow_angle += diff * 0.04
-            self.update()
-        else:
-            self._glow_angle = self._glow_target
-            if self._t < 0.01:
-                self._glow_timer.stop()
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
     def _reload_items(self):
         self._items = db.get_items(self._session["id"])
 
@@ -185,7 +156,11 @@ class SessionCard(QWidget):
     def _sync_height(self):
         self.setFixedHeight(self._target_h())
 
-    # ── Animated property ─────────────────────────────────────────────────────
+    def _del_rect(self) -> QRect:
+        w = self.width()
+        x = w - DEL_MARGIN_R - DEL_W
+        return QRect(x, DEL_MARGIN_T, DEL_W, DEL_H)
+
     def getExpandT(self) -> float:
         return self._t
 
@@ -207,198 +182,108 @@ class SessionCard(QWidget):
         self._restoring = v
         self.update()
 
-    # ── Mouse ─────────────────────────────────────────────────────────────────
     def enterEvent(self, e):
         self._anim.stop()
         self._anim.setStartValue(self._t)
         self._anim.setEndValue(1.0)
         self._anim.start()
-        self._glow_target = self._glow_angle + 180.0
-        self._glow_timer.start()
 
     def leaveEvent(self, e):
         self._anim.stop()
         self._anim.setStartValue(self._t)
         self._anim.setEndValue(0.0)
         self._anim.start()
-        self._glow_target = round(self._glow_angle / 360) * 360 + 83.0
-        self._glow_timer.start()
 
     def mousePressEvent(self, e):
         x = int(e.position().x())
         y = int(e.position().y())
         w = self.width()
 
-        # Delete button is now in the lower-left of the collapsed header area
-        if self._t > 0.3 and x < 48 and CARD_H_COLL - 24 < y < CARD_H_COLL - 4:
+        # Delete button
+        dr = self._del_rect()
+        if dr.contains(x, y) and self._t > 0.05:
             self.delete_requested.emit(self._session["id"])
             return
 
+        # Restore bar
         if self._t > 0.5 and y >= self._restore_bar_y:
             if not self._restoring:
                 self.restore_requested.emit(self._session["id"])
             return
 
+        # Item row remove
         if self._t > 0.3 and y > CARD_H_COLL + 8:
             row_idx = (y - CARD_H_COLL - 12) // CARD_ITEM_H
             if 0 <= row_idx < len(self._items) and x > w - 38:
                 self.remove_item.emit(self._items[row_idx]["id"])
 
-    # ── Glow border painter ────────────────────────────────────────────────────
-    def _paint_glow_border(
-        self, p: QPainter, w: int, h: int,
-        angle: float, strength: float, r: float = 14.0,
-    ):
-        cx_mid = w / 2
-        cy_mid = h / 2
-
-        # Outer ambient radial glow (more opaque)
-        for color, radius, base_alpha in [
-            (GLOW_A, w * 1.0, 60),
-            (GLOW_B, w * 0.8, 45),
-        ]:
-            a = int(base_alpha * strength)
-            if a < 2:
-                continue
-            rg = QRadialGradient(cx_mid, cy_mid, radius)
-            rg.setColorAt(0.0, QColor(color.red(), color.green(), color.blue(), a))
-            rg.setColorAt(1.0, QColor(0, 0, 0, 0))
-            glow_path = QPainterPath()
-            glow_path.addRoundedRect(QRectF(-20, -12, w + 40, h + 24), r + 8, r + 8)
-            p.setOpacity(1.0)
-            p.fillPath(glow_path, rg)
-
-        # Dark inner shadow ring
-        dark_path = QPainterPath()
-        dark_path.addRoundedRect(QRectF(-1, -1, w + 2, h + 2), r + 1, r + 1)
-        cg_dark = QConicalGradient(cx_mid, cy_mid, angle + 2)
-        cg_dark.setColorAt(0.00, QColor(0, 0, 0, 0))
-        cg_dark.setColorAt(0.05, QColor("#0a0830"))
-        cg_dark.setColorAt(0.10, QColor(0, 0, 0, 0))
-        cg_dark.setColorAt(0.50, QColor(0, 0, 0, 0))
-        cg_dark.setColorAt(0.60, QColor("#2d0840"))
-        cg_dark.setColorAt(0.65, QColor(0, 0, 0, 0))
-        cg_dark.setColorAt(1.00, QColor(0, 0, 0, 0))
-        p.setOpacity(strength)
-        p.fillPath(dark_path, cg_dark)
-
-        # Conic border ring (brighter stops)
-        border_outer = QPainterPath()
-        border_outer.addRoundedRect(QRectF(-2, -2, w + 4, h + 4), r + 2, r + 2)
-        border_inner = QPainterPath()
-        border_inner.addRoundedRect(QRectF(0, 0, w, h), r, r)
-        border_ring = border_outer.subtracted(border_inner)
-
-        cg_border = QConicalGradient(cx_mid, cy_mid, angle)
-        cg_border.setColorAt(0.00, QColor("#181420"))
-        cg_border.setColorAt(0.05, GLOW_A)
-        cg_border.setColorAt(0.14, QColor("#181420"))
-        cg_border.setColorAt(0.50, QColor("#181420"))
-        cg_border.setColorAt(0.60, GLOW_B)
-        cg_border.setColorAt(0.64, QColor("#181420"))
-        cg_border.setColorAt(1.00, QColor("#181420"))
-        p.setOpacity(strength)
-        p.fillPath(border_ring, cg_border)
-
-        # Soft inner highlight ring
-        white_outer = QPainterPath()
-        white_outer.addRoundedRect(QRectF(0, 0, w, h), r, r)
-        white_inner = QPainterPath()
-        white_inner.addRoundedRect(QRectF(2, 2, w - 4, h - 4), r - 2, r - 2)
-        white_ring = white_outer.subtracted(white_inner)
-
-        cg_white = QConicalGradient(cx_mid, cy_mid, angle + 3)
-        cg_white.setColorAt(0.00, QColor(0, 0, 0, 0))
-        cg_white.setColorAt(0.04, GLOW_PURPLE)
-        cg_white.setColorAt(0.08, QColor(0, 0, 0, 0))
-        cg_white.setColorAt(0.50, QColor(0, 0, 0, 0))
-        cg_white.setColorAt(0.55, GLOW_PINK2)
-        cg_white.setColorAt(0.60, QColor(0, 0, 0, 0))
-        cg_white.setColorAt(1.00, QColor(0, 0, 0, 0))
-        p.setOpacity(strength * 0.8)
-        p.fillPath(white_ring, cg_white)
-
-        p.setOpacity(1.0)
-
-    # ── Paint ─────────────────────────────────────────────────────────────────
     def paintEvent(self, event):
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
 
         t    = self._t
         w    = self.width()
         h    = self.height()
         sess = self._session
-        r    = 14.0
+        r    = 18.0
 
-        glow_strength = min(t * 1.6, 1.0)
-
-        # ── Glow border ───────────────────────────────────────────────────────
-        if glow_strength > 0.02:
-            self._paint_glow_border(p, w, h, self._glow_angle, glow_strength, r)
-
-        # ── Card background (blended gradient) ────────────────────────────────
+        # ── Clean Solid Background ────────────────────────────────────────────
+        # Simple interpolation between base and hover color - no animations
         def lerp_color(a: QColor, b: QColor, f: float) -> QColor:
             return QColor(
                 int(a.red()   + (b.red()   - a.red())   * f),
                 int(a.green() + (b.green() - a.green()) * f),
                 int(a.blue()  + (b.blue()  - a.blue())  * f),
             )
-
-        bg_top = lerp_color(BG_CARD, BG_CARD_HOV, t)
-        bg_bot = lerp_color(
-            QColor("#0f0f1a"), QColor("#161626"), t
-        )
+        
+        bg = lerp_color(GRAY_BASE, GRAY_HOVER, t)
+        
         card_path = QPainterPath()
-        card_path.addRoundedRect(0, 0, w, h, r, r)
+        card_path.addRoundedRect(QRectF(0, 0, w, h), r, r)
+        p.fillPath(card_path, bg)
 
-        card_grad = QLinearGradient(0, 0, 0, h)
-        card_grad.setColorAt(0.0, bg_top)
-        card_grad.setColorAt(1.0, bg_bot)
-        p.fillPath(card_path, card_grad)
+        # ── Clean 1px Border ──────────────────────────────────────────────────
+        border_alpha = int(70 + 50 * t)
+        p.setPen(QPen(QColor(85, 85, 85, border_alpha), 1.0))
+        border_path = QPainterPath()
+        border_path.addRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), r, r)
+        p.drawPath(border_path)
 
-        # Subtle border
-        border_alpha = int(80 + 60 * t)
-        p.setPen(QPen(QColor(BORDER_CARD.red(), BORDER_CARD.green(),
-                             BORDER_CARD.blue(), border_alpha), 1.0))
-        bd = QPainterPath()
-        bd.addRoundedRect(0.5, 0.5, w - 1, h - 1, r, r)
-        p.drawPath(bd)
-
-        # ── Gradient icon ─────────────────────────────────────────────────────
-        ic_top, ic_bot = ICON_GRADS[self._index % len(ICON_GRADS)]
+        # ── Icon ──────────────────────────────────────────────────────────────
+        ic_top, ic_bot = ICON_TINTS[self._index % len(ICON_TINTS)]
         icon_x, icon_y, icon_w, icon_h = 12, 13, 50, 50
+        
         ip = QPainterPath()
-        ip.addRoundedRect(icon_x, icon_y, icon_w, icon_h, 10, 10)
+        ip.addRoundedRect(QRectF(icon_x, icon_y, icon_w, icon_h), 14, 14)
         ig = QLinearGradient(icon_x, icon_y, icon_x, icon_y + icon_h)
         ig.setColorAt(0.0, ic_top)
         ig.setColorAt(1.0, ic_bot)
         p.fillPath(ip, ig)
 
-        p.setPen(QColor(255, 255, 255, 230))
+        p.setPen(QColor(255, 255, 255, 240))
         p.setFont(_font(16, bold=True))
         p.drawText(QRect(icon_x, icon_y, icon_w, icon_h),
                    Qt.AlignmentFlag.AlignCenter,
                    sess.get("name", "?")[0].upper())
 
-        # ── Session name ──────────────────────────────────────────────────────
+        # ── Session Name ──────────────────────────────────────────────────────
         name_font = _font(12, bold=True)
-        name_max  = w - 82 - 70
+        name_max  = w - 82 - DEL_W - DEL_MARGIN_R - 10
         p.setPen(TEXT_PRIMARY)
         p.setFont(name_font)
         p.drawText(QRect(72, 10, name_max, 24),
                    Qt.AlignmentFlag.AlignVCenter,
                    _elide(sess.get("name", "Session"), name_font, name_max))
 
-        # ── Timestamp (top-right, always visible, no overlap) ─────────────────
+        # ── Timestamp ─────────────────────────────────────────────────────────
         p.setPen(TEXT_MUTED)
         p.setFont(_font(9))
-        p.drawText(QRect(w - 68, 10, 56, 24),
-                   Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+        p.drawText(QRect(72, 34, w - 82, 20),
+                   Qt.AlignmentFlag.AlignVCenter,
                    _time_ago(sess.get("updated_at", "")))
 
-        # ── Item summary ──────────────────────────────────────────────────────
+        # ── Item Summary ──────────────────────────────────────────────────────
         n_a = sum(1 for i in self._items if i["type"] == "app")
         n_u = sum(1 for i in self._items if i["type"] == "url")
         n_f = sum(1 for i in self._items if i["type"] == "file")
@@ -409,37 +294,35 @@ class SessionCard(QWidget):
         )
         p.setPen(TEXT_DIM)
         p.setFont(_font(9))
-        p.drawText(QRect(72, 38, w - 82, 20),
+        p.drawText(QRect(72, 54, w - 82, 18),
                    Qt.AlignmentFlag.AlignVCenter,
                    " · ".join(parts) if parts else "empty")
 
-        # ── Delete × — now tucked below name, left side, fades in on hover ───
+        # ── Delete Button ─────────────────────────────────────────────────────
         if t > 0.05:
-            a = int(min(t * 2.5, 1.0) * 200)
+            a = int(min(t * 2.5, 1.0) * 220)
+            dr = self._del_rect()
             p.setOpacity(a / 255.0)
-            # Small pill in the lower-left corner of the header row
-            del_x, del_y = 72, CARD_H_COLL - 22
             dp = QPainterPath()
-            dp.addRoundedRect(del_x, del_y, 22, 14, 4, 4)
+            dp.addRoundedRect(QRectF(dr), 6, 6)
             p.fillPath(dp, QColor(ACCENT_DEL.red(), ACCENT_DEL.green(),
-                                  ACCENT_DEL.blue(), 28))
+                                  ACCENT_DEL.blue(), 30))
             p.setPen(QColor(ACCENT_DEL.red(), ACCENT_DEL.green(),
                             ACCENT_DEL.blue(), a))
             p.setFont(_font(9, bold=True))
-            p.drawText(QRect(del_x, del_y, 22, 14),
-                       Qt.AlignmentFlag.AlignCenter, "✕")
+            p.drawText(dr, Qt.AlignmentFlag.AlignCenter, "✕")
             p.setOpacity(1.0)
 
-        # ── Expanded section ──────────────────────────────────────────────────
+        # ── Expanded Section ──────────────────────────────────────────────────
         if t > 0.04:
             fade = min(t * 3.0, 1.0)
             p.setOpacity(fade)
 
-            # Soft gradient separator instead of a hard line
+            # Separator
             sep_grad = QLinearGradient(0, CARD_H_COLL, w, CARD_H_COLL)
             sep_grad.setColorAt(0.0,  QColor(0, 0, 0, 0))
-            sep_grad.setColorAt(0.15, QColor(60, 60, 90, 80))
-            sep_grad.setColorAt(0.85, QColor(60, 60, 90, 80))
+            sep_grad.setColorAt(0.15, QColor(90, 90, 90, 60))
+            sep_grad.setColorAt(0.85, QColor(90, 90, 90, 60))
             sep_grad.setColorAt(1.0,  QColor(0, 0, 0, 0))
             p.setPen(QPen(sep_grad, 1.0))
             p.drawLine(0, CARD_H_COLL, w, CARD_H_COLL)
@@ -452,18 +335,18 @@ class SessionCard(QWidget):
                 ry = CARD_H_COLL + 12 + idx * CARD_ITEM_H
                 rh = CARD_ITEM_H - 4
 
-                # Blended row — subtle gradient, no hard outline
+                # Row background
                 row_grad = QLinearGradient(0, ry, w, ry)
                 row_grad.setColorAt(0.0,  QColor(0, 0, 0, 0))
-                row_grad.setColorAt(0.04, QColor(BG_ITEM_ROW.red(),
-                                                  BG_ITEM_ROW.green(),
-                                                  BG_ITEM_ROW.blue(), 120))
-                row_grad.setColorAt(0.96, QColor(BG_ITEM_ROW.red(),
-                                                  BG_ITEM_ROW.green(),
-                                                  BG_ITEM_ROW.blue(), 120))
+                row_grad.setColorAt(0.04, QColor(GRAY_ROW.red(),
+                                                  GRAY_ROW.green(),
+                                                  GRAY_ROW.blue(), 100))
+                row_grad.setColorAt(0.96, QColor(GRAY_ROW.red(),
+                                                  GRAY_ROW.green(),
+                                                  GRAY_ROW.blue(), 100))
                 row_grad.setColorAt(1.0,  QColor(0, 0, 0, 0))
                 rp = QPainterPath()
-                rp.addRoundedRect(0, ry, w, rh, 8, 8)
+                rp.addRoundedRect(QRectF(0, ry, w, rh), 12, 12)
                 p.fillPath(rp, row_grad)
 
                 p.setPen(TEXT_DIM)
@@ -490,37 +373,38 @@ class SessionCard(QWidget):
                 if badge_text:
                     bx = w - 74
                     bp = QPainterPath()
-                    bp.addRoundedRect(bx, ry + 10, 54, 14, 3, 3)
-                    p.fillPath(bp, QColor(30, 30, 50, 180))
+                    bp.addRoundedRect(bx, ry + 10, 54, 14, 6, 6)
+                    p.fillPath(bp, QColor(60, 60, 60, 180))
                     p.setPen(QColor(badge_color))
                     p.setFont(badge_font)
                     p.drawText(QRect(int(bx), ry + 10, 54, 14),
                                Qt.AlignmentFlag.AlignCenter,
                                badge_text[:12])
 
-                # Row remove × — dimmer, blends in
-                p.setPen(QColor(70, 70, 100, 160))
+                p.setPen(QColor(100, 100, 100, 120))
                 p.setFont(_font(13))
                 p.drawText(QRect(w - 28, ry, 20, rh),
                            Qt.AlignmentFlag.AlignCenter, "×")
 
-            # ── Restore bar — blended gradient, no hard separator line ────────
+            # ── Restore Bar ───────────────────────────────────────────────────
             bar_y = h - CARD_FOOTER_H + 6
             self._restore_bar_y = bar_y
 
             bar_grad = QLinearGradient(0, bar_y, 0, bar_y + CARD_FOOTER_H - 10)
             hover_f = max(0.0, (t - 0.75) / 0.25)
+            r_base = GRAY_BASE
+            r_hov = QColor("#505050")
             r1 = QColor(
-                int(RESTORE_BG.red()   + (RESTORE_HOV.red()   - RESTORE_BG.red())   * hover_f),
-                int(RESTORE_BG.green() + (RESTORE_HOV.green() - RESTORE_BG.green()) * hover_f),
-                int(RESTORE_BG.blue()  + (RESTORE_HOV.blue()  - RESTORE_BG.blue())  * hover_f),
+                int(r_base.red()   + (r_hov.red()   - r_base.red())   * hover_f),
+                int(r_base.green() + (r_hov.green() - r_base.green()) * hover_f),
+                int(r_base.blue()  + (r_hov.blue()  - r_base.blue())  * hover_f),
             )
             bar_grad.setColorAt(0.0, QColor(r1.red(), r1.green(), r1.blue(), 0))
             bar_grad.setColorAt(0.3, r1)
             bar_grad.setColorAt(1.0, r1)
 
             bp2 = QPainterPath()
-            bp2.addRoundedRect(8, bar_y, w - 16, CARD_FOOTER_H - 10, 10, 10)
+            bp2.addRoundedRect(QRectF(8, bar_y, w - 16, CARD_FOOTER_H - 10), 12, 12)
             p.fillPath(bp2, bar_grad)
 
             p.setPen(TEXT_DIM if not self._restoring else TEXT_MUTED)
@@ -562,10 +446,10 @@ class WalletPanel(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setFixedSize(PANEL_WIDTH, PANEL_HEIGHT)
         sh = QGraphicsDropShadowEffect(self)
-        sh.setBlurRadius(72)
+        sh.setBlurRadius(48)
         sh.setXOffset(0)
-        sh.setYOffset(20)
-        sh.setColor(QColor(0, 0, 0, 160))
+        sh.setYOffset(12)
+        sh.setColor(QColor(0, 0, 0, 120))
         self.setGraphicsEffect(sh)
 
     def _position_on_screen(self):
@@ -603,7 +487,7 @@ class WalletPanel(QWidget):
                 background: transparent; width: 3px; margin: 0;
             }
             QScrollBar::handle:vertical {
-                background: rgba(255,255,255,0.05);
+                background: rgba(255,255,255,0.08);
                 border-radius: 2px; min-height: 20px;
             }
             QScrollBar::add-line:vertical,
@@ -656,7 +540,7 @@ class WalletPanel(QWidget):
             )
             e.setAlignment(Qt.AlignmentFlag.AlignCenter)
             e.setStyleSheet(
-                "color:#2e2e44;font-size:12px;padding:48px 20px;"
+                "color:#666;font-size:12px;padding:48px 20px;"
                 f"font-family:{_FONT_FAMILY};"
             )
             self._list_layout.addWidget(e)
@@ -737,22 +621,23 @@ class WalletPanel(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
 
-        # Fully rounded panel — gradient top-to-bottom for depth
+        # Clean panel background
         bg = QPainterPath()
-        bg.addRoundedRect(0, 0, w, h, 18, 18)
+        bg.addRoundedRect(0, 0, w, h, 22, 22)
         panel_grad = QLinearGradient(0, 0, 0, h)
-        panel_grad.setColorAt(0.0, QColor("#13131e"))
-        panel_grad.setColorAt(1.0, QColor("#0a0a12"))
+        panel_grad.setColorAt(0.0, QColor("#252525"))
+        panel_grad.setColorAt(1.0, QColor("#1a1a1a"))
         p.fillPath(bg, panel_grad)
 
+        # Clean border
         p.setPen(QPen(BORDER, 1.0))
         bd = QPainterPath()
-        bd.addRoundedRect(0.5, 0.5, w - 1, h - 1, 18, 18)
+        bd.addRoundedRect(0.5, 0.5, w - 1, h - 1, 22, 22)
         p.drawPath(bd)
         p.end()
 
 
-# ── Header — clean title only ─────────────────────────────────────────────────
+# ── Header ────────────────────────────────────────────────────────────────────
 class _PanelHeader(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -763,7 +648,7 @@ class _PanelHeader(QWidget):
 
         t = QLabel("Workspace Sessions")
         t.setStyleSheet(
-            "color:#c8c8d8;"
+            "color:#b0b0b0;"
             "font-size:13px;"
             "font-weight:700;"
             f"font-family:{_FONT_FAMILY};"
@@ -775,11 +660,10 @@ class _PanelHeader(QWidget):
 
     def paintEvent(self, e):
         p = QPainter(self)
-        # Soft gradient separator instead of hard line
         grad = QLinearGradient(0, self.height() - 1, self.width(), self.height() - 1)
         grad.setColorAt(0.0,  QColor(0, 0, 0, 0))
-        grad.setColorAt(0.1,  QColor(40, 40, 60, 120))
-        grad.setColorAt(0.9,  QColor(40, 40, 60, 120))
+        grad.setColorAt(0.1,  QColor(80, 80, 80, 100))
+        grad.setColorAt(0.9,  QColor(80, 80, 80, 100))
         grad.setColorAt(1.0,  QColor(0, 0, 0, 0))
         p.setPen(QPen(grad, 1.0))
         p.drawLine(0, self.height() - 1, self.width(), self.height() - 1)
@@ -797,7 +681,7 @@ class _PanelFooter(QWidget):
 
         h = QLabel("Drag any window to the right edge to save")
         h.setStyleSheet(
-            "color:#222238;"
+            "color:#555;"
             "font-size:9px;"
             f"font-family:{_FONT_FAMILY};"
             "background:transparent;"
@@ -808,8 +692,8 @@ class _PanelFooter(QWidget):
         p = QPainter(self)
         grad = QLinearGradient(0, 0, self.width(), 0)
         grad.setColorAt(0.0,  QColor(0, 0, 0, 0))
-        grad.setColorAt(0.1,  QColor(30, 30, 50, 80))
-        grad.setColorAt(0.9,  QColor(30, 30, 50, 80))
+        grad.setColorAt(0.1,  QColor(60, 60, 60, 60))
+        grad.setColorAt(0.9,  QColor(60, 60, 60, 60))
         grad.setColorAt(1.0,  QColor(0, 0, 0, 0))
         p.setPen(QPen(grad, 1.0))
         p.drawLine(0, 0, self.width(), 0)
