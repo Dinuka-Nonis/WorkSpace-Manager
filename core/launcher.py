@@ -39,6 +39,7 @@ import os
 import subprocess
 import time
 import webbrowser
+import functools
 from pathlib import Path
 
 
@@ -66,6 +67,7 @@ VSCODE_PATHS = [
 FOCUS_SETTLE_SECS = 0.35
 
 
+@functools.lru_cache(maxsize=None)
 def _find_browser() -> str | None:
     for p in CHROME_PATHS + EDGE_PATHS:
         if os.path.exists(p):
@@ -73,6 +75,7 @@ def _find_browser() -> str | None:
     return None
 
 
+@functools.lru_cache(maxsize=None)
 def _find_chrome() -> str | None:
     for p in CHROME_PATHS:
         if os.path.exists(p):
@@ -80,6 +83,7 @@ def _find_chrome() -> str | None:
     return None
 
 
+@functools.lru_cache(maxsize=None)
 def _find_vscode(hint_exe: str = "") -> str | None:
     import shutil
     if hint_exe and os.path.exists(hint_exe):
