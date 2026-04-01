@@ -586,84 +586,149 @@ class DropZoneOverlay(QWidget):
     # ── Folder painting ───────────────────────────────────────────────────────
 
     def _paint_folder(self, p: QPainter):
-        fan  = self._fan
-        fr   = self._folder_rect()
-        fx   = fr.x()
-        fy   = fr.y()
-        fw   = fr.width()
-        fh   = fr.height()
+        """
+        Pixel-faithful port of the CSS folder (Uiverse / Cobp):
+          work-5   : amber-600 back plate + LEFT tab (rounded-tl-none)
+          work-4/3/2: three grey paper sheets, origin-bottom rotateX
+          work-1   : amber-400→500 front LID + RIGHT tab, origin-bottom rotateX(-46deg)
+        fan = 0 → closed, fan = 1 → fully open
+        """
+        import math
+        fan = self._fan
+        fr  = self._folder_rect()
+        fx, fy, fw, fh = fr.x(), fr.y(), fr.width(), fr.height()
+        r = 12   # border-radius (rounded-2xl ≈ 12px)
 
-        # ── Paper sheets — fan UPWARD out of the open folder ──────────────────
-        # When fan=0 papers are hidden inside body. fan=1 they stick up above.
-        for sheet in range(PAPER_COUNT):
-            if fan < 0.05:
-                break
-            # Each sheet sticks up a different amount and angles slightly
-            angle       = (sheet - 1) * 6 * fan           # -6, 0, +6 degrees
-            rise        = int(fan * (14 + sheet * 8))      # how far above body top
-            paper_h     = int(fh * 0.55)
-            paper_w     = fw - 14
-            paper_x     = fx + 7
-            paper_y     = fy + 14 - rise                   # rises upward
-            color       = PAPER_COLORS[PAPER_COUNT - 1 - sheet]
+        # ── CSS colours ───────────────────────────────────────────────────────
+        amber_600 = QColor("#d97706")
+        amber_500 = QColor("#f59e0b")
+        amber_400 = QColor("#fbbf24")
+        zinc_400  = QColor("#a1a1aa")
+        zinc_300  = QColor("#d4d4d8")
+        zinc_200  = QColor("#e4e4e7")
 
-            p.save()
-            p.translate(fx + fw / 2, fy + 14)             # rotate from hinge
-            p.rotate(angle)
-            p.translate(-(fx + fw / 2), -(fy + 14))
-            pp = QPainterPath()
-            pp.addRoundedRect(paper_x, paper_y, paper_w, paper_h, 6, 6)
-            p.fillPath(pp, color)
-            p.restore()
+        # ── WORK-5: back body (rounded-2xl rounded-tl-none) + LEFT tab ────────
+        back = QPainterPath()
+        back.moveTo(fx,        fy + 16)           # top-left: no rounding
+        back.lineTo(fx + fw - r, fy + 16)
+        back.quadTo(fx + fw,   fy + 16,  fx + fw, fy + 16 + r)
+        back.lineTo(fx + fw,   fy + fh - r)
+        back.quadTo(fx + fw,   fy + fh,  fx + fw - r, fy + fh)
+        back.lineTo(fx + r,    fy + fh)
+        back.quadTo(fx,        fy + fh,  fx, fy + fh - r)
+        back.lineTo(fx,        fy + 16)
+        back.closeSubpath()
+        p.fillPath(back, amber_600)
 
-        # ── Folder body ───────────────────────────────────────────────────────
-        body = QPainterPath()
-        body.addRoundedRect(fx, fy + 14, fw, fh - 14, 12, 12)
-        grad = QLinearGradient(fx, fy + 14, fx, fy + fh)
-        grad.setColorAt(0, FOLDER_BODY)
-        grad.setColorAt(1, FOLDER_BODY2)
-        p.fillPath(body, grad)
-
-        # Tab (top-left bump on back of folder)
+        # Left tab:  w ≈ fw*0.42  h ≈ fh*0.13  rounded-t-2xl (top corners only)
+        tw, th = int(fw * 0.42), int(fh * 0.135)
         tab = QPainterPath()
-        tab.addRoundedRect(fx, fy + 4, fw * 0.42, 14, 6, 6)
-        p.fillPath(tab, FOLDER_TAB)
+        tab.moveTo(fx,        fy + 16)
+        tab.lineTo(fx + tw,   fy + 16)
+        tab.lineTo(fx + tw,   fy + 16 - th + r)
+        tab.quadTo(fx + tw,   fy + 16 - th, fx + tw - r, fy + 16 - th)
+        tab.lineTo(fx + r,    fy + 16 - th)
+        tab.quadTo(fx,        fy + 16 - th, fx, fy + 16 - th + r)
+        tab.lineTo(fx,        fy + 16)
+        tab.closeSubpath()
+        p.fillPath(tab, amber_600)
 
-        # ── Lid — flips BACKWARD (upward) from hinge at top of body ──────────
-        # fan=0: lid is flat covering the top of the body.
-        # fan=1: lid has rotated ~180deg back (scale_y goes 1 → 0 → slightly negative).
-        # We clamp at a small positive so it never fully disappears.
-        hinge_y = fy + 14
-        p.save()
-        p.translate(fx + fw / 2, hinge_y)
-        # scale_y: 1.0 at fan=0 (closed), shrinks to 0 at fan=0.5, then flips
-        # We only show the closing sweep (fan 0→0.5 → lid shrinks to nothing)
-        # beyond that the lid is behind the folder — invisible.
-        raw_scale = 1.0 - fan * 2.0          # 1 → -1
-        scale_y   = max(-0.08, raw_scale)    # allow a tiny flip-past for realism
-        p.scale(1.0, scale_y)
-        p.translate(-(fx + fw / 2), -hinge_y)
+        # Corner connector triangle (before pseudo-element, polygon 0 35%, 0 100%, 50% 100%)
+        notch = QPainterPath()
+        notch.moveTo(fx + tw,            fy + 16 - th + th * 0.35)
+        notch.lineTo(fx + tw,            fy + 16)
+        notch.lineTo(fx + tw + th * 0.5, fy + 16)
+        notch.closeSubpath()
+        p.fillPath(notch, amber_600)
 
-        lid = QPainterPath()
-        lid.addRoundedRect(fx + 1, fy, fw - 2, 18, 6, 6)
-        lid_grad = QLinearGradient(fx, fy, fx, fy + 18)
-        lid_grad.setColorAt(0, FOLDER_LID.lighter(118))
-        lid_grad.setColorAt(1, FOLDER_LID)
-        p.fillPath(lid, lid_grad)
-        p.restore()
+        # ── WORK-4 / 3 / 2: grey papers, rotateX from BOTTOM ─────────────────
+        inset   = 5
+        px, py_bot = fx + inset, fy + fh   # origin-bottom (hinge at bottom)
+        pw, ph  = fw - inset * 2, fh - inset * 2
 
-        # ── Interior shadow when open — gives depth ───────────────────────────
-        if fan > 0.5:
-            alpha = int((fan - 0.5) * 2 * 60)
-            inner = QPainterPath()
-            inner.addRoundedRect(fx + 4, fy + 16, fw - 8, 20, 4, 4)
-            p.fillPath(inner, QColor(0, 0, 0, alpha))
+        # CSS hover angles: work-4 → -20°, work-3 → -30°, work-2 → -38°
+        for angle_max, color in [(20, zinc_400), (30, zinc_300), (38, zinc_200)]:
+            angle_rad = math.radians(fan * angle_max)
+            sy        = math.cos(angle_rad)          # vertical foreshortening
+            # bottom of paper stays at py_bot; top rises as it tilts back
+            p_top = py_bot - ph * sy
+            pp = QPainterPath()
+            pp.addRoundedRect(px, p_top, pw, ph * sy, 10, 10)
+            p.fillPath(pp, color)
 
-        # Label
-        p.setPen(QColor(100, 60, 10))
-        f = QFont("Helvetica Neue", 7, QFont.Weight.Bold)
-        p.setFont(f)
-        p.drawText(QRect(fx, fy + fh - 20, fw, 18),
+        # ── WORK-1: front amber lid, rotateX(-46deg) from BOTTOM ─────────────
+        # h-[156px] at 160px total → ratio 156/160 ≈ 0.975 of fh
+        lid_h   = fh * 0.975
+        lid_bot = fy + fh                          # hinge at bottom
+        lid_angle_rad = math.radians(fan * 46.0)
+        lid_sy  = math.cos(lid_angle_rad)
+        lid_top = lid_bot - lid_h * lid_sy
+
+        # Shape: rounded-2xl rounded-tr-none  (top-right has NO rounding)
+        lid_path = QPainterPath()
+        lid_path.moveTo(fx + fw,  lid_top)         # top-right: no rounding
+        lid_path.lineTo(fx + fw,  lid_bot - r)
+        lid_path.quadTo(fx + fw,  lid_bot,  fx + fw - r, lid_bot)
+        lid_path.lineTo(fx + r,   lid_bot)
+        lid_path.quadTo(fx,       lid_bot,  fx, lid_bot - r)
+        lid_path.lineTo(fx,       lid_top + r * lid_sy)
+        lid_path.quadTo(fx,       lid_top,  fx + r, lid_top)
+        lid_path.lineTo(fx + fw,  lid_top)
+        lid_path.closeSubpath()
+
+        lid_grad = QLinearGradient(fx, lid_top, fx, lid_bot)
+        lid_grad.setColorAt(0.0, amber_500)
+        lid_grad.setColorAt(1.0, amber_400)
+        p.fillPath(lid_path, lid_grad)
+
+        # Inner glow (inset shadows): inset 0 20px 40px #fbbf24, inset 0 -20px 40px #d97706
+        if fan > 0.05:
+            ga = int(fan * 100)
+            top_glow = QLinearGradient(fx, lid_top, fx, lid_top + lid_h * lid_sy * 0.4)
+            top_glow.setColorAt(0.0, QColor(251, 191, 36, ga))
+            top_glow.setColorAt(1.0, QColor(251, 191, 36, 0))
+            gp = QPainterPath(); gp.addRoundedRect(fx + 2, lid_top, fw - 4,
+                                                    lid_h * lid_sy * 0.4, 8, 8)
+            p.fillPath(gp, top_glow)
+
+            bot_glow = QLinearGradient(fx, lid_bot - lid_h * lid_sy * 0.4, fx, lid_bot)
+            bot_glow.setColorAt(0.0, QColor(217, 119, 6, 0))
+            bot_glow.setColorAt(1.0, QColor(217, 119, 6, ga))
+            gp2 = QPainterPath(); gp2.addRoundedRect(fx + 2,
+                                                      lid_bot - lid_h * lid_sy * 0.4,
+                                                      fw - 4, lid_h * lid_sy * 0.4, 8, 8)
+            p.fillPath(gp2, bot_glow)
+
+        # Right tab: after:bottom[99%] right:0 w-[146px]/240≈fw*0.61 h-4 amber-400 rounded-t-2xl
+        rtw     = int(fw * 0.61)
+        rth     = int(fh * 0.115)
+        rtx     = fx + fw - rtw
+        rt_bot  = lid_top                          # sits just above lid top
+        rt_top  = rt_bot - rth * lid_sy
+
+        rtab = QPainterPath()
+        rtab.moveTo(rtx,        rt_bot)
+        rtab.lineTo(rtx + rtw,  rt_bot)
+        rtab.lineTo(rtx + rtw,  rt_top + r * lid_sy)
+        rtab.quadTo(rtx + rtw,  rt_top,  rtx + rtw - r, rt_top)
+        rtab.lineTo(rtx + r,    rt_top)
+        rtab.quadTo(rtx,        rt_top,  rtx, rt_top + r * lid_sy)
+        rtab.lineTo(rtx,        rt_bot)
+        rtab.closeSubpath()
+        p.fillPath(rtab, amber_400)
+
+        # Corner notch triangle (before, polygon 100% 14%, 50% 100%, 100% 100%)
+        rnotch = QPainterPath()
+        rnotch.moveTo(rtx,                rt_top + rth * lid_sy * 0.14)
+        rnotch.lineTo(rtx - rth * lid_sy * 0.5, rt_bot)
+        rnotch.lineTo(rtx,                rt_bot)
+        rnotch.closeSubpath()
+        p.fillPath(rnotch, amber_400)
+
+        # ── WORKSPACE label ───────────────────────────────────────────────────
+        p.setPen(QColor(120, 70, 5, 200))
+        p.setFont(QFont("Helvetica Neue", 7, QFont.Weight.Bold))
+        p.drawText(QRect(fx, fy + fh - 18, fw, 16),
                    Qt.AlignmentFlag.AlignCenter, "WORKSPACE")
 
     # ── Session / notification cards ──────────────────────────────────────────
