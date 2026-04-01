@@ -1,31 +1,6 @@
 """
 core/drag_watcher.py — Window drag detection via SetWinEventHook.
 
-Bug fixes in this version
---------------------------
-1. Chrome auto-add / wrong profile ("Person 1"):
-   - _get_chrome_profile_for_hwnd now uses GetWindowThreadProcessId on the
-     DRAGGED hwnd to get the owning PID, then walks up to the browser process
-     from THAT specific PID. Previously it was receiving the renderer PID of
-     whatever chrome process happened to own the message-queue thread, not the
-     browser-frame process, so --profile-directory= was never found.
-   - Strategy 5 no longer falls back to "Default" when detection fails.
-     Instead we return ("", "") and skip saving a URL with a wrong profile,
-     rather than silently tagging everything as "Person 1".
-   - _capture_window_info for Chrome: if profile detection returns ("","") AND
-     uiautomation is available and returns a URL, we still save the URL but
-     without a profile prefix — so it opens in whatever profile is active at
-     restore time, rather than always forcing "Default" / Person 1.
-
-2. File Explorer wrong window detection:
-   - _get_file_explorer_windows now receives the dragged hwnd and uses
-     IShellWindows.FindWindowSW (via comtypes) or iterates Shell.Windows()
-     comparing each window's hwnd against the dragged hwnd directly. Only the
-     folder that corresponds to the EXACT dragged window is returned.
-   - Falls back to SHGetPathFromIDList + IFolderView via win32com if comtypes
-     is unavailable.
-   - If the dragged hwnd can't be matched to any open Explorer folder (e.g.
-     the Desktop or a zip-file preview), we return [] so nothing is saved.
 """
 
 import sys
