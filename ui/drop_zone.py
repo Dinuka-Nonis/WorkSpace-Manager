@@ -1,15 +1,15 @@
 """
 ui/drop_zone.py — Folder-style drop zone overlay.
 
-v5 changes (New Session card):
-  • The "＋ New Session" card now has a spinning conic-gradient glow border
-    inspired by the CSS reference (purple #402fb5 ↔ pink #cf30aa).
-  • The ＋ icon cycles through a colour animation (blue→purple→pink→blue).
-  • A dark grid background sits inside the card (matches the CSS .grid).
-  • On hover the border-glow rotates 180°; on idle it rests at its base angle.
-  • All driven by a single QTimer + angle float — zero extra widgets needed.
-
-Everything else is unchanged from v4.
+v6 changes:
+  • New Session card height reduced (NEW_CARD_H = 58).
+  • Input field now expands INLINE inside the New Session card with a smooth
+    height animation — the card grows, the label/subtitle fades out, and a
+    borderless QLineEdit fades in.  No floating overlay card any more.
+  • All session cards (regular + new) show the spinning conic-gradient glow
+    border on hover, matching the New Session card's existing glow logic.
+  • _glow_angle/target now tracked per-card via _card_glow_angles[i] and
+    _card_glow_targets[i] dicts so each card glows independently.
 """
 
 from __future__ import annotations
@@ -40,9 +40,13 @@ WIDGET_H        = 600
 
 CARD_W          = 310
 CARD_H          = 72
+NEW_CARD_H      = 56          # ← reduced height for New Session card
 CARD_X          = 20
 CARD_GAP        = 10
 CARDS_START_Y   = FOLDER_H + 24
+
+# Height the New Session card expands to when showing the inline input
+NEW_CARD_EXPANDED_H = 96
 
 PAPER_COUNT     = 3
 
@@ -58,17 +62,21 @@ GRAD_TOP        = QColor("#d7cfcf")
 GRAD_BOT        = QColor("#9198e5")
 GRAD_HOVER_TOP  = QColor("#9198e5")
 GRAD_HOVER_BOT  = QColor("#712020")
-NEW_CARD_BG     = QColor("#010201")          # matches CSS input bg
+NEW_CARD_BG     = QColor("#010201")
 NEW_CARD_HOV    = QColor("#0d0d18")
 TEXT_WHITE      = QColor(255, 255, 255)
 TEXT_DIM        = QColor(136, 136, 153)
 CONFIRM_GREEN   = QColor("#42d778")
 
-# Glow palette (matches CSS #402fb5 / #cf30aa)
+# Glow palette
 GLOW_BLUE       = QColor("#402fb5")
 GLOW_PINK       = QColor("#cf30aa")
 GLOW_PURPLE     = QColor("#a099d8")
 GLOW_PINK2      = QColor("#dfa2da")
+
+# Regular card glow palette (cooler, less saturated than new-session card)
+RGLOW_A         = QColor("#2a3fa8")   # blue-ish
+RGLOW_B         = QColor("#7a2090")   # purple-ish
 
 
 class _CardState:
@@ -102,18 +110,22 @@ class DropZoneOverlay(QWidget):
         self._card_scales: list[float] = []
         self._confirm_alpha = 0.0
 
-        # ── Glow animation state ──────────────────────────────────────────────
-        # _glow_angle: current rotation of the conic gradient (degrees)
-        # _glow_target: where it should animate to
-        # _glow_hovered: whether new-session card is hovered
-        self._glow_angle   = 83.0     # resting angle (matches CSS rotate(83deg))
-        self._glow_target  = 83.0
-        self._glow_hovered = False
-        self._plus_hue     = 240.0    # HSV hue for the + icon colour cycle
+        # ── Per-card glow state ───────────────────────────────────────────────
+        # Keyed by card index: angle (current), target, hovered flag
+        self._card_glow_angles:  dict[int, float] = {}
+        self._card_glow_targets: dict[int, float] = {}
+        self._card_glow_hovered: dict[int, bool]  = {}
+        self._plus_hue = 240.0   # HSV hue for the + icon colour cycle
 
-        # Master animation timer — 60 fps, drives glow rotation + + colour
+        # ── Inline input state ────────────────────────────────────────────────
+        # _input_t: 0.0 = collapsed (normal new-session card)
+        #           1.0 = fully expanded (showing inline QLineEdit)
+        self._input_t      = 0.0
+        self._input_open   = False
+
+        # Master animation timer — 60 fps
         self._anim_timer = QTimer(self)
-        self._anim_timer.setInterval(16)   # ~60 fps
+        self._anim_timer.setInterval(16)
         self._anim_timer.timeout.connect(self._tick_glow)
         self._anim_timer.start()
 
@@ -121,20 +133,22 @@ class DropZoneOverlay(QWidget):
         self._position_on_screen()
         self._refresh_sessions()
         self._build_slide_anim()
+        self._build_input_anim()
 
+        # Inline input embedded inside the widget (positioned over new-card area)
         self._new_sess_input = QLineEdit(self)
         self._new_sess_input.setPlaceholderText("Session name…")
-        self._new_sess_input.setFixedHeight(32)
+        self._new_sess_input.setFixedHeight(28)
         self._new_sess_input.hide()
         self._new_sess_input.returnPressed.connect(self._create_new_session)
         self._new_sess_input.setStyleSheet("""
             QLineEdit {
-                background: #0d0d18; color: #ffffff;
-                border: none; border-radius: 10px;
-                padding: 0 12px; font-size: 13px;
+                background: transparent; color: #ffffff;
+                border: none; border-radius: 0px;
+                padding: 0 4px; font-size: 12px;
                 font-family: 'Helvetica Neue', 'Helvetica', sans-serif;
             }
-            QLineEdit:focus { background: #12122a; }
+            QLineEdit:focus { background: transparent; }
         """)
 
         self._confirm_timer = QTimer(self)
@@ -145,20 +159,37 @@ class DropZoneOverlay(QWidget):
         _ref.timeout.connect(self._refresh_sessions)
         _ref.start(5000)
 
+    # ── Per-card glow helpers ─────────────────────────────────────────────────
+    def _glow_angle(self, i: int) -> float:
+        return self._card_glow_angles.get(i, 83.0)
+
+    def _set_card_glow_hover(self, i: int, hovered: bool):
+        was = self._card_glow_hovered.get(i, False)
+        if hovered == was:
+            return
+        self._card_glow_hovered[i] = hovered
+        cur = self._card_glow_angles.get(i, 83.0)
+        if hovered:
+            self._card_glow_targets[i] = cur + 180.0
+        else:
+            self._card_glow_targets[i] = round(cur / 360) * 360 + 83.0
+
     # ── Glow tick ─────────────────────────────────────────────────────────────
     def _tick_glow(self):
-        """Animate glow_angle toward target and cycle + icon hue."""
         changed = False
+        total = len(self._sessions) + 1
 
-        # Angle easing
-        diff = self._glow_target - self._glow_angle
-        if abs(diff) > 0.3:
-            self._glow_angle += diff * 0.06   # smooth lerp
-            changed = True
-        else:
-            self._glow_angle = self._glow_target
+        for i in range(total):
+            cur    = self._card_glow_angles.get(i, 83.0)
+            target = self._card_glow_targets.get(i, 83.0)
+            diff   = target - cur
+            if abs(diff) > 0.3:
+                self._card_glow_angles[i] = cur + diff * 0.06
+                changed = True
+            else:
+                self._card_glow_angles[i] = target
 
-        # + icon hue cycles continuously when card is visible
+        # + icon hue cycles continuously
         if self._cards_visible or self._picker_mode:
             self._plus_hue = (self._plus_hue + 0.6) % 360
             changed = True
@@ -166,16 +197,59 @@ class DropZoneOverlay(QWidget):
         if changed:
             self.update()
 
-    def _set_glow_hover(self, hovered: bool):
-        if hovered == self._glow_hovered:
+    # ── Input animation ───────────────────────────────────────────────────────
+    def _build_input_anim(self):
+        self._input_anim = QPropertyAnimation(self, b"inputT", self)
+        self._input_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._input_anim.setDuration(260)
+
+    def getInputT(self) -> float:
+        return self._input_t
+
+    def setInputT(self, v: float):
+        self._input_t = v
+        self._reposition_inline_input()
+        self.update()
+
+    inputT = pyqtProperty(float, getInputT, setInputT)
+
+    def _reposition_inline_input(self):
+        """Keep the QLineEdit centred inside the expanded new-session card."""
+        if not self._input_open and self._input_t < 0.05:
+            self._new_sess_input.hide()
             return
-        self._glow_hovered = hovered
-        if hovered:
-            # Spin 180° forward on hover (matches CSS -97deg offset)
-            self._glow_target = self._glow_angle + 180.0
+
+        n_cards  = len(self._sessions)
+        card_y   = self._new_card_y(n_cards)
+        cur_h    = self._new_card_current_h()
+
+        # Position input in the lower portion of the card
+        input_y = card_y + int(cur_h * 0.52)
+        self._new_sess_input.setGeometry(
+            CARD_X + 14,
+            input_y,
+            CARD_W - 28,
+            28,
+        )
+        alpha = int(min(self._input_t * 2.0, 1.0) * 255)
+        if alpha > 10:
+            self._new_sess_input.show()
         else:
-            # Spin back to nearest resting position
-            self._glow_target = round(self._glow_angle / 360) * 360 + 83.0
+            self._new_sess_input.hide()
+
+    def _new_card_y(self, card_index: int) -> int:
+        """Y position of new-session card accounting for drop animation."""
+        drop_frac = (
+            self._card_drops[card_index]
+            if card_index < len(self._card_drops) else 0.0
+        )
+        base_y    = CARDS_START_Y + card_index * (CARD_H + CARD_GAP)
+        slide_off = int((1.0 - drop_frac) * (NEW_CARD_H + 50))
+        return base_y - slide_off
+
+    def _new_card_current_h(self) -> int:
+        """Interpolated height of new-session card."""
+        return int(NEW_CARD_H + (NEW_CARD_EXPANDED_H - NEW_CARD_H) * self._input_t)
 
     # ── Window setup ──────────────────────────────────────────────────────────
     def _setup_window(self):
@@ -350,7 +424,7 @@ class DropZoneOverlay(QWidget):
         self._cards_visible       = False
         self._cards_dropped_once  = False
         self._folder_hovered      = False
-        self._new_sess_input.hide()
+        self._close_inline_input()
         self._hide_cards()
         self._fan = 0.0
         self._refresh_sessions()
@@ -363,7 +437,7 @@ class DropZoneOverlay(QWidget):
         card_i = self._card_at(cx, cy)
         if card_i is not None:
             if card_i == len(self._sessions):
-                self._show_new_session_input(app_info)
+                self._open_inline_input(app_info)
             else:
                 self._pending_app       = app_info
                 self._picker_mode       = True
@@ -382,7 +456,7 @@ class DropZoneOverlay(QWidget):
         self._pending_app        = None
         self._picker_mode        = False
         self._cards_dropped_once = False
-        self._new_sess_input.hide()
+        self._close_inline_input()
         if not self._drop_confirmed:
             self._slide_out()
 
@@ -390,6 +464,33 @@ class DropZoneOverlay(QWidget):
         self._active_session_id = session_id
         self._refresh_sessions()
         self.update()
+
+    # ── Inline input open/close ───────────────────────────────────────────────
+    def _open_inline_input(self, app_info: dict):
+        self._pending_app  = app_info
+        self._input_open   = True
+        self._new_sess_input.clear()
+        # Animate expansion
+        self._input_anim.stop()
+        self._input_anim.setStartValue(self._input_t)
+        self._input_anim.setEndValue(1.0)
+        self._input_anim.start()
+        # Show input after brief delay (let expansion start)
+        QTimer.singleShot(80, self._focus_input)
+        self.update()
+
+    def _focus_input(self):
+        self._new_sess_input.show()
+        self._new_sess_input.setFocus()
+        self._reposition_inline_input()
+
+    def _close_inline_input(self):
+        self._input_open = False
+        self._new_sess_input.clearFocus()
+        self._input_anim.stop()
+        self._input_anim.setStartValue(self._input_t)
+        self._input_anim.setEndValue(0.0)
+        self._input_anim.start()
 
     # ── Internal session ops ──────────────────────────────────────────────────
     def _refresh_sessions(self):
@@ -423,19 +524,9 @@ class DropZoneOverlay(QWidget):
         self.update()
         self._confirm_timer.start(2000)
 
-    def _show_new_session_input(self, app_info: dict):
-        self._pending_app = app_info
-        n_cards = len(self._sessions)
-        input_y = CARDS_START_Y + n_cards * (CARD_H + CARD_GAP) + 8
-        self._new_sess_input.setGeometry(CARD_X, input_y, CARD_W, 36)
-        self._new_sess_input.clear()
-        self._new_sess_input.show()
-        self._new_sess_input.setFocus()
-        self.update()
-
     def _create_new_session(self):
         name = self._new_sess_input.text().strip() or "My Workspace"
-        self._new_sess_input.hide()
+        self._close_inline_input()
         sid = db.create_session(name)
         self._active_session_id = sid
         self._refresh_sessions()
@@ -455,7 +546,7 @@ class DropZoneOverlay(QWidget):
         self._picker_mode        = False
         self._drop_confirmed     = False
         self._cards_dropped_once = False
-        self._new_sess_input.hide()
+        self._close_inline_input()
         self._slide_out()
 
     # ── Hit-testing ───────────────────────────────────────────────────────────
@@ -474,9 +565,11 @@ class DropZoneOverlay(QWidget):
             drop_frac = self._card_drops[i]
             if drop_frac < 0.05:
                 continue
+            is_new   = (i == len(self._sessions))
+            card_h   = self._new_card_current_h() if is_new else CARD_H
             base_y   = CARDS_START_Y + i * (CARD_H + CARD_GAP)
-            actual_y = base_y - int((1.0 - drop_frac) * (CARD_H + 40))
-            r = QRect(CARD_X, actual_y, CARD_W, CARD_H)
+            actual_y = base_y - int((1.0 - drop_frac) * (card_h + 40))
+            r = QRect(CARD_X, actual_y, CARD_W, card_h)
             if r.contains(x, y):
                 return i
         return None
@@ -498,26 +591,26 @@ class DropZoneOverlay(QWidget):
         elif not now_over_folder and self._folder_hovered:
             self._folder_hovered = False
 
-        # Update card hover states
+        # Update card hover states and per-card glow
         changed = False
         total = len(self._sessions) + 1
         while len(self._card_scales) < total:
             self._card_scales.append(1.0)
 
-        new_card_i = len(self._sessions)
         for i in range(total):
-            base_y   = CARDS_START_Y + i * (CARD_H + CARD_GAP)
+            is_new    = (i == len(self._sessions))
+            card_h    = self._new_card_current_h() if is_new else CARD_H
+            base_y    = CARDS_START_Y + i * (CARD_H + CARD_GAP)
             drop_frac = self._card_drops[i] if i < len(self._card_drops) else 0.0
-            actual_y = base_y - int((1.0 - drop_frac) * (CARD_H + 40))
-            r     = QRect(CARD_X, actual_y, CARD_W, CARD_H)
-            hover = r.contains(x, y) and drop_frac > 0.5
-            want  = 1.05 if hover else 1.0
+            actual_y  = base_y - int((1.0 - drop_frac) * (card_h + 40))
+            r         = QRect(CARD_X, actual_y, CARD_W, card_h)
+            hover     = r.contains(x, y) and drop_frac > 0.5
+            want      = 1.05 if hover else 1.0
             if abs(self._card_scales[i] - want) > 0.001:
                 self._card_scales[i] = want
                 changed = True
-            # Glow hover for new-session card
-            if i == new_card_i:
-                self._set_glow_hover(hover)
+            # Drive per-card glow
+            self._set_card_glow_hover(i, hover)
 
         if changed:
             self.update()
@@ -527,7 +620,7 @@ class DropZoneOverlay(QWidget):
         card_i = self._card_at(x, y)
         if card_i is not None:
             if card_i == len(self._sessions):
-                self._show_new_session_input(self._pending_app)
+                self._open_inline_input(self._pending_app)
             else:
                 self._active_session_id = self._sessions[card_i]["id"]
                 if self._pending_app or self._picker_mode:
@@ -560,7 +653,9 @@ class DropZoneOverlay(QWidget):
 
     def leaveEvent(self, event):
         self._folder_hovered = False
-        self._set_glow_hover(False)
+        total = len(self._sessions) + 1
+        for i in range(total):
+            self._set_card_glow_hover(i, False)
         self.update()
 
     # ── Paint ─────────────────────────────────────────────────────────────────
@@ -580,7 +675,6 @@ class DropZoneOverlay(QWidget):
             if self._picker_mode:
                 self._paint_picker_hint(p)
 
-        self._paint_cancel_hint(p)
         p.end()
 
     # ── Folder painting ───────────────────────────────────────────────────────
@@ -727,34 +821,134 @@ class DropZoneOverlay(QWidget):
             is_active      = not is_new and sess and sess["id"] == self._active_session_id
             is_confirmed   = (i == self._confirmed_card_i and self._drop_confirmed)
 
+            card_h    = self._new_card_current_h() if is_new else CARD_H
             base_y    = CARDS_START_Y + i * (CARD_H + CARD_GAP)
-            slide_off = int((1.0 - drop_frac) * (CARD_H + 50))
+            slide_off = int((1.0 - drop_frac) * (card_h + 50))
             cy        = base_y - slide_off
 
             cx_centre = CARD_X + CARD_W / 2
-            cy_centre = cy + CARD_H / 2
+            cy_centre = cy + card_h / 2
             p.save()
             p.translate(cx_centre, cy_centre)
             p.scale(scale, scale)
             p.translate(-cx_centre, -cy_centre)
 
             if is_new:
-                self._paint_new_session_card(p, CARD_X, cy, CARD_W, CARD_H, scale)
+                self._paint_new_session_card(p, CARD_X, cy, CARD_W, card_h, scale, i)
             else:
                 self._paint_session_card(
                     p, CARD_X, cy, CARD_W, CARD_H,
-                    sess, is_active, is_confirmed, scale,
+                    sess, is_active, is_confirmed, scale, i,
                 )
             p.restore()
+
+    # ── Shared glow border painter ────────────────────────────────────────────
+    def _paint_glow_border(
+        self,
+        p: QPainter,
+        cx: float, cy: float, cw: int, ch: int,
+        angle: float,
+        glow_a: QColor, glow_b: QColor,
+        dark_a: str, dark_b: str,
+        hover_strength: float,   # 0..1 how much glow to show
+        r: float = 14.0,
+    ):
+        """Paint the layered conic glow border.  Works for any card size."""
+        cx_mid = cx + cw / 2
+        cy_mid = cy + ch / 2
+        alpha_mul = hover_strength   # fade in with hover
+
+        # Outer radial glow
+        for color, radius, base_alpha in [
+            (glow_a, cw * 0.9, 30),
+            (glow_b, cw * 0.7, 25),
+        ]:
+            a = int(base_alpha * alpha_mul)
+            if a < 2:
+                continue
+            rg = QRadialGradient(cx_mid, cy_mid, radius)
+            rg.setColorAt(0.0, QColor(color.red(), color.green(), color.blue(), a))
+            rg.setColorAt(1.0, QColor(0, 0, 0, 0))
+            glow_path = QPainterPath()
+            glow_path.addRoundedRect(
+                QRectF(cx - 20, cy - 14, cw + 40, ch + 28), r + 8, r + 8)
+            p.fillPath(glow_path, rg)
+
+        # darkBorderBg
+        dark_path = QPainterPath()
+        dark_path.addRoundedRect(QRectF(cx - 1, cy - 1, cw + 2, ch + 2), r + 1, r + 1)
+        cg_dark = QConicalGradient(cx_mid, cy_mid, angle + 2)
+        cg_dark.setColorAt(0.00, QColor(0, 0, 0, 0))
+        cg_dark.setColorAt(0.05, QColor(dark_a))
+        cg_dark.setColorAt(0.10, QColor(0, 0, 0, 0))
+        cg_dark.setColorAt(0.50, QColor(0, 0, 0, 0))
+        cg_dark.setColorAt(0.60, QColor(dark_b))
+        cg_dark.setColorAt(0.65, QColor(0, 0, 0, 0))
+        cg_dark.setColorAt(1.00, QColor(0, 0, 0, 0))
+        p.setOpacity(alpha_mul)
+        p.fillPath(dark_path, cg_dark)
+        p.setOpacity(1.0)
+
+        # Conic border ring
+        border_outer = QPainterPath()
+        border_outer.addRoundedRect(QRectF(cx - 2, cy - 2, cw + 4, ch + 4), r + 2, r + 2)
+        border_inner = QPainterPath()
+        border_inner.addRoundedRect(QRectF(cx, cy, cw, ch), r, r)
+        border_ring  = border_outer.subtracted(border_inner)
+
+        cg_border = QConicalGradient(cx_mid, cy_mid, angle)
+        cg_border.setColorAt(0.00, QColor("#1c191c"))
+        cg_border.setColorAt(0.05, glow_a)
+        cg_border.setColorAt(0.14, QColor("#1c191c"))
+        cg_border.setColorAt(0.50, QColor("#1c191c"))
+        cg_border.setColorAt(0.60, glow_b)
+        cg_border.setColorAt(0.64, QColor("#1c191c"))
+        cg_border.setColorAt(1.00, QColor("#1c191c"))
+        p.setOpacity(alpha_mul)
+        p.fillPath(border_ring, cg_border)
+        p.setOpacity(1.0)
+
+        # Soft inner white ring
+        white_outer = QPainterPath()
+        white_outer.addRoundedRect(QRectF(cx, cy, cw, ch), r, r)
+        white_inner = QPainterPath()
+        white_inner.addRoundedRect(
+            QRectF(cx + 2, cy + 2, cw - 4, ch - 4), r - 2, r - 2)
+        white_ring = white_outer.subtracted(white_inner)
+
+        cg_white = QConicalGradient(cx_mid, cy_mid, angle + 3)
+        cg_white.setColorAt(0.00, QColor(0, 0, 0, 0))
+        cg_white.setColorAt(0.04, GLOW_PURPLE)
+        cg_white.setColorAt(0.08, QColor(0, 0, 0, 0))
+        cg_white.setColorAt(0.50, QColor(0, 0, 0, 0))
+        cg_white.setColorAt(0.55, GLOW_PINK2)
+        cg_white.setColorAt(0.60, QColor(0, 0, 0, 0))
+        cg_white.setColorAt(1.00, QColor(0, 0, 0, 0))
+        p.setOpacity(alpha_mul * 0.7)
+        p.fillPath(white_ring, cg_white)
+        p.setOpacity(1.0)
 
     # ── Regular session card ──────────────────────────────────────────────────
     def _paint_session_card(
         self, p, cx, cy, cw, ch,
-        sess, is_active, is_confirmed, scale,
+        sess, is_active, is_confirmed, scale, card_index,
     ):
+        r    = 14.0
         cr   = QRectF(cx, cy, cw, ch)
         bg_path = QPainterPath()
-        bg_path.addRoundedRect(cr, 14, 14)
+        bg_path.addRoundedRect(cr, r, r)
+
+        hover_strength = max(0.0, (scale - 1.0) / 0.05)  # 0..1
+        angle = self._glow_angle(card_index)
+
+        # Paint glow border (fades in with hover)
+        if hover_strength > 0.01:
+            self._paint_glow_border(
+                p, cx, cy, cw, ch, angle,
+                RGLOW_A, RGLOW_B,
+                "#0e0c3a", "#3d1050",
+                hover_strength, r,
+            )
 
         if is_confirmed:
             p.fillPath(bg_path, CONFIRM_GREEN.darker(110))
@@ -821,117 +1015,73 @@ class DropZoneOverlay(QWidget):
                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                        f"{n_items} item{'s' if n_items != 1 else ''} saved")
 
-    # ── NEW SESSION CARD — glowing conic border ───────────────────────────────
+    # ── NEW SESSION CARD ──────────────────────────────────────────────────────
     def _paint_new_session_card(
         self, p: QPainter,
         cx: int, cy: int, cw: int, ch: int,
-        scale: float,
+        scale: float, card_index: int,
     ):
-        """
-        Replicates the CSS layered glow effect:
-          .glow    — blurred outer radial glow (blue+pink, opacity 0.4)
-          .darkBorderBg — dark conic halo
-          .border  — conic gradient rotating border
-          .white   — soft bright inner ring
-          card bg  — dark #010201 fill
-          icon     — ＋ with animated hue-cycling colour
-        All layers share the same border-radius and conic angle (self._glow_angle).
-        """
-        angle = self._glow_angle
-        is_hovered = scale > 1.01
+        angle          = self._glow_angle(card_index)
+        is_hovered     = scale > 1.01
+        hover_strength = max(0.0, (scale - 1.0) / 0.05)
+        t_input        = self._input_t   # 0 = normal, 1 = input open
+        r              = 14.0
 
-        card_rect = QRectF(cx, cy, cw, ch)
-        r = 14.0  # border radius
+        # Glow border (always present for new-session card; fades further with input)
+        glow_mul = max(0.08, hover_strength) * (1.0 - t_input * 0.5)
+        self._paint_glow_border(
+            p, cx, cy, cw, ch, angle,
+            GLOW_BLUE, GLOW_PINK,
+            "#18116a", "#6e1b60",
+            glow_mul, r,
+        )
 
-        # ── Layer 1: outer glow (matches .glow — blurred, opacity 0.4) ────────
-        # We simulate blur with a large radial gradient at low opacity
-        cx_mid = cx + cw / 2
-        cy_mid = cy + ch / 2
-        for color, radius, alpha in [
-            (GLOW_BLUE,  cw * 0.9, 35),
-            (GLOW_PINK,  cw * 0.7, 30),
-        ]:
-            rg = QRadialGradient(cx_mid, cy_mid, radius)
-            rg.setColorAt(0.0, QColor(color.red(), color.green(), color.blue(), alpha))
-            rg.setColorAt(1.0, QColor(0, 0, 0, 0))
-            glow_path = QPainterPath()
-            glow_path.addRoundedRect(
-                QRectF(cx - 20, cy - 14, cw + 40, ch + 28), r + 8, r + 8)
-            p.fillPath(glow_path, rg)
+        # Card body
+        card_path = QPainterPath()
+        card_path.addRoundedRect(QRectF(cx, cy, cw, ch), r, r)
+        bg = NEW_CARD_HOV if (is_hovered or self._input_open) else NEW_CARD_BG
+        p.fillPath(card_path, bg)
 
-        # ── Layer 2: darkBorderBg — dark conic halo ───────────────────────────
-        dark_path = QPainterPath()
-        dark_path.addRoundedRect(QRectF(cx - 1, cy - 1, cw + 2, ch + 2), r + 1, r + 1)
-        cg_dark = QConicalGradient(cx_mid, cy_mid, angle + 2)
-        cg_dark.setColorAt(0.00, QColor(0, 0, 0, 0))
-        cg_dark.setColorAt(0.05, QColor("#18116a"))
-        cg_dark.setColorAt(0.10, QColor(0, 0, 0, 0))
-        cg_dark.setColorAt(0.50, QColor(0, 0, 0, 0))
-        cg_dark.setColorAt(0.60, QColor("#6e1b60"))
-        cg_dark.setColorAt(0.65, QColor(0, 0, 0, 0))
-        cg_dark.setColorAt(1.00, QColor(0, 0, 0, 0))
-        p.fillPath(dark_path, cg_dark)
-
-        # ── Layer 3: .border — conic gradient border ──────────────────────────
-        border_outer = QPainterPath()
-        border_outer.addRoundedRect(QRectF(cx - 2, cy - 2, cw + 4, ch + 4), r + 2, r + 2)
-        border_inner = QPainterPath()
-        border_inner.addRoundedRect(card_rect, r, r)
-        border_ring = QPainterPath()
-        border_ring = border_outer.subtracted(border_inner)
-
-        cg_border = QConicalGradient(cx_mid, cy_mid, angle)
-        cg_border.setColorAt(0.00, QColor("#1c191c"))
-        cg_border.setColorAt(0.05, GLOW_BLUE)
-        cg_border.setColorAt(0.14, QColor("#1c191c"))
-        cg_border.setColorAt(0.50, QColor("#1c191c"))
-        cg_border.setColorAt(0.60, GLOW_PINK)
-        cg_border.setColorAt(0.64, QColor("#1c191c"))
-        cg_border.setColorAt(1.00, QColor("#1c191c"))
-        p.fillPath(border_ring, cg_border)
-
-        # ── Layer 4: .white — soft bright inner ring ──────────────────────────
-        white_outer = QPainterPath()
-        white_outer.addRoundedRect(card_rect, r, r)
-        white_inner = QPainterPath()
-        white_inner.addRoundedRect(
-            QRectF(cx + 2, cy + 2, cw - 4, ch - 4), r - 2, r - 2)
-        white_ring = white_outer.subtracted(white_inner)
-
-        cg_white = QConicalGradient(cx_mid, cy_mid, angle + 3)
-        cg_white.setColorAt(0.00, QColor(0, 0, 0, 0))
-        cg_white.setColorAt(0.04, GLOW_PURPLE)
-        cg_white.setColorAt(0.08, QColor(0, 0, 0, 0))
-        cg_white.setColorAt(0.50, QColor(0, 0, 0, 0))
-        cg_white.setColorAt(0.55, GLOW_PINK2)
-        cg_white.setColorAt(0.60, QColor(0, 0, 0, 0))
-        cg_white.setColorAt(1.00, QColor(0, 0, 0, 0))
-        p.fillPath(white_ring, cg_white)
-
-        # ── Card body ─────────────────────────────────────────────────────────
-        bg = NEW_CARD_HOV if is_hovered else NEW_CARD_BG
-        p.fillPath(border_inner, bg)
-
-        # Subtle grid pattern (matches CSS .grid)
+        # Grid pattern
         self._paint_card_grid(p, cx + 2, cy + 2, cw - 4, ch - 4)
 
-        # ── Icon block (left, matching other cards) ───────────────────────────
-        icon_x, icon_y, icon_w, icon_h = cx + 10, cy + 11, 50, 50
-        icon_path = QPainterPath()
-        icon_path.addRoundedRect(icon_x, icon_y, icon_w, icon_h, 10, 10)
+        # ── Content fades out as input opens ─────────────────────────────────
+        content_alpha = max(0.0, 1.0 - t_input * 2.5)
+        if content_alpha > 0.01:
+            p.setOpacity(content_alpha)
+            self._paint_new_card_content(p, cx, cy, cw, ch, angle)
+            p.setOpacity(1.0)
 
-        # Dark icon bg with subtle purple tint
+        # ── Inline input area fades in ────────────────────────────────────────
+        if t_input > 0.1:
+            input_alpha = min(1.0, (t_input - 0.1) / 0.4)
+            p.setOpacity(input_alpha)
+            self._paint_inline_input_bg(p, cx, cy, cw, ch)
+            p.setOpacity(1.0)
+
+    def _paint_new_card_content(
+        self, p: QPainter,
+        cx: int, cy: int, cw: int, ch: int,
+        angle: float,
+    ):
+        """Draws the icon + text label inside the new-session card."""
+        icon_x, icon_y, icon_w = cx + 10, cy + (ch - 40) // 2, 40
+        icon_h = 40
+
+        icon_path = QPainterPath()
+        icon_path.addRoundedRect(icon_x, icon_y, icon_w, icon_h, 9, 9)
+
         icon_bg = QLinearGradient(icon_x, icon_y, icon_x, icon_y + icon_h)
         icon_bg.setColorAt(0.0, QColor("#161329"))
         icon_bg.setColorAt(1.0, QColor("#1d1b4b"))
         p.fillPath(icon_path, icon_bg)
 
-        # Thin spinning border on icon (matches CSS #filter-icon border gradient)
+        # Spinning icon border
         icon_border_outer = QPainterPath()
-        icon_border_outer.addRoundedRect(icon_x - 1, icon_y - 1, icon_w + 2, icon_h + 2, 11, 11)
+        icon_border_outer.addRoundedRect(icon_x - 1, icon_y - 1, icon_w + 2, icon_h + 2, 10, 10)
         icon_border_inner = QPainterPath()
-        icon_border_inner.addRoundedRect(icon_x, icon_y, icon_w, icon_h, 10, 10)
-        icon_border_ring = icon_border_outer.subtracted(icon_border_inner)
+        icon_border_inner.addRoundedRect(icon_x, icon_y, icon_w, icon_h, 9, 9)
+        icon_border_ring  = icon_border_outer.subtracted(icon_border_inner)
         cg_icon = QConicalGradient(icon_x + icon_w / 2, icon_y + icon_h / 2, angle * 1.5)
         cg_icon.setColorAt(0.00, QColor("#3d3a4f"))
         cg_icon.setColorAt(0.50, QColor(0, 0, 0, 0))
@@ -939,48 +1089,63 @@ class DropZoneOverlay(QWidget):
         cg_icon.setColorAt(1.00, QColor("#3d3a4f"))
         p.fillPath(icon_border_ring, cg_icon)
 
-        # ＋ icon — hue cycles (blue→purple→pink→blue)
-        plus_color = QColor.fromHsvF(
-            (self._plus_hue % 360) / 360.0,
-            0.75,
-            1.0,
-        )
+        plus_color = QColor.fromHsvF((self._plus_hue % 360) / 360.0, 0.75, 1.0)
         p.setPen(plus_color)
-        p.setFont(QFont("Helvetica Neue", 22, QFont.Weight.Bold))
-        p.drawText(
-            QRect(icon_x, icon_y, icon_w, icon_h),
-            Qt.AlignmentFlag.AlignCenter,
-            "＋",
-        )
+        p.setFont(QFont("Helvetica Neue", 18, QFont.Weight.Bold))
+        p.drawText(QRect(icon_x, icon_y, icon_w, icon_h),
+                   Qt.AlignmentFlag.AlignCenter, "＋")
 
-        # ── Text (right side) ─────────────────────────────────────────────────
-        tx = cx + 70; tw = cw - 80
+        tx = cx + icon_x - cx + icon_w + 10
+        tw = cw - (tx - cx) - 10
 
         p.setPen(TEXT_WHITE)
         p.setFont(QFont("Helvetica Neue", 11, QFont.Weight.Bold))
-        p.drawText(
-            QRect(tx, cy + 10, tw - 10, 22),
-            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-            "New Session",
-        )
+        p.drawText(QRect(tx, cy + 8, tw, 20),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   "New Session")
+        p.setPen(TEXT_DIM)
+        p.setFont(QFont("Helvetica Neue", 9))
+        p.drawText(QRect(tx, cy + 30, tw, 18),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   "Create a new workspace")
+
+    def _paint_inline_input_bg(
+        self, p: QPainter,
+        cx: int, cy: int, cw: int, ch: int,
+    ):
+        """Draws the prompt label + input underline inside the expanded card."""
+        # Prompt label at top
         p.setPen(TEXT_DIM)
         p.setFont(QFont("Helvetica Neue", 9))
         p.drawText(
-            QRect(tx, cy + 36, tw, 20),
+            QRect(cx + 14, cy + 10, cw - 28, 16),
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-            "Create a new workspace",
+            "New workspace name",
         )
 
+        # Underline where QLineEdit sits
+        input_y = cy + int(ch * 0.52)
+        line_y  = input_y + 28
+        p.setPen(QPen(QColor(80, 60, 140, 180), 1.0))
+        p.drawLine(cx + 14, line_y, cx + cw - 14, line_y)
+
+        # Subtle glow under the line
+        line_glow = QLinearGradient(cx + 14, line_y, cx + cw - 14, line_y)
+        line_glow.setColorAt(0.0,  QColor(64, 47, 181, 0))
+        line_glow.setColorAt(0.35, QColor(64, 47, 181, 80))
+        line_glow.setColorAt(0.65, QColor(207, 48, 170, 80))
+        line_glow.setColorAt(1.0,  QColor(207, 48, 170, 0))
+        pen = QPen(QBrush(line_glow), 2.0)
+        p.setPen(pen)
+        p.drawLine(cx + 14, line_y + 1, cx + cw - 14, line_y + 1)
+
     def _paint_card_grid(self, p: QPainter, x: int, y: int, w: int, h: int):
-        """Subtle dot-grid inside the new session card (CSS .grid reference)."""
         grid_size = 16
         p.setPen(QPen(QColor(15, 15, 16, 180), 0.5))
-        # Vertical lines
         xi = x + (x % grid_size)
         while xi < x + w:
             p.drawLine(int(xi), int(y), int(xi), int(y + h))
             xi += grid_size
-        # Horizontal lines
         yi = y + (y % grid_size)
         while yi < y + h:
             p.drawLine(int(x), int(yi), int(x + w), int(yi))
@@ -1006,12 +1171,6 @@ class DropZoneOverlay(QWidget):
         p.drawText(QRect(fr.x() - 10, fr.y() + FOLDER_H + 4, FOLDER_W + 20, 16),
                    Qt.AlignmentFlag.AlignCenter, "tap a session ↓")
 
-    def _paint_cancel_hint(self, p: QPainter):
-        if self._pending_app or self._picker_mode:
-            p.setPen(QColor(136, 136, 153, 140))
-            p.setFont(QFont("Helvetica Neue", 8))
-            p.drawText(QRect(0, WIDGET_H - 28, WIDGET_W, 20),
-                       Qt.AlignmentFlag.AlignCenter, "Esc to cancel")
 
 
 # ── Per-card animation helper ─────────────────────────────────────────────────
