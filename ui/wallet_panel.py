@@ -458,7 +458,8 @@ class WalletPanel(QWidget):
             return
         g = s.geometry()
         self._final_x  = g.x() + g.width() - PANEL_WIDTH - 20
-        self._final_y  = g.y() + 20
+        # Position at bottom instead of top
+        self._final_y  = g.y() + g.height() - PANEL_HEIGHT - 20
         self._hidden_x = g.x() + g.width() + 10
         self.move(self._hidden_x, self._final_y)
 
