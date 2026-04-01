@@ -1,29 +1,41 @@
 """
 db.py — SQLite persistence layer for WorkSpace Manager.
 
-save_chrome_tabs fix:
-  • Tab with confirmed profile_dir  → chrome-profile:<dir>|<url>   (green badge)
-  • Tab with profile_email but no dir → chrome-profile-email:<email>|<url>  (amber ⚠)
-  • Tab with neither                → SKIPPED (no wrong-profile saves)
 """
 
 import sqlite3
 import os
+import threading
 from datetime import datetime
 from pathlib import Path
 
 DB_PATH = Path(os.getenv("APPDATA", ".")) / "WorkSpaceManager" / "workspace.db"
 
+# ── Connection Pool (thread-local) ───────────────────────────────────────────
+_local = threading.local()
 
 def get_conn() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    """Return cached connection for this thread (creates once)."""
+    if not hasattr(_local, "conn") or _local.conn is None:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # check_same_thread=False is safe because we use thread-local storage
+        _local.conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        _local.conn.row_factory = sqlite3.Row
+        _local.conn.execute("PRAGMA journal_mode=WAL")
+        _local.conn.execute("PRAGMA foreign_keys=ON")
+        # Keep connection alive across transactions (WAL mode handles concurrency)
+        _local.conn.execute("PRAGMA synchronous=NORMAL")
+    return _local.conn
 
 
+# Optional: graceful cleanup on app exit (call from main.py if desired)
+def close_all_connections():
+    """Close thread-local connection for current thread."""
+    if hasattr(_local, "conn") and _local.conn:
+        _local.conn.close()
+        _local.conn = None
+
+        
 def init_db():
     with get_conn() as conn:
         conn.executescript("""
