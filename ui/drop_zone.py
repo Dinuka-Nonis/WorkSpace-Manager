@@ -1,92 +1,123 @@
 """
-ui/drop_zone.py — Right-edge drop zone overlay.
+ui/drop_zone.py — Folder-style drop zone overlay.
 
-Changes in this version:
-  • Cancel button shown in picker/session-select mode so users can
-    dismiss an accidental drop without saving anything.
-  • Esc key press cancels and closes the overlay at any time.
-  • Auto-save timer on the session picker is removed entirely — the
-    overlay now stays open indefinitely until the user picks a session
-    OR explicitly cancels.
-  • All other behaviour (slide in/out, session pre-selection, new
-    session inline input, confirmed flash) is preserved.
+Behaviour:
+  • A macOS-style folder icon peeks from the top-right edge at all times.
+  • When a window drag starts the folder slides fully into view.
+  • When the cursor hovers over the folder, the paper tabs fan open AND
+    session cards drop down one-by-one like iOS notifications.
+  • Dropping onto a card saves the item to that session.
+  • Dropping onto the folder body when only one session exists auto-saves.
+  • "＋ New Session" card always appears below existing session cards.
+  • Esc / Cancel dismisses at any time.
+
+Public API (unchanged from original):
+  on_drag_started(app_info)
+  on_dropped(app_info)
+  on_drag_cancelled()
+  drop_zone_final_rect() -> tuple[int,int,int,int]
 """
 
+from __future__ import annotations
+
 import sys
-from PyQt6.QtWidgets import (
-    QWidget, QApplication, QLineEdit, QPushButton,
-    QHBoxLayout, QVBoxLayout
-)
+from PyQt6.QtWidgets import QWidget, QApplication, QLineEdit
 from PyQt6.QtCore import (
     Qt, QTimer, QPropertyAnimation, QEasingCurve,
-    QRect, pyqtProperty, QPoint
+    QRect, QRectF, pyqtProperty, QPoint, QSequentialAnimationGroup,
+    QParallelAnimationGroup, QPauseAnimation, QAbstractAnimation
 )
 from PyQt6.QtGui import (
     QPainter, QColor, QPainterPath, QLinearGradient,
-    QFont, QFontMetrics, QPen
+    QFont, QFontMetrics, QPen, QTransform, QBrush
 )
 
 import db
 
-# ── Design tokens ─────────────────────────────────────────────────────────────
-WALLET_BG       = QColor("#1a2e1a")
-WALLET_BG2      = QColor("#1e341e")
-WALLET_STITCH   = QColor("#3d5635")
-WALLET_GLOW     = QColor("#42d778")
-WALLET_TEXT     = QColor("#a7c59e")
-WALLET_TEXT_DIM = QColor("#698263")
-WALLET_CANCEL   = QColor("#ef4444")
-WALLET_CARD_COLORS = [
-    QColor("#635bff"),  # purple
-    QColor("#9bd86a"),  # green
-    QColor("#f59e0b"),  # amber
-    QColor("#ef4444"),  # red
-    QColor("#06b6d4"),  # cyan
-]
+# ── Dimensions ────────────────────────────────────────────────────────────────
+FOLDER_W        = 110          # folder icon width
+FOLDER_H        = 90           # folder icon height
+EDGE_PEEK       = 18           # px visible when hidden (just the tab)
+TOP_MARGIN      = 40           # distance from screen top
+WIDGET_W        = 340          # total overlay width (folder + cards)
+WIDGET_H        = 560          # total overlay height
 
-ZONE_WIDTH  = 280
-EDGE_HANDLE = 6   # px strip visible when fully hidden
+CARD_W          = 290
+CARD_H          = 70
+CARD_X          = 20           # x offset of cards inside widget
+CARD_GAP        = 10
+CARDS_START_Y   = FOLDER_H + 20   # y where first card rests (fully dropped)
 
-# Vertical layout constants
-HEADER_H        = 80
-APP_CARD_Y      = HEADER_H + 10
-APP_CARD_H      = 72
-SESSION_LIST_Y  = APP_CARD_Y + APP_CARD_H + 16
-CARD_H          = 52
-CARD_GAP        = 8
-NEW_BTN_H       = 40
-CANCEL_BTN_H    = 36
+# Paper layers (3 sheets that fan out behind folder lid)
+PAPER_COUNT     = 3
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+FOLDER_BODY     = QColor("#F5A623")   # amber body
+FOLDER_BODY2    = QColor("#E8941A")   # darker gradient end
+FOLDER_TAB      = QColor("#C87A10")   # tab / top flap
+FOLDER_LID      = QColor("#F5A623")
+PAPER_COLORS    = [QColor("#E0E0E0"), QColor("#ECECEC"), QColor("#F5F5F5")]
+
+CARD_BG         = QColor("#353535")
+CARD_HOVER_BG   = QColor("#424242")
+GRAD_TOP        = QColor("#d7cfcf")
+GRAD_BOT        = QColor("#9198e5")
+GRAD_HOVER_TOP  = QColor("#9198e5")
+GRAD_HOVER_BOT  = QColor("#712020")
+NEW_CARD_GRAD_T = QColor("#2a9d8f")
+NEW_CARD_GRAD_B = QColor("#264653")
+TEXT_WHITE      = QColor(255, 255, 255)
+TEXT_DIM        = QColor(180, 180, 180)
+CONFIRM_GREEN   = QColor("#42d778")
+
+
+class _CardState:
+    """Runtime state for one animated session card."""
+    def __init__(self, index: int):
+        self.index       = index
+        self.y_offset    = 0.0     # 0 = fully dropped, negative = hidden above
+        self.hovered     = False
+        self.scale       = 1.0
 
 
 class DropZoneOverlay(QWidget):
-    """
-    Wallet-style drop zone that slides in from the right edge during window drags.
-    """
+    """Folder-style drop zone that slides in from the top-right edge."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
+
+        self._sessions:        list[dict]   = []
+        self._card_states:     list[_CardState] = []
+        self._pending_app:     dict | None  = None
         self._active_session_id: int | None = None
-        self._sessions: list[dict] = []
-        self._pending_app: dict | None = None
-        self._hovered           = False
-        self._drop_confirmed    = False
-        self._confirmed_label   = ""
-        self._user_selected_session = False   # True once user clicks a card
-        self._picker_mode       = False       # True while waiting for session pick after drop
+        self._picker_mode      = False
+        self._drop_confirmed   = False
+        self._confirmed_label  = ""
+        self._confirmed_card_i = -1
+        self._folder_hovered   = False
+        self._cards_visible    = False
 
-        # Only used for the post-save confirmation flash — NOT for auto-saving
-        self._confirm_timer = QTimer(self)
-        self._confirm_timer.setSingleShot(True)
-        self._confirm_timer.timeout.connect(self._hide_after_confirm)
+        # Folder slide (0 = fully in, 1 = fully hidden)
+        self._slide_x = 1.0
 
-        self._slide_x = 1.0  # 0=fully visible, 1=fully hidden
+        # Paper fan angle (0 = flat, 1 = fanned open)
+        self._fan     = 0.0
+
+        # Per-card drop progress (0 = hidden above, 1 = fully dropped)
+        self._card_drops: list[float] = []
+
+        # Hover scale per card
+        self._card_scales: list[float] = []
+
+        # Confirm flash alpha
+        self._confirm_alpha = 0.0
 
         self._setup_window()
-        self._setup_animation()
         self._position_on_screen()
         self._refresh_sessions()
+        self._build_slide_anim()
 
-        # Build the "new session" inline input (hidden until needed)
+        # Inline new-session input
         self._new_sess_input = QLineEdit(self)
         self._new_sess_input.setPlaceholderText("Session name…")
         self._new_sess_input.setFixedHeight(32)
@@ -94,17 +125,22 @@ class DropZoneOverlay(QWidget):
         self._new_sess_input.returnPressed.connect(self._create_new_session)
         self._new_sess_input.setStyleSheet("""
             QLineEdit {
-                background: #2a3e2a; color: #a7c59e;
-                border: 1px solid #3d5635; border-radius: 6px;
-                padding: 0 8px; font-size: 12px;
+                background: #2a2a2a; color: #ffffff;
+                border: 1px solid #555; border-radius: 8px;
+                padding: 0 10px; font-size: 13px;
+                font-family: 'Poppins', 'Segoe UI', sans-serif;
             }
         """)
+
+        self._confirm_timer = QTimer(self)
+        self._confirm_timer.setSingleShot(True)
+        self._confirm_timer.timeout.connect(self._finish_confirm)
 
         _ref = QTimer(self)
         _ref.timeout.connect(self._refresh_sessions)
         _ref.start(5000)
 
-    # ── Window / animation setup ──────────────────────────────────────────────
+    # ── Window setup ──────────────────────────────────────────────────────────
 
     def _setup_window(self):
         self.setWindowFlags(
@@ -116,11 +152,6 @@ class DropZoneOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setMouseTracking(True)
 
-    def _setup_animation(self):
-        self._anim = QPropertyAnimation(self, b"slideX", self)
-        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._anim.setDuration(300)
-
     def _position_on_screen(self):
         screen = QApplication.primaryScreen()
         if not screen:
@@ -128,172 +159,212 @@ class DropZoneOverlay(QWidget):
         geo = screen.geometry()
         self._screen_geo = geo
         self.setGeometry(
-            geo.x() + geo.width() - ZONE_WIDTH,
-            geo.y(),
-            ZONE_WIDTH,
-            geo.height()
+            geo.x() + geo.width() - WIDGET_W,
+            geo.y() + TOP_MARGIN,
+            WIDGET_W,
+            WIDGET_H
         )
         self._apply_slide(1.0)
 
     # ── Slide property ────────────────────────────────────────────────────────
 
+    def _build_slide_anim(self):
+        self._slide_anim = QPropertyAnimation(self, b"slideX", self)
+        self._slide_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._slide_anim.setDuration(320)
+
     def getSlideX(self) -> float:
         return self._slide_x
 
-    def setSlideX(self, value: float):
-        self._slide_x = value
-        self._apply_slide(value)
+    def setSlideX(self, v: float):
+        self._slide_x = v
+        self._apply_slide(v)
         self.update()
 
     slideX = pyqtProperty(float, getSlideX, setSlideX)
 
-    def _apply_slide(self, value: float):
+    def _apply_slide(self, v: float):
         if not hasattr(self, "_screen_geo"):
             return
         geo    = self._screen_geo
-        offset = int((ZONE_WIDTH - EDGE_HANDLE) * value)
-        self.move(geo.x() + geo.width() - ZONE_WIDTH + offset, geo.y())
+        # slide so only EDGE_PEEK px of the folder tab is visible when hidden
+        offset = int((FOLDER_W - EDGE_PEEK) * v)
+        self.move(
+            geo.x() + geo.width() - WIDGET_W + offset,
+            geo.y() + TOP_MARGIN
+        )
 
-    # ── Keyboard ──────────────────────────────────────────────────────────────
+    def _slide_in(self):
+        self._slide_anim.stop()
+        self._slide_anim.setStartValue(self._slide_x)
+        self._slide_anim.setEndValue(0.0)
+        self._slide_anim.start()
 
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Escape:
-            self._cancel()
-        else:
-            super().keyPressEvent(event)
+    def _slide_out(self):
+        self._cards_visible = False
+        self._hide_cards()
+        self._close_fan()
+        QTimer.singleShot(250, self.__do_slide_out)
+
+    def __do_slide_out(self):
+        self._slide_anim.stop()
+        self._slide_anim.setStartValue(self._slide_x)
+        self._slide_anim.setEndValue(1.0)
+        self._slide_anim.start()
+
+    # ── Fan property ──────────────────────────────────────────────────────────
+
+    def getFan(self) -> float:
+        return self._fan
+
+    def setFan(self, v: float):
+        self._fan = v
+        self.update()
+
+    fan = pyqtProperty(float, getFan, setFan)
+
+    def _open_fan(self):
+        if not hasattr(self, "_fan_anim"):
+            self._fan_anim = QPropertyAnimation(self, b"fan", self)
+            self._fan_anim.setEasingCurve(QEasingCurve.Type.OutBack)
+            self._fan_anim.setDuration(380)
+        self._fan_anim.stop()
+        self._fan_anim.setStartValue(self._fan)
+        self._fan_anim.setEndValue(1.0)
+        self._fan_anim.start()
+
+    def _close_fan(self):
+        if not hasattr(self, "_fan_anim"):
+            return
+        self._fan_anim.stop()
+        self._fan_anim.setEasingCurve(QEasingCurve.Type.InCubic)
+        self._fan_anim.setDuration(220)
+        self._fan_anim.setStartValue(self._fan)
+        self._fan_anim.setEndValue(0.0)
+        self._fan_anim.start()
+
+    # ── Card drop animations ──────────────────────────────────────────────────
+
+    def _drop_cards(self):
+        """Drop session cards down one by one with stagger."""
+        n = len(self._sessions) + 1  # +1 for New Session card
+        # Rebuild drop progress list if needed
+        while len(self._card_drops) < n:
+            self._card_drops.append(0.0)
+        while len(self._card_scales) < n:
+            self._card_scales.append(1.0)
+        self._card_drops = self._card_drops[:n]
+        self._card_scales = self._card_scales[:n]
+
+        # Kill old anims
+        if hasattr(self, "_drop_anims"):
+            for a in self._drop_anims:
+                a.stop()
+
+        self._drop_anims = []
+        for i in range(n):
+            prop = f"cardDrop{i}".encode()
+            # Dynamically create property per card index
+            anim = _CardDropAnim(self, i, self._card_drops)
+            anim.setDuration(340)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.setStartValue(0.0)
+            anim.setEndValue(1.0)
+            # stagger
+            delay_timer = QTimer(self)
+            delay_timer.setSingleShot(True)
+            delay_index = i
+            delay_anim  = anim
+            def _start(a=delay_anim): a.start()
+            delay_timer.timeout.connect(_start)
+            delay_timer.start(i * 80)
+            self._drop_anims.append(anim)
+
+    def _hide_cards(self):
+        """Slide all cards back up."""
+        if hasattr(self, "_drop_anims"):
+            for a in self._drop_anims:
+                a.stop()
+        n = len(self._card_drops)
+        for i in range(n):
+            self._card_drops[i] = 0.0
+        self.update()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def drop_zone_final_rect(self) -> tuple[int, int, int, int]:
-        """
-        Return the rect for the FULLY VISIBLE position.
-
-        This is what the DragWatcher must use for its cursor check.
-        Do NOT use geometry() here — during animation it is wrong.
-        """
         if not hasattr(self, "_screen_geo"):
             s = QApplication.primaryScreen()
-            geo = s.geometry() if s else QApplication.primaryScreen().geometry()
+            geo = s.geometry()
         else:
             geo = self._screen_geo
         return (
-            geo.x() + geo.width() - ZONE_WIDTH,
-            geo.y(),
-            ZONE_WIDTH,
-            geo.height(),
+            geo.x() + geo.width() - WIDGET_W,
+            geo.y() + TOP_MARGIN,
+            WIDGET_W,
+            WIDGET_H,
         )
 
     def on_drag_started(self, app_info: dict):
-        self._pending_app           = app_info
-        self._drop_confirmed        = False
-        self._hovered               = False
-        self._user_selected_session = False
-        self._picker_mode           = False
+        self._pending_app      = app_info
+        self._drop_confirmed   = False
+        self._picker_mode      = False
+        self._cards_visible    = False
+        self._folder_hovered   = False
         self._new_sess_input.hide()
         self._refresh_sessions()
         self._slide_in()
         self.update()
 
     def on_dropped(self, app_info: dict):
-        """Called when the user releases inside our zone."""
-        # Check if release was over the "+ New Session" button
-        cursor_y = self.mapFromGlobal(self.cursor().pos()).y()
-        new_btn_y = SESSION_LIST_Y + len(self._sessions) * (CARD_H + CARD_GAP) + 8
-        over_new_btn = (new_btn_y <= cursor_y <= new_btn_y + NEW_BTN_H)
+        """Called when user releases inside our zone."""
+        cursor_local = self.mapFromGlobal(self.cursor().pos())
+        cx, cy = cursor_local.x(), cursor_local.y()
 
-        if not self._sessions or over_new_btn:
-            # No sessions, or explicitly dropped on "New Session"
+        # Check if dropped on a session card
+        card_i = self._card_at(cx, cy)
+        if card_i is not None:
+            if card_i == len(self._sessions):
+                # New session card
+                self._show_new_session_input(app_info)
+            else:
+                self._active_session_id = self._sessions[card_i]["id"]
+                self._save_to_session(app_info, confirmed_card=card_i)
+            return
+
+        # Dropped on folder body
+        if not self._sessions:
             self._show_new_session_input(app_info)
-        elif not self._user_selected_session and len(self._sessions) > 1:
-            # Multiple sessions, nothing pre-selected — enter picker mode.
-            # Do NOT auto-save; wait for explicit selection or cancel.
+        elif len(self._sessions) == 1:
+            self._active_session_id = self._sessions[0]["id"]
+            self._save_to_session(app_info, confirmed_card=0)
+        else:
+            # Multiple sessions — enter picker mode (cards should already be visible)
             self._pending_app = app_info
             self._picker_mode = True
             self.update()
-        else:
-            # Either one session or user already clicked a card
-            self._save_to_session(app_info)
-
-    def request_new_session(self):
-        """Called when the user taps '+ New Session' even when sessions exist."""
-        self._show_new_session_input(self._pending_app)
 
     def on_drag_cancelled(self):
-        self._pending_app   = None
-        self._picker_mode   = False
+        self._pending_app  = None
+        self._picker_mode  = False
         self._new_sess_input.hide()
         if not self._drop_confirmed:
             self._slide_out()
 
     def set_active_session(self, session_id: int):
-        self._active_session_id     = session_id
-        self._user_selected_session = True
+        self._active_session_id = session_id
         self._refresh_sessions()
         self.update()
 
-    # ── Cancel ────────────────────────────────────────────────────────────────
-
-    def _cancel(self):
-        """Discard the pending drop and slide out — triggered by Cancel btn or Esc."""
-        self._confirm_timer.stop()
-        self._pending_app   = None
-        self._picker_mode   = False
-        self._drop_confirmed = False
-        self._new_sess_input.hide()
-        self._slide_out()
-
-    # ── Session picker mode (shown after drop when ambiguous) ─────────────────
-
-    def _show_new_session_input(self, app_info: dict):
-        """Show the inline name input for a brand-new session.
-        Positions the input below any existing session cards."""
-        self._pending_app = app_info
-        input_y = SESSION_LIST_Y + len(self._sessions) * (CARD_H + CARD_GAP) + 8
-        self._new_sess_input.setGeometry(20, input_y, ZONE_WIDTH - 40, 32)
-        self._new_sess_input.clear()
-        self._new_sess_input.show()
-        self._new_sess_input.setFocus()
-        self.update()
-
-    def _create_new_session(self):
-        name = self._new_sess_input.text().strip() or "My Workspace"
-        self._new_sess_input.hide()
-        sid = db.create_session(name)
-        self._active_session_id     = sid
-        self._user_selected_session = True
-        self._refresh_sessions()
-        if self._pending_app:
-            self._save_to_session(self._pending_app)
-
-    # ── Slide helpers ─────────────────────────────────────────────────────────
-
-    def _slide_in(self):
-        self._anim.stop()
-        self._anim.setStartValue(self._slide_x)
-        self._anim.setEndValue(0.0)
-        self._anim.start()
-
-    def _slide_out(self):
-        self._anim.stop()
-        self._anim.setStartValue(self._slide_x)
-        self._anim.setEndValue(1.0)
-        self._anim.start()
-
-    def _hide_after_confirm(self):
-        """Called only after a successful save — just slides out."""
-        self._drop_confirmed        = False
-        self._user_selected_session = False
-        self._slide_out()
-
-    # ── Data ──────────────────────────────────────────────────────────────────
+    # ── Internal session ops ──────────────────────────────────────────────────
 
     def _refresh_sessions(self):
         self._sessions = db.get_all_sessions()[:6]
-        if self._active_session_id is None and self._sessions:
+        if not self._active_session_id and self._sessions:
             self._active_session_id = self._sessions[0]["id"]
         self.update()
 
-    def _save_to_session(self, app_info: dict):
+    def _save_to_session(self, app_info: dict, confirmed_card: int = 0):
         self._confirm_timer.stop()
         self._picker_mode = False
 
@@ -316,61 +387,140 @@ class DropZoneOverlay(QWidget):
         else:
             print(f"[DropZone] Skipped — empty path_or_url for '{item['label']}'")
 
-        self._confirmed_label       = item["label"]
-        self._drop_confirmed        = True
-        self._pending_app           = None
-        self._user_selected_session = False
+        self._confirmed_label   = item["label"]
+        self._confirmed_card_i  = confirmed_card
+        self._drop_confirmed    = True
+        self._pending_app       = None
         self._refresh_sessions()
         self.update()
-        self._confirm_timer.start(2200)   # flash then slide out
+        self._confirm_timer.start(2000)
 
-    # ── Mouse events ──────────────────────────────────────────────────────────
-
-    def enterEvent(self, event):
-        self._hovered = True
+    def _show_new_session_input(self, app_info: dict):
+        self._pending_app = app_info
+        n_cards = len(self._sessions)
+        input_y = CARDS_START_Y + n_cards * (CARD_H + CARD_GAP) + 8
+        self._new_sess_input.setGeometry(CARD_X, input_y, CARD_W, 36)
+        self._new_sess_input.clear()
+        self._new_sess_input.show()
+        self._new_sess_input.setFocus()
         self.update()
 
-    def leaveEvent(self, event):
-        self._hovered = False
-        self.update()
+    def _create_new_session(self):
+        name = self._new_sess_input.text().strip() or "My Workspace"
+        self._new_sess_input.hide()
+        sid = db.create_session(name)
+        self._active_session_id = sid
+        self._refresh_sessions()
+        if self._pending_app:
+            idx = next((i for i, s in enumerate(self._sessions) if s["id"] == sid), 0)
+            self._save_to_session(self._pending_app, confirmed_card=idx)
+
+    def _finish_confirm(self):
+        self._drop_confirmed   = False
+        self._confirmed_card_i = -1
+        self._slide_out()
+
+    def _cancel(self):
+        self._confirm_timer.stop()
+        self._pending_app    = None
+        self._picker_mode    = False
+        self._drop_confirmed = False
+        self._new_sess_input.hide()
+        self._slide_out()
+
+    # ── Hit-testing ───────────────────────────────────────────────────────────
+
+    def _folder_rect(self) -> QRect:
+        """The folder body rect in widget coordinates."""
+        return QRect(WIDGET_W - FOLDER_W - 4, 0, FOLDER_W, FOLDER_H)
+
+    def _card_rect(self, index: int) -> QRect:
+        """Rect for card[index] at its fully-dropped position."""
+        y = CARDS_START_Y + index * (CARD_H + CARD_GAP)
+        return QRect(CARD_X, y, CARD_W, CARD_H)
+
+    def _card_at(self, x: int, y: int) -> int | None:
+        """Return card index under (x,y) or None. Includes New Session card."""
+        total = len(self._sessions) + 1
+        for i in range(total):
+            if i >= len(self._card_drops):
+                continue
+            drop_frac = self._card_drops[i]
+            if drop_frac < 0.05:
+                continue
+            base_y   = CARDS_START_Y + i * (CARD_H + CARD_GAP)
+            # Cards animate from above — start_y offset
+            actual_y = base_y - int((1.0 - drop_frac) * (CARD_H + 40))
+            r = QRect(CARD_X, actual_y, CARD_W, CARD_H)
+            if r.contains(x, y):
+                return i
+        return None
+
+    # ── Mouse ─────────────────────────────────────────────────────────────────
+
+    def mouseMoveEvent(self, event):
+        x, y = int(event.position().x()), int(event.position().y())
+        fr   = self._folder_rect()
+        now_over_folder = fr.contains(x, y)
+
+        if now_over_folder and not self._folder_hovered:
+            self._folder_hovered = True
+            self._cards_visible  = True
+            self._open_fan()
+            self._drop_cards()
+            self.update()
+        elif not now_over_folder and self._folder_hovered:
+            self._folder_hovered = False
+            # Don't hide cards once shown during a drag
+
+        # Update card hover states
+        changed = False
+        total = len(self._sessions) + 1
+        while len(self._card_scales) < total:
+            self._card_scales.append(1.0)
+        for i in range(total):
+            r     = self._card_rect(i)
+            hover = r.contains(x, y) and (i < len(self._card_drops) and self._card_drops[i] > 0.5)
+            want  = 1.05 if hover else 1.0
+            if abs(self._card_scales[i] - want) > 0.001:
+                self._card_scales[i] = want
+                changed = True
+        if changed:
+            self.update()
 
     def mousePressEvent(self, event):
-        y = event.position().y()
-
-        # Cancel button (visible in picker mode)
-        if self._picker_mode or self._new_sess_input.isVisible():
-            cancel_y = self._cancel_btn_y()
-            if cancel_y <= y <= cancel_y + CANCEL_BTN_H:
-                self._cancel()
-                return
-
-        # Clicking a session card always selects it as active target
-        for i, sess in enumerate(self._sessions):
-            card_y = SESSION_LIST_Y + i * (CARD_H + CARD_GAP)
-            if card_y <= y <= card_y + CARD_H:
-                self._active_session_id     = sess["id"]
-                self._user_selected_session = True
-                self.update()
-
-                # If a drop is pending (picker mode), save immediately
-                if self._pending_app is not None:
+        x, y = int(event.position().x()), int(event.position().y())
+        card_i = self._card_at(x, y)
+        if card_i is not None:
+            if card_i == len(self._sessions):
+                self._show_new_session_input(self._pending_app)
+            else:
+                self._active_session_id = self._sessions[card_i]["id"]
+                if self._pending_app or self._picker_mode:
                     app = self._pending_app
                     self._pending_app = None
                     self._picker_mode = False
-                    self._save_to_session(app)
-                return
+                    self._save_to_session(app, confirmed_card=card_i)
+                else:
+                    self.update()
+            return
 
-        # "+ New Session" button
-        new_btn_y = SESSION_LIST_Y + len(self._sessions) * (CARD_H + CARD_GAP) + 8
-        if new_btn_y <= y <= new_btn_y + NEW_BTN_H and self._new_sess_input.isHidden():
-            self._show_new_session_input(self._pending_app)
+        # Cancel button area (bottom of widget)
+        if y > WIDGET_H - 52:
+            self._cancel()
 
-    # ── Layout helper ─────────────────────────────────────────────────────────
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self._cancel()
+        else:
+            super().keyPressEvent(event)
 
-    def _cancel_btn_y(self) -> int:
-        """Y position of the Cancel button — below sessions and new-session btn."""
-        base = SESSION_LIST_Y + len(self._sessions) * (CARD_H + CARD_GAP) + 8
-        return base + NEW_BTN_H + 10
+    def enterEvent(self, event):
+        self.update()
+
+    def leaveEvent(self, event):
+        self._folder_hovered = False
+        self.update()
 
     # ── Paint ─────────────────────────────────────────────────────────────────
 
@@ -379,220 +529,306 @@ class DropZoneOverlay(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
 
-        w = self.width()
-        h = self.height()
-
-        # Background
-        bg = QPainterPath()
-        bg.addRoundedRect(8, 0, w - 8, h, 20, 20)
-        p.fillPath(bg, WALLET_BG)
-
-        # Stitched border
-        sp = QPen(WALLET_STITCH, 1.2, Qt.PenStyle.DashLine)
-        sp.setDashPattern([4, 3])
-        p.setPen(sp)
-        inner = QPainterPath()
-        inner.addRoundedRect(14, 6, w - 20, h - 12, 15, 15)
-        p.drawPath(inner)
-
         if self._drop_confirmed:
-            self._paint_confirmed(p, w, h)
-        elif self._pending_app is not None or self._picker_mode:
-            self._paint_active(p, w, h)
+            self._paint_folder(p)
+            self._paint_cards(p)
+            self._paint_confirm_overlay(p)
         else:
-            self._paint_idle(p, w, h)
+            self._paint_folder(p)
+            if self._cards_visible or self._picker_mode:
+                self._paint_cards(p)
+            if self._picker_mode:
+                self._paint_picker_hint(p)
 
+        self._paint_cancel_hint(p)
         p.end()
 
-    # ── Idle state ────────────────────────────────────────────────────────────
+    # ── Folder painting ───────────────────────────────────────────────────────
 
-    def _paint_idle(self, p, w, h):
-        p.setPen(WALLET_TEXT)
-        p.setFont(QFont("Helvetica Neue", 11, QFont.Weight.Bold))
-        p.drawText(QRect(20, 24, w - 40, 28), Qt.AlignmentFlag.AlignLeft, "WORKSPACE")
+    def _paint_folder(self, p: QPainter):
+        fan  = self._fan
+        fr   = self._folder_rect()
+        fx   = fr.x()
+        fy   = fr.y()
+        fw   = fr.width()
+        fh   = fr.height()
 
-        p.setPen(WALLET_TEXT_DIM)
-        p.setFont(QFont("Helvetica Neue", 9))
-        p.drawText(QRect(20, 50, w - 40, 20), Qt.AlignmentFlag.AlignLeft,
-                   "Drag a window to the right edge to save")
+        # ── Paper sheets behind folder (fan effect) ──
+        for sheet in range(PAPER_COUNT):
+            max_angle = 14 + sheet * 9           # degrees of rotation at full fan
+            angle     = fan * max_angle
+            color     = PAPER_COLORS[sheet]
+            p.save()
+            # Rotate from bottom-centre of folder
+            p.translate(fx + fw / 2, fy + fh)
+            p.rotate(-angle + (PAPER_COUNT - sheet - 1) * 3)
+            p.translate(-(fx + fw / 2), -(fy + fh))
+            pp = QPainterPath()
+            pp.addRoundedRect(fx + 6, fy + 10, fw - 12, fh - 10, 10, 10)
+            p.fillPath(pp, color)
+            p.restore()
 
-        self._paint_session_cards(p, w, show_active_dot=True)
+        # ── Folder body ──────────────────────────────
+        body = QPainterPath()
+        body.addRoundedRect(fx, fy + 14, fw, fh - 14, 12, 12)
+        grad = QLinearGradient(fx, fy + 14, fx, fy + fh)
+        grad.setColorAt(0, FOLDER_BODY)
+        grad.setColorAt(1, FOLDER_BODY2)
+        p.fillPath(body, grad)
 
-        p.setPen(WALLET_TEXT_DIM)
-        p.setFont(QFont("Helvetica Neue", 8))
-        p.drawText(QRect(20, h - 55, w - 40, 40), Qt.AlignmentFlag.AlignCenter,
-                   "Click a card to switch target session")
+        # Tab (top-left bump)
+        tab = QPainterPath()
+        tab.addRoundedRect(fx, fy + 4, fw * 0.45, 14, 6, 6)
+        p.fillPath(tab, FOLDER_TAB)
 
-    # ── Active drag / picker state ────────────────────────────────────────────
+        # ── Lid (top flap, rotates open with fan) ────
+        lid_angle = fan * -46          # matches original CSS rotateX(-46deg) feel
+        p.save()
+        p.translate(fx + fw / 2, fy + 14)
+        # We fake perspective with a vertical scale
+        scale_y = max(0.05, 1.0 - fan * 0.92)
+        p.scale(1.0, scale_y)
+        p.translate(-(fx + fw / 2), -(fy + 14))
+        lid_right_w = fw * 0.55
+        lid = QPainterPath()
+        lid.moveTo(fx + fw * 0.45, fy + 14)
+        lid.lineTo(fx + fw, fy + 14)
+        lid.lineTo(fx + fw, fy + fh * 0.38)
+        lid.lineTo(fx + fw * 0.45, fy + fh * 0.38)
+        lid.closeSubpath()
+        # Small connector triangle
+        tri = QPainterPath()
+        tri.moveTo(fx + fw * 0.45 - 6, fy + 14)
+        tri.lineTo(fx + fw * 0.45, fy + 4)
+        tri.lineTo(fx + fw * 0.45, fy + 14)
+        tri.closeSubpath()
+        lid_grad = QLinearGradient(fx, fy, fx, fy + fh * 0.5)
+        lid_grad.setColorAt(0, FOLDER_LID.lighter(108))
+        lid_grad.setColorAt(1, FOLDER_LID)
+        p.fillPath(lid, lid_grad)
+        p.fillPath(tri, FOLDER_BODY2)
 
-    def _paint_active(self, p, w, h):
-        app = self._pending_app
+        # Glow rim on lid when hovered
+        if self._folder_hovered or fan > 0.1:
+            p.setPen(QPen(QColor(255, 200, 80, 120), 1.5))
+            p.drawPath(lid)
+        p.restore()
 
-        # Glow when hovered
-        if self._hovered:
-            gp = QPainterPath()
-            gp.addRoundedRect(8, 0, w - 8, h, 20, 20)
-            gc = QColor(WALLET_GLOW)
-            gc.setAlpha(18)
-            p.fillPath(gp, gc)
-            border = QPainterPath()
-            border.addRoundedRect(10, 2, w - 14, h - 4, 18, 18)
-            p.setPen(QPen(WALLET_GLOW, 2.0))
-            p.drawPath(border)
+        # Drop-target glow ring when dragging
+        if self._pending_app and not self._drop_confirmed:
+            glow = QPainterPath()
+            glow.addRoundedRect(fx - 3, fy - 3, fw + 6, fh + 6, 14, 14)
+            p.setPen(QPen(QColor(245, 166, 35, 160), 2.0))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(glow)
 
-        # Header
-        if self._picker_mode:
-            p.setPen(WALLET_GLOW)
-            p.setFont(QFont("Helvetica Neue", 11, QFont.Weight.Bold))
-            p.drawText(QRect(20, 18, w - 40, 24), Qt.AlignmentFlag.AlignLeft, "CHOOSE SESSION")
-            p.setPen(WALLET_TEXT_DIM)
-            p.setFont(QFont("Helvetica Neue", 9))
-            p.drawText(QRect(20, 44, w - 40, 18), Qt.AlignmentFlag.AlignLeft,
-                       "Tap a card below · or cancel")
-        else:
-            p.setPen(WALLET_GLOW)
-            p.setFont(QFont("Helvetica Neue", 11, QFont.Weight.Bold))
-            p.drawText(QRect(20, 18, w - 40, 24), Qt.AlignmentFlag.AlignLeft, "DROP HERE")
-            p.setPen(WALLET_TEXT_DIM)
-            p.setFont(QFont("Helvetica Neue", 9))
-            p.drawText(QRect(20, 44, w - 40, 18), Qt.AlignmentFlag.AlignLeft,
-                       "Release to save to session")
+        # Label
+        p.setPen(QColor(80, 50, 10))
+        f = QFont("Segoe UI", 7, QFont.Weight.Bold)
+        p.setFont(f)
+        p.drawText(QRect(fx, fy + fh - 20, fw, 18),
+                   Qt.AlignmentFlag.AlignCenter, "WORKSPACE")
 
-        # App preview card (only when we actually have an app to preview)
-        if app:
-            ap = QPainterPath()
-            ap.addRoundedRect(20, APP_CARD_Y, w - 40, APP_CARD_H, 12, 12)
-            p.fillPath(ap, WALLET_CARD_COLORS[0])
+    # ── Session / notification cards ──────────────────────────────────────────
 
-            p.setPen(QColor(255, 255, 255))
-            lf = QFont("Helvetica Neue", 10, QFont.Weight.Bold)
-            p.setFont(lf)
-            label = app.get("label", "Unknown")
-            label = QFontMetrics(lf).elidedText(label, Qt.TextElideMode.ElideRight, w - 70)
-            p.drawText(QRect(30, APP_CARD_Y + 12, w - 60, 26),
-                       Qt.AlignmentFlag.AlignVCenter, label)
-            p.setPen(QColor(255, 255, 255, 130))
-            p.setFont(QFont("Helvetica Neue", 8))
-            p.drawText(QRect(30, APP_CARD_Y + 38, w - 60, 20),
-                       Qt.AlignmentFlag.AlignVCenter, app.get("type", "app").upper())
+    def _paint_cards(self, p: QPainter):
+        total = len(self._sessions) + 1   # +1 for New Session
 
-        # Session list
-        self._paint_session_cards(p, w, show_active_dot=True)
+        while len(self._card_drops) < total:
+            self._card_drops.append(0.0)
+        while len(self._card_scales) < total:
+            self._card_scales.append(1.0)
 
-        # "+ New Session" button
-        if self._new_sess_input.isHidden():
-            self._paint_new_session_btn(p, w)
+        for i in range(total):
+            drop_frac = self._card_drops[i] if i < len(self._card_drops) else 0.0
+            if drop_frac < 0.01:
+                continue
 
-        # Cancel button — always visible when a drop is pending
-        self._paint_cancel_btn(p, w)
+            scale    = self._card_scales[i] if i < len(self._card_scales) else 1.0
+            is_new   = (i == len(self._sessions))
+            is_sess  = not is_new
+            sess     = self._sessions[i] if is_sess else None
+            is_active = is_sess and sess and sess["id"] == self._active_session_id
+            is_confirmed = (i == self._confirmed_card_i and self._drop_confirmed)
 
-    # ── Confirmed state ───────────────────────────────────────────────────────
+            base_y   = CARDS_START_Y + i * (CARD_H + CARD_GAP)
+            # Slide in from above
+            slide_off = int((1.0 - drop_frac) * (CARD_H + 50))
+            cy        = base_y - slide_off
 
-    def _paint_confirmed(self, p, w, h):
-        gp = QPainterPath()
-        gp.addRoundedRect(8, 0, w - 8, h, 20, 20)
-        gc = QColor(WALLET_GLOW)
-        gc.setAlpha(22)
-        p.fillPath(gp, gc)
-        border = QPainterPath()
-        border.addRoundedRect(10, 2, w - 14, h - 4, 18, 18)
-        p.setPen(QPen(WALLET_GLOW, 2.0))
-        p.drawPath(border)
+            # Scale around card centre
+            cx_centre = CARD_X + CARD_W / 2
+            cy_centre = cy + CARD_H / 2
+            p.save()
+            p.translate(cx_centre, cy_centre)
+            p.scale(scale, scale)
+            p.translate(-cx_centre, -cy_centre)
 
-        cx, cy = w // 2, h // 2 - 60
-        cp = QPainterPath()
-        cp.addEllipse(cx - 28, cy - 28, 56, 56)
-        p.fillPath(cp, WALLET_GLOW)
-        p.setPen(QColor(255, 255, 255))
-        p.setFont(QFont("Helvetica Neue", 22, QFont.Weight.Bold))
-        p.drawText(QRect(cx - 28, cy - 28, 56, 56), Qt.AlignmentFlag.AlignCenter, "✓")
+            # Card background
+            cr = QRectF(CARD_X, cy, CARD_W, CARD_H)
+            bg_path = QPainterPath()
+            bg_path.addRoundedRect(cr, 20, 20)
 
-        p.setPen(WALLET_GLOW)
-        p.setFont(QFont("Helvetica Neue", 11, QFont.Weight.Bold))
-        p.drawText(QRect(20, h // 2 + 10, w - 40, 28), Qt.AlignmentFlag.AlignCenter, "SAVED")
+            if is_confirmed:
+                p.fillPath(bg_path, CONFIRM_GREEN.darker(110))
+            elif is_new:
+                grad = QLinearGradient(CARD_X, cy, CARD_X, cy + CARD_H)
+                grad.setColorAt(0, NEW_CARD_GRAD_T)
+                grad.setColorAt(1, NEW_CARD_GRAD_B)
+                p.fillPath(bg_path, grad)
+            else:
+                bg_col = CARD_HOVER_BG if scale > 1.01 else CARD_BG
+                p.fillPath(bg_path, bg_col)
 
-        lf = QFont("Helvetica Neue", 9)
-        p.setPen(WALLET_TEXT)
-        p.setFont(lf)
-        label = QFontMetrics(lf).elidedText(self._confirmed_label,
-                                             Qt.TextElideMode.ElideRight, w - 60)
-        p.drawText(QRect(20, h // 2 + 42, w - 40, 22), Qt.AlignmentFlag.AlignCenter, label)
+            # Active session indicator (subtle border)
+            if is_active and not is_new:
+                p.setPen(QPen(QColor(245, 166, 35, 200), 2.0))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawPath(bg_path)
 
-        sess_name = next((s["name"] for s in self._sessions
-                          if s["id"] == self._active_session_id), "Session")
-        p.setPen(WALLET_TEXT_DIM)
-        p.setFont(QFont("Helvetica Neue", 8))
-        p.drawText(QRect(20, h // 2 + 68, w - 40, 20),
-                   Qt.AlignmentFlag.AlignCenter, f"→ {sess_name}")
+            # Gradient square (icon area)  — matches your HTML .img
+            icon_x = CARD_X + 10
+            icon_y = cy + 10
+            icon_w = 50
+            icon_h = 50
+            icon_path = QPainterPath()
+            icon_path.addRoundedRect(icon_x, icon_y, icon_w, icon_h, 10, 10)
 
-    # ── Shared: session card list ─────────────────────────────────────────────
+            if is_confirmed:
+                icon_grad = QLinearGradient(icon_x, icon_y, icon_x, icon_y + icon_h)
+                icon_grad.setColorAt(0, QColor("#42d778"))
+                icon_grad.setColorAt(1, QColor("#1a8a40"))
+            elif is_new:
+                icon_grad = QLinearGradient(icon_x, icon_y, icon_x, icon_y + icon_h)
+                icon_grad.setColorAt(0, NEW_CARD_GRAD_B)
+                icon_grad.setColorAt(1, NEW_CARD_GRAD_T)
+            elif scale > 1.01:
+                # hover state — matches .card:hover > .img
+                icon_grad = QLinearGradient(icon_x, icon_y, icon_x, icon_y + icon_h)
+                icon_grad.setColorAt(0, GRAD_HOVER_TOP)
+                icon_grad.setColorAt(1, GRAD_HOVER_BOT)
+            else:
+                icon_grad = QLinearGradient(icon_x, icon_y, icon_x, icon_y + icon_h)
+                icon_grad.setColorAt(0, GRAD_TOP)
+                icon_grad.setColorAt(1, GRAD_BOT)
+            p.fillPath(icon_path, icon_grad)
 
-    def _paint_session_cards(self, p, w, show_active_dot: bool = False):
-        """Draw clickable session cards starting at SESSION_LIST_Y."""
-        for i, sess in enumerate(self._sessions):
-            color    = WALLET_CARD_COLORS[i % len(WALLET_CARD_COLORS)]
-            is_active = (sess["id"] == self._active_session_id)
-            card_y   = SESSION_LIST_Y + i * (CARD_H + CARD_GAP)
+            # Icon centre text
+            p.setPen(TEXT_WHITE)
+            p.setFont(QFont("Segoe UI", 16))
+            p.drawText(QRect(icon_x, icon_y, icon_w, icon_h),
+                       Qt.AlignmentFlag.AlignCenter,
+                       "✓" if is_confirmed else ("＋" if is_new else "◈"))
 
-            sh = QPainterPath()
-            sh.addRoundedRect(22, card_y + 3, w - 44, CARD_H, 10, 10)
-            p.fillPath(sh, QColor(0, 0, 0, 40))
+            # Text area — mirrors your HTML .textBox
+            tx = CARD_X + 70
+            tw = CARD_W - 80
 
-            cp = QPainterPath()
-            cp.addRoundedRect(20, card_y, w - 40, CARD_H, 10, 10)
-            cc = QColor(color)
-            if is_active:
-                cc = cc.lighter(115)
-            p.fillPath(cp, cc)
+            if is_confirmed:
+                # Title
+                p.setPen(TEXT_WHITE)
+                p.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+                p.drawText(QRect(tx, cy + 10, tw, 22),
+                           Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                           "Saved!")
+                # Body
+                p.setPen(TEXT_DIM)
+                p.setFont(QFont("Segoe UI", 9))
+                fm  = QFontMetrics(p.font())
+                lbl = fm.elidedText(self._confirmed_label,
+                                    Qt.TextElideMode.ElideRight, tw)
+                p.drawText(QRect(tx, cy + 36, tw, 20),
+                           Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                           lbl)
 
-            if is_active and show_active_dot:
-                dp = QPainterPath()
-                dp.addEllipse(w - 28, card_y + 8, 7, 7)
-                p.fillPath(dp, QColor(255, 255, 255, 200))
+            elif is_new:
+                p.setPen(TEXT_WHITE)
+                p.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+                p.drawText(QRect(tx, cy + 10, tw - 10, 22),
+                           Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                           "New Session")
+                p.setPen(TEXT_DIM)
+                p.setFont(QFont("Segoe UI", 9))
+                p.drawText(QRect(tx, cy + 36, tw, 20),
+                           Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                           "Create a new workspace")
+            else:
+                name     = sess.get("name", "Session") if sess else "Session"
+                items    = db.get_items(sess["id"]) if sess else []
+                n_items  = len(items)
+                time_str = "active" if is_active else f"{n_items} items"
 
-            brightness = (cc.red() * 299 + cc.green() * 587 + cc.blue() * 114) / 1000
-            text_color = QColor(0, 0, 0) if brightness > 160 else QColor(255, 255, 255)
-            p.setPen(text_color)
-            p.setFont(QFont("Helvetica Neue", 9, QFont.Weight.Bold))
-            p.drawText(QRect(30, card_y, w - 60, CARD_H),
-                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                       sess.get("name", "Session"))
+                # .h1 — session name (bold, 16px equivalent)
+                p.setPen(TEXT_WHITE)
+                p.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+                fm   = QFontMetrics(p.font())
+                name_elided = fm.elidedText(name, Qt.TextElideMode.ElideRight, tw - 60)
+                p.drawText(QRect(tx, cy + 10, tw - 60, 22),
+                           Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                           name_elided)
 
-            items = db.get_items(sess["id"])
-            tc    = QColor(text_color)
-            tc.setAlpha(140)
-            p.setPen(tc)
-            p.setFont(QFont("Helvetica Neue", 8))
-            p.drawText(QRect(30, card_y + 28, w - 60, 18),
-                       Qt.AlignmentFlag.AlignLeft,
-                       f"{len(items)} items")
+                # .span — time / status (10px, right side)
+                p.setPen(TEXT_DIM)
+                p.setFont(QFont("Segoe UI", 8))
+                p.drawText(QRect(tx, cy + 10, tw - 4, 22),
+                           Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                           time_str)
 
-    def _paint_new_session_btn(self, p, w):
-        """Paint a '+  New Session' button below all existing session cards."""
-        by = SESSION_LIST_Y + len(self._sessions) * (CARD_H + CARD_GAP) + 8
-        bp = QPainterPath()
-        bp.addRoundedRect(20, by, w - 40, NEW_BTN_H, 10, 10)
-        bc = QColor(WALLET_GLOW)
-        bc.setAlpha(30)
-        p.fillPath(bp, bc)
-        p.setPen(QPen(WALLET_GLOW, 1.0))
-        p.drawPath(bp)
-        p.setPen(WALLET_GLOW)
-        p.setFont(QFont("Helvetica Neue", 10, QFont.Weight.Bold))
-        p.drawText(QRect(20, by, w - 40, NEW_BTN_H),
-                   Qt.AlignmentFlag.AlignCenter, "+  New Session")
+                # .p — item count (lighter, 12px)
+                p.setPen(TEXT_DIM)
+                p.setFont(QFont("Segoe UI", 9))
+                p.drawText(QRect(tx, cy + 36, tw, 20),
+                           Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                           f"{n_items} item{'s' if n_items != 1 else ''} saved")
 
-    def _paint_cancel_btn(self, p, w):
-        """Paint a red Cancel button. Shown whenever a drop is awaiting decision."""
-        by = self._cancel_btn_y()
-        bp = QPainterPath()
-        bp.addRoundedRect(20, by, w - 40, CANCEL_BTN_H, 10, 10)
-        bc = QColor(WALLET_CANCEL)
-        bc.setAlpha(40)
-        p.fillPath(bp, bc)
-        p.setPen(QPen(WALLET_CANCEL, 1.0))
-        p.drawPath(bp)
-        p.setPen(WALLET_CANCEL)
-        p.setFont(QFont("Helvetica Neue", 10, QFont.Weight.Bold))
-        p.drawText(QRect(20, by, w - 40, CANCEL_BTN_H),
-                   Qt.AlignmentFlag.AlignCenter, "✕  Cancel  (Esc)")
+            p.restore()
+
+    # ── Confirm overlay ───────────────────────────────────────────────────────
+
+    def _paint_confirm_overlay(self, p: QPainter):
+        # The confirmed card already shows green in _paint_cards
+        # Just add a subtle full-widget dim + tick near folder
+        fr = self._folder_rect()
+        cx = fr.x() + fr.width() // 2
+        cy = fr.y() + fr.height() // 2
+        dot = QPainterPath()
+        dot.addEllipse(cx - 14, cy - 14, 28, 28)
+        p.fillPath(dot, CONFIRM_GREEN)
+        p.setPen(TEXT_WHITE)
+        p.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        p.drawText(QRect(cx - 14, cy - 14, 28, 28),
+                   Qt.AlignmentFlag.AlignCenter, "✓")
+
+    def _paint_picker_hint(self, p: QPainter):
+        fr = self._folder_rect()
+        p.setPen(QColor(245, 166, 35, 200))
+        p.setFont(QFont("Segoe UI", 8))
+        p.drawText(QRect(fr.x() - 10, fr.y() + FOLDER_H + 4, FOLDER_W + 20, 16),
+                   Qt.AlignmentFlag.AlignCenter, "tap a session ↓")
+
+    def _paint_cancel_hint(self, p: QPainter):
+        if self._pending_app or self._picker_mode:
+            p.setPen(QColor(180, 180, 180, 120))
+            p.setFont(QFont("Segoe UI", 8))
+            p.drawText(QRect(0, WIDGET_H - 28, WIDGET_W, 20),
+                       Qt.AlignmentFlag.AlignCenter, "Esc to cancel")
+
+
+# ── Per-card animation helper ─────────────────────────────────────────────────
+
+class _CardDropAnim(QPropertyAnimation):
+    """
+    Animates a single float in a list (self._parent._card_drops[index]).
+    We can't use pyqtProperty on a list element directly, so we subclass
+    QPropertyAnimation and override update delivery.
+    """
+    def __init__(self, widget: DropZoneOverlay, index: int, store: list):
+        super().__init__()
+        self._widget = widget
+        self._index  = index
+        self._store  = store
+
+    def updateCurrentValue(self, value):
+        if self._index < len(self._store):
+            self._store[self._index] = value
+        self._widget.update()
