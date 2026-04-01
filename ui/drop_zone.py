@@ -118,6 +118,7 @@ class DropZoneOverlay(QWidget):
         self._anim_timer.setInterval(16)
         self._anim_timer.timeout.connect(self._tick_glow)
         self._anim_timer.start()
+        self._is_fully_hidden = True
 
         self._setup_window()
         self._position_on_screen()
@@ -164,6 +165,10 @@ class DropZoneOverlay(QWidget):
             self._card_glow_targets[i] = round(cur / 360) * 360 + 83.0
 
     def _tick_glow(self):
+        # Skip work when widget is fully hidden
+        if self._is_fully_hidden and not self._folder_hovered:
+            return
+            
         changed = False
         total = len(self._sessions) + 1
 
@@ -332,6 +337,9 @@ class DropZoneOverlay(QWidget):
         )
 
     def _slide_in(self):
+        self._is_fully_hidden = False
+        if not self._anim_timer.isActive():
+            self._anim_timer.start()
         self._slide_anim.stop()
         self._slide_anim.setStartValue(self._slide_x)
         self._slide_anim.setEndValue(0.0)
@@ -349,8 +357,19 @@ class DropZoneOverlay(QWidget):
         self._slide_anim.setStartValue(self._slide_x)
         self._slide_anim.setEndValue(1.0)
         self._slide_anim.start()
+        self._slide_anim.finished.connect(self._on_fully_hidden)
         try:
             QApplication.instance().removeEventFilter(self)
+        except Exception:
+            pass
+
+    def _on_fully_hidden(self):
+        """Stop 60fps glow timer once fully off-screen."""
+        if self._slide_x >= 0.99:
+            self._is_fully_hidden = True
+            self._anim_timer.stop()
+        try:
+            self._slide_anim.finished.disconnect(self._on_fully_hidden)
         except Exception:
             pass
 
