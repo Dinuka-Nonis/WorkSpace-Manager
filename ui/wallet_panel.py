@@ -445,12 +445,7 @@ class WalletPanel(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setFixedSize(PANEL_WIDTH, PANEL_HEIGHT)
-        sh = QGraphicsDropShadowEffect(self)
-        sh.setBlurRadius(48)
-        sh.setXOffset(0)
-        sh.setYOffset(12)
-        sh.setColor(QColor(0, 0, 0, 120))
-        self.setGraphicsEffect(sh)
+
 
     def _position_on_screen(self):
         s = QApplication.primaryScreen()
@@ -621,23 +616,35 @@ class WalletPanel(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
+        r = 16
 
-        # Clean panel background
+        shadow_offset = 8
+
+        shadow_path = QPainterPath()
+        shadow_path.addRoundedRect(
+            shadow_offset/2,
+            shadow_offset,
+            w - shadow_offset,
+            h - shadow_offset,
+            r,
+            r
+        )
+        p.fillPath(shadow_path, QColor(0, 0, 0, 80))
+
+        # Main panel background
         bg = QPainterPath()
-        bg.addRoundedRect(0, 0, w, h, 22, 22)
+        bg.addRoundedRect(0, 0, w, h, r, r)
         panel_grad = QLinearGradient(0, 0, 0, h)
         panel_grad.setColorAt(0.0, QColor("#252525"))
         panel_grad.setColorAt(1.0, QColor("#1a1a1a"))
         p.fillPath(bg, panel_grad)
 
-        # Clean border
         p.setPen(QPen(BORDER, 1.0))
         bd = QPainterPath()
-        bd.addRoundedRect(0.5, 0.5, w - 1, h - 1, 22, 22)
+        bd.addRoundedRect(0.5, 0.5, w - 1, h - 1, r, r)
         p.drawPath(bd)
         p.end()
-
-
+        
 # ── Header ────────────────────────────────────────────────────────────────────
 class _PanelHeader(QWidget):
     def __init__(self, parent=None):
