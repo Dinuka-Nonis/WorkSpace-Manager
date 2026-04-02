@@ -46,20 +46,21 @@ from pathlib import Path
 # ── Browser preference ────────────────────────────────────────────────────────
 
 CHROME_PATHS = [
-    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+    os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
     os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
 ]
 
 EDGE_PATHS = [
     os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
+    os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
     os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
 ]
 
 VSCODE_PATHS = [
     os.path.expandvars(r"%LOCALAPPDATA%\Programs\Microsoft VS Code\Code.exe"),
-    r"C:\Program Files\Microsoft VS Code\Code.exe",
-    r"C:\Program Files (x86)\Microsoft VS Code\Code.exe",
+    os.path.expandvars(r"%ProgramFiles%\Microsoft VS Code\Code.exe"),
+    os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft VS Code\Code.exe"),
 ]
 
 # How long (seconds) to wait after SetForegroundWindow before opening the URL.

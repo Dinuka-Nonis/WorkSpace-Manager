@@ -873,7 +873,7 @@ class DragWatcher(QThread):
                 return None
 
             # ── UWP / Microsoft Store ──────────────────────────────────────────
-            wa_norm = os.path.normcase(r"C:\Program Files\WindowsApps")
+            wa_norm = os.path.normcase(os.path.expandvars(r"%ProgramFiles%\WindowsApps"))
             if wa_norm in os.path.normcase(exe):
                 return {
                     "type":        "app",

@@ -9,7 +9,8 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-DB_PATH = Path(os.getenv("APPDATA", ".")) / "WorkSpaceManager" / "workspace.db"
+_appdata = os.getenv("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+DB_PATH = Path(_appdata) / "WorkSpaceManager" / "workspace.db"
 
 # ── Connection Pool (thread-local) ───────────────────────────────────────────
 _local = threading.local()
