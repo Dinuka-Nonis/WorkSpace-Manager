@@ -137,7 +137,7 @@ class DropZoneOverlay(QWidget):
                 background: transparent; color: #ffffff;
                 border: none; border-radius: 0px;
                 padding: 0 4px; font-size: 12px;
-                font-family: 'Helvetica Neue', 'Helvetica', sans-serif;
+                font-family: 'Inter', '-apple-system', 'BlinkMacSystemFont', sans-serif;
             }
             QLineEdit:focus { background: transparent; }
         """)
@@ -834,7 +834,7 @@ class DropZoneOverlay(QWidget):
         p.fillPath(rnotch, amber_400)
 
         p.setPen(QColor(120, 70, 5, 200))
-        p.setFont(QFont("Helvetica Neue", 7, QFont.Weight.Bold))
+        p.setFont(QFont("Inter", 7, QFont.Weight.Bold))
         p.drawText(QRect(fx, fy + fh - 18, fw, 16),
                    Qt.AlignmentFlag.AlignCenter, "WORKSPACE")
 
@@ -1002,13 +1002,13 @@ class DropZoneOverlay(QWidget):
         if is_confirmed and self._confirm_alpha > 0.01:
             p.setOpacity(self._confirm_alpha)
             p.setPen(TEXT_WHITE)
-            p.setFont(QFont("Helvetica Neue", 16))
+            p.setFont(QFont("Inter", 16))
             p.drawText(QRect(icon_x, icon_y, icon_w, icon_h),
                        Qt.AlignmentFlag.AlignCenter, "✓")
             p.setOpacity(1.0)
         else:
             p.setPen(TEXT_WHITE)
-            p.setFont(QFont("Helvetica Neue", 16))
+            p.setFont(QFont("Inter", 16))
             p.drawText(QRect(icon_x, icon_y, icon_w, icon_h),
                        Qt.AlignmentFlag.AlignCenter, "◈")
 
@@ -1020,7 +1020,7 @@ class DropZoneOverlay(QWidget):
         n_items = len(items)
         
         p.setPen(TEXT_WHITE)
-        p.setFont(QFont("Helvetica Neue", 11, QFont.Weight.Bold))
+        p.setFont(QFont("Inter", 11, QFont.Weight.Bold))
         fm = QFontMetrics(p.font())
         name_width = tw - 60
         p.drawText(QRect(tx, cy + 10, name_width, 22),
@@ -1034,7 +1034,7 @@ class DropZoneOverlay(QWidget):
             
             p.setOpacity(self._confirm_alpha)
             p.setPen(CONFIRM_GREEN)
-            p.setFont(QFont("Helvetica Neue", 10, QFont.Weight.Bold))
+            p.setFont(QFont("Inter", 10, QFont.Weight.Bold))
             p.drawText(badge_rect,
                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
                        "Saved!")
@@ -1047,13 +1047,13 @@ class DropZoneOverlay(QWidget):
         else:
             time_str = "active" if is_active else f"{n_items} items"
             p.setPen(TEXT_DIM)
-            p.setFont(QFont("Helvetica Neue", 8))
+            p.setFont(QFont("Inter", 8))
             p.drawText(QRect(tx, cy + 10, tw - 4, 22),
                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
                        time_str)
 
         p.setPen(TEXT_DIM)
-        p.setFont(QFont("Helvetica Neue", 9))
+        p.setFont(QFont("Inter", 9))
         if is_confirmed and self._confirm_alpha > 0.01 and self._confirmed_label:
             subtitle_text = f"{n_items} item{'s' if n_items != 1 else ''} saved"
             confirmed_text = self._confirmed_label
@@ -1144,7 +1144,7 @@ class DropZoneOverlay(QWidget):
 
         plus_color = QColor.fromHsvF((self._plus_hue % 360) / 360.0, 0.75, 1.0)
         p.setPen(plus_color)
-        p.setFont(QFont("Helvetica Neue", 18, QFont.Weight.Bold))
+        p.setFont(QFont("Inter", 18, QFont.Weight.Bold))
         p.drawText(QRect(icon_x, icon_y, icon_w, icon_h),
                    Qt.AlignmentFlag.AlignCenter, "＋")
 
@@ -1152,12 +1152,12 @@ class DropZoneOverlay(QWidget):
         tw = cw - (tx - cx) - 10
 
         p.setPen(TEXT_WHITE)
-        p.setFont(QFont("Helvetica Neue", 11, QFont.Weight.Bold))
+        p.setFont(QFont("Inter", 11, QFont.Weight.Bold))
         p.drawText(QRect(tx, cy + 8, tw, 20),
                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                    "New Session")
         p.setPen(TEXT_DIM)
-        p.setFont(QFont("Helvetica Neue", 9))
+        p.setFont(QFont("Inter", 9))
         p.drawText(QRect(tx, cy + 30, tw, 18),
                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                    "Create a new workspace")
@@ -1167,7 +1167,7 @@ class DropZoneOverlay(QWidget):
         cx: int, cy: int, cw: int, ch: int,
     ):
         p.setPen(TEXT_DIM)
-        p.setFont(QFont("Helvetica Neue", 9))
+        p.setFont(QFont("Inter", 9))
         p.drawText(
             QRect(cx + 14, cy + 10, cw - 28, 16),
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
@@ -1203,7 +1203,7 @@ class DropZoneOverlay(QWidget):
     def _paint_picker_hint(self, p: QPainter):
         fr = self._folder_rect()
         p.setPen(QColor(136, 136, 153, 200))
-        p.setFont(QFont("Helvetica Neue", 8))
+        p.setFont(QFont("Inter", 8))
         p.drawText(QRect(fr.x() - 10, fr.y() + FOLDER_H + 4, FOLDER_W + 20, 16),
                    Qt.AlignmentFlag.AlignCenter, "tap a session ↓")
 
