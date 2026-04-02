@@ -693,9 +693,9 @@ class DropZoneOverlay(QWidget):
             if nr.contains(x, y):
                 return 0
 
-        # Check session cards (clipped to fixed viewport)
-        clip_top    = SESSIONS_START_Y
-        clip_bottom = clip_top + SESSIONS_VIEWPORT_H
+        # Check session cards (clipped to viewport; top shifts up with push)
+        clip_top    = SESSIONS_START_Y + int(self._sessions_push)
+        clip_bottom = SESSIONS_START_Y + SESSIONS_VIEWPORT_H  # bottom stays fixed
         if not (clip_top <= y <= clip_bottom):
             return None
 
@@ -733,8 +733,8 @@ class DropZoneOverlay(QWidget):
         while len(self._card_scales) < total:
             self._card_scales.append(1.0)
 
-        clip_top    = SESSIONS_START_Y
-        clip_bottom = clip_top + SESSIONS_VIEWPORT_H
+        clip_top    = SESSIONS_START_Y + int(self._sessions_push)
+        clip_bottom = SESSIONS_START_Y + SESSIONS_VIEWPORT_H  # bottom stays fixed
 
         for i in range(total):
             if i == 0:
@@ -984,9 +984,15 @@ class DropZoneOverlay(QWidget):
             self._paint_new_session_card(p, CARD_X, NEW_CARD_PINNED_Y, CARD_W, cur_h, scale_0, 0)
             p.restore()
 
-        # ── 2. Clip the sessions viewport (fixed window — only cards move down) ─
-        clip_y    = SESSIONS_START_Y
-        clip_rect = QRectF(0, clip_y, WIDGET_W, SESSIONS_VIEWPORT_H)
+        # ── 2. Clip the sessions viewport ─────────────────────────────────────
+        # Top rises by push so expanded input card never overlaps scrolled sessions.
+        # A small vertical pad (HOVER_PAD) lets the 5% scale-up animation breathe
+        # without clipping the top/bottom card edges.
+        HOVER_PAD  = 4  # px extra on each side so hovered card scale doesn't clip
+        push       = int(self._sessions_push)
+        clip_y     = SESSIONS_START_Y + push - HOVER_PAD
+        clip_h     = SESSIONS_VIEWPORT_H - push + HOVER_PAD * 2
+        clip_rect  = QRectF(0, clip_y, WIDGET_W, clip_h)
         p.save()
         clip_path = QPainterPath()
         clip_path.addRect(clip_rect)
@@ -1005,7 +1011,7 @@ class DropZoneOverlay(QWidget):
             cy        = self._session_card_y(sess_i)
 
             # Skip cards fully outside clip
-            if cy + CARD_H < clip_y or cy > clip_y + SESSIONS_VIEWPORT_H:
+            if cy + CARD_H < clip_y or cy > clip_y + clip_h:
                 continue
 
             cx_centre = CARD_X + CARD_W / 2
