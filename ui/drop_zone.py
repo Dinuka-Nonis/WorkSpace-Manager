@@ -1,12 +1,12 @@
 """
 ui/drop_zone.py — Folder-style drop zone overlay.
 
-v8 changes:
-  • "New Session" card is now pinned/fixed at the top and never scrolls
-  • Sessions below are shown in a clipped viewport showing exactly 4 at a time
-  • Smooth animated scrolling (_scroll_anim) replaces instant jump
-  • Wheel delta accumulates into a smooth target offset
-  • Cards outside the clip region are hidden cleanly
+v9 changes (on top of v8):
+  • Removed radial glow blobs from _paint_glow_border — they produced a
+    fuzzy shadow halo around hovered session cards
+  • Removed scroll-edge fade gradients — the top/bottom fades made the
+    4th card look clipped and added unwanted shadow at the viewport boundary
+  • Viewport clip is now hard/sharp with no decorative overlays
 """
 
 from __future__ import annotations
@@ -996,28 +996,8 @@ class DropZoneOverlay(QWidget):
             self._paint_scroll_fades(p)
 
     def _paint_scroll_fades(self, p: QPainter):
-        """Subtle gradient fades at top/bottom of sessions viewport."""
-        fade_h = 24
-        bg = QColor(15, 14, 20)  # approximate widget bg
-
-        # Top fade (visible when scrolled down)
-        if self._scroll_offset > 2:
-            grad = QLinearGradient(0, SESSIONS_START_Y, 0, SESSIONS_START_Y + fade_h)
-            c = QColor(bg); c.setAlpha(200)
-            grad.setColorAt(0.0, c)
-            c2 = QColor(bg); c2.setAlpha(0)
-            grad.setColorAt(1.0, c2)
-            p.fillRect(QRectF(CARD_X, SESSIONS_START_Y, CARD_W, fade_h), grad)
-
-        # Bottom fade (visible when more cards below)
-        if self._scroll_offset < self._max_scroll() - 2:
-            bot_y = SESSIONS_START_Y + SESSIONS_VIEWPORT_H
-            grad = QLinearGradient(0, bot_y - fade_h, 0, bot_y)
-            c2 = QColor(bg); c2.setAlpha(0)
-            grad.setColorAt(0.0, c2)
-            c = QColor(bg); c.setAlpha(220)
-            grad.setColorAt(1.0, c)
-            p.fillRect(QRectF(CARD_X, bot_y - fade_h, CARD_W, fade_h), grad)
+        """No fades — removed to keep card edges clean and sharp."""
+        pass
 
     def _paint_glow_border(
         self,
@@ -1033,20 +1013,8 @@ class DropZoneOverlay(QWidget):
         cy_mid = cy + ch / 2
         alpha_mul = hover_strength
 
-        for color, radius, base_alpha in [
-            (glow_a, cw * 0.9, 30),
-            (glow_b, cw * 0.7, 25),
-        ]:
-            a = int(base_alpha * alpha_mul)
-            if a < 2:
-                continue
-            rg = QRadialGradient(cx_mid, cy_mid, radius)
-            rg.setColorAt(0.0, QColor(color.red(), color.green(), color.blue(), a))
-            rg.setColorAt(1.0, QColor(0, 0, 0, 0))
-            glow_path = QPainterPath()
-            glow_path.addRoundedRect(
-                QRectF(cx - 20, cy - 14, cw + 40, ch + 28), r + 8, r + 8)
-            p.fillPath(glow_path, rg)
+        # Radial glow blobs intentionally removed — they produced a fuzzy
+        # shadow halo that looked unclean, especially near the viewport edge.
 
         dark_path = QPainterPath()
         dark_path.addRoundedRect(QRectF(cx - 1, cy - 1, cw + 2, ch + 2), r + 1, r + 1)
