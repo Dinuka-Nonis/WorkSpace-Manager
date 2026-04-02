@@ -14,6 +14,7 @@ Deps: PyQt6  psutil  pywin32  keyboard
 import sys
 import os
 import time
+import shutil
 import threading
 import signal
 from pathlib import Path
@@ -45,6 +46,75 @@ TRAY_STYLE = """
 """
 
 
+# ── First-run setup ───────────────────────────────────────────────────────────
+
+def _get_appdata_dir() -> Path:
+    """Return %APPDATA%\\WorkSpaceManager, creating it if needed."""
+    appdata = os.getenv("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    d = Path(appdata) / "WorkSpaceManager"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def first_run_setup():
+    """
+    Runs silently on every launch but only does real work once.
+    All operations are idempotent — safe to call repeatedly.
+
+    Steps:
+      1. Extract workspace_host.exe from the PyInstaller bundle (frozen only).
+      2. Write the native host manifest and register it in the registry.
+      3. Add WorkSpaceManager.exe to Windows startup (first run only).
+      4. Touch a marker file so step 3 is skipped on future launches.
+    """
+    app_dir = _get_appdata_dir()
+    marker  = app_dir / ".setup_done"
+
+    # ── 1. Extract workspace_host.exe from the bundle ─────────────────────────
+    # sys._MEIPASS is set by PyInstaller when the app is frozen into an EXE.
+    # When running from source (python main.py) this block is skipped entirely.
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        bundled_host = Path(meipass) / "workspace_host.exe"
+        target_host  = app_dir / "workspace_host.exe"
+        if bundled_host.exists() and not target_host.exists():
+            shutil.copy2(str(bundled_host), str(target_host))
+            print(f"[Setup] Extracted workspace_host.exe → {target_host}")
+
+    # ── 2. Register the native messaging host ─────────────────────────────────
+    try:
+        from native_host.install_host import write_manifest, register_in_registry
+        manifest_path = write_manifest()
+        register_in_registry(manifest_path)
+        print(f"[Setup] Native host registered: {manifest_path}")
+    except Exception as e:
+        print(f"[Setup] Native host registration failed (non-fatal): {e}")
+
+    # ── 3. Add to Windows startup (only on the very first run) ────────────────
+    if not marker.exists():
+        try:
+            import winreg
+            # sys.executable is the .exe path when frozen, or python.exe in source mode.
+            exe_path    = sys.executable
+            key_path    = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            startup_cmd = f'"{exe_path}"'
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0,
+                                winreg.KEY_WRITE) as key:
+                winreg.SetValueEx(key, "WorkSpaceManager", 0,
+                                  winreg.REG_SZ, startup_cmd)
+            print(f"[Setup] Added to Windows startup: {startup_cmd}")
+        except Exception as e:
+            print(f"[Setup] Startup registration failed (non-fatal): {e}")
+
+        # Mark setup as done regardless — avoids retrying on every launch
+        try:
+            marker.touch()
+        except Exception:
+            pass
+
+
+# ── Tray icon ─────────────────────────────────────────────────────────────────
+
 def make_tray_icon() -> QIcon:
     px = QPixmap(64, 64)
     px.fill(Qt.GlobalColor.transparent)
@@ -65,6 +135,8 @@ def make_tray_icon() -> QIcon:
     return QIcon(px)
 
 
+# ── Restore worker ────────────────────────────────────────────────────────────
+
 class RestoreWorker(QThread):
     done = pyqtSignal(dict)
 
@@ -81,6 +153,8 @@ class RestoreWorker(QThread):
 def _invoke_on_main(fn):
     QTimer.singleShot(0, fn)
 
+
+# ── Hotkey listener ───────────────────────────────────────────────────────────
 
 def start_hotkey_listener(wallet_panel: WalletPanel, tray: QSystemTrayIcon):
     def _listen():
@@ -108,6 +182,8 @@ def start_hotkey_listener(wallet_panel: WalletPanel, tray: QSystemTrayIcon):
     threading.Thread(target=_listen, daemon=True).start()
 
 
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("WorkSpace Manager")
@@ -118,6 +194,9 @@ def main():
     _sig.timeout.connect(lambda: None)
     _sig.start(200)
 
+    # Run silent first-time setup before anything else
+    first_run_setup()
+
     db.init_db()
 
     drop_zone    = DropZoneOverlay()
@@ -125,7 +204,7 @@ def main():
 
     drop_zone.show()
 
-    # ── Drag watcher (Windows only) ────────────────────────────────────────────
+    # ── Drag watcher (Windows only) ───────────────────────────────────────────
     watcher = None
     if sys.platform == "win32":
         from core.drag_watcher import DragWatcher
