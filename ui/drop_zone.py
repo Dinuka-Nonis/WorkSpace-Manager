@@ -50,6 +50,10 @@ SESSIONS_VIEWPORT_H = VISIBLE_SESSIONS * (CARD_H + CARD_GAP) - CARD_GAP  # clip 
 
 NEW_CARD_EXPANDED_H = 96
 
+# Pixels the session list shifts down when the new-session input is open.
+# Just the extra height the input card gains beyond its collapsed size.
+SESSIONS_PUSH_PX    = NEW_CARD_EXPANDED_H - NEW_CARD_H + CARD_GAP
+
 PAPER_COUNT     = 3
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -124,6 +128,10 @@ class DropZoneOverlay(QWidget):
         # Smooth scrolling — tracks only the sessions list (not the pinned card)
         self._scroll_offset      = 0.0   # current rendered offset (animated)
         self._scroll_target      = 0.0   # target offset from wheel events
+
+        # How far (in pixels) the sessions list is pushed down when input opens.
+        # Two session-card heights + gap = enough room for the expanded input.
+        self._sessions_push      = 0.0   # animated 0.0 → SESSIONS_PUSH_PX
 
         self._anim_timer = QTimer(self)
         self._anim_timer.setInterval(16)
@@ -279,6 +287,10 @@ class DropZoneOverlay(QWidget):
         self._input_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._input_anim.setDuration(260)
 
+        self._push_anim = QPropertyAnimation(self, b"sessionsPush", self)
+        self._push_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._push_anim.setDuration(280)
+
     def getInputT(self) -> float:
         return self._input_t
 
@@ -288,6 +300,15 @@ class DropZoneOverlay(QWidget):
         self.update()
 
     inputT = pyqtProperty(float, getInputT, setInputT)
+
+    def getSessionsPush(self) -> float:
+        return self._sessions_push
+
+    def setSessionsPush(self, v: float):
+        self._sessions_push = v
+        self.update()
+
+    sessionsPush = pyqtProperty(float, getSessionsPush, setSessionsPush)
 
     def _reposition_inline_input(self):
         if not self._input_open and self._input_t < 0.05:
@@ -507,6 +528,7 @@ class DropZoneOverlay(QWidget):
         self._folder_hovered      = False
         self._scroll_offset       = 0.0
         self._scroll_target       = 0.0
+        self._sessions_push       = 0.0
         self._close_inline_input()
         self._hide_cards()
         self._fan = 0.0
@@ -558,6 +580,10 @@ class DropZoneOverlay(QWidget):
         self._input_anim.setStartValue(self._input_t)
         self._input_anim.setEndValue(1.0)
         self._input_anim.start()
+        self._push_anim.stop()
+        self._push_anim.setStartValue(self._sessions_push)
+        self._push_anim.setEndValue(float(SESSIONS_PUSH_PX))
+        self._push_anim.start()
         QTimer.singleShot(80, self._focus_input)
         self.update()
 
@@ -573,6 +599,10 @@ class DropZoneOverlay(QWidget):
         self._input_anim.setStartValue(self._input_t)
         self._input_anim.setEndValue(0.0)
         self._input_anim.start()
+        self._push_anim.stop()
+        self._push_anim.setStartValue(self._sessions_push)
+        self._push_anim.setEndValue(0.0)
+        self._push_anim.start()
 
     def _refresh_sessions(self):
         self._sessions = db.get_all_sessions()[:6]
@@ -648,11 +678,11 @@ class DropZoneOverlay(QWidget):
         return QRect(CARD_X, y, CARD_W, CARD_H)
 
     def _session_card_y(self, sess_index: int) -> int:
-        """Actual painted Y for session card (sess_index 0-based), accounting for scroll."""
+        """Actual painted Y for session card (sess_index 0-based), accounting for scroll and push."""
         base_y    = SESSIONS_START_Y + sess_index * (CARD_H + CARD_GAP)
         drop_frac = self._card_drops[sess_index + 1] if (sess_index + 1) < len(self._card_drops) else 0.0
         slide_off = int((1.0 - drop_frac) * (CARD_H + 50))
-        return base_y - slide_off - int(self._scroll_offset)
+        return base_y - slide_off - int(self._scroll_offset) + int(self._sessions_push)
 
     def _card_at(self, x: int, y: int) -> int | None:
         """Returns card index (0 = new-session, 1..N = sessions). None if no hit."""
@@ -663,9 +693,9 @@ class DropZoneOverlay(QWidget):
             if nr.contains(x, y):
                 return 0
 
-        # Check session cards (clipped to viewport)
+        # Check session cards (clipped to fixed viewport)
         clip_top    = SESSIONS_START_Y
-        clip_bottom = SESSIONS_START_Y + SESSIONS_VIEWPORT_H
+        clip_bottom = clip_top + SESSIONS_VIEWPORT_H
         if not (clip_top <= y <= clip_bottom):
             return None
 
@@ -704,7 +734,7 @@ class DropZoneOverlay(QWidget):
             self._card_scales.append(1.0)
 
         clip_top    = SESSIONS_START_Y
-        clip_bottom = SESSIONS_START_Y + SESSIONS_VIEWPORT_H
+        clip_bottom = clip_top + SESSIONS_VIEWPORT_H
 
         for i in range(total):
             if i == 0:
@@ -954,8 +984,9 @@ class DropZoneOverlay(QWidget):
             self._paint_new_session_card(p, CARD_X, NEW_CARD_PINNED_Y, CARD_W, cur_h, scale_0, 0)
             p.restore()
 
-        # ── 2. Clip the sessions viewport ─────────────────────────────────────
-        clip_rect = QRectF(0, SESSIONS_START_Y, WIDGET_W, SESSIONS_VIEWPORT_H)
+        # ── 2. Clip the sessions viewport (fixed window — only cards move down) ─
+        clip_y    = SESSIONS_START_Y
+        clip_rect = QRectF(0, clip_y, WIDGET_W, SESSIONS_VIEWPORT_H)
         p.save()
         clip_path = QPainterPath()
         clip_path.addRect(clip_rect)
@@ -974,7 +1005,7 @@ class DropZoneOverlay(QWidget):
             cy        = self._session_card_y(sess_i)
 
             # Skip cards fully outside clip
-            if cy + CARD_H < SESSIONS_START_Y or cy > SESSIONS_START_Y + SESSIONS_VIEWPORT_H:
+            if cy + CARD_H < clip_y or cy > clip_y + SESSIONS_VIEWPORT_H:
                 continue
 
             cx_centre = CARD_X + CARD_W / 2
