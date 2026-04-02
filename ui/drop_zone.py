@@ -1,11 +1,12 @@
 """
 ui/drop_zone.py — Folder-style drop zone overlay.
 
-v7 changes:
-  • Confirmation no longer turns card green — keeps original card color
-  • "Saved!" text now appears with a smooth slide+fade animation in the top-right
-    corner (replacing the item count temporarily) while session name stays visible
-  • Added _confirm_anim to animate confirmation state with proper fade in/out
+v8 changes:
+  • "New Session" card is now pinned/fixed at the top and never scrolls
+  • Sessions below are shown in a clipped viewport showing exactly 4 at a time
+  • Smooth animated scrolling (_scroll_anim) replaces instant jump
+  • Wheel delta accumulates into a smooth target offset
+  • Cards outside the clip region are hidden cleanly
 """
 
 from __future__ import annotations
@@ -40,6 +41,12 @@ NEW_CARD_H      = 56
 CARD_X          = 20
 CARD_GAP        = 10
 CARDS_START_Y   = FOLDER_H + 24
+
+# New Session card is pinned; sessions viewport sits below it
+NEW_CARD_PINNED_Y   = CARDS_START_Y                          # fixed Y for new-session card
+SESSIONS_START_Y    = NEW_CARD_PINNED_Y + NEW_CARD_H + CARD_GAP  # top of scrollable session area
+VISIBLE_SESSIONS    = 4                                      # max sessions visible at once
+SESSIONS_VIEWPORT_H = VISIBLE_SESSIONS * (CARD_H + CARD_GAP) - CARD_GAP  # clip height
 
 NEW_CARD_EXPANDED_H = 96
 
@@ -102,7 +109,7 @@ class DropZoneOverlay(QWidget):
 
         self._card_drops:  list[float] = []
         self._card_scales: list[float] = []
-        
+
         # Confirmation animation: 0.0 = hidden, 1.0 = fully visible
         self._confirm_alpha = 0.0
 
@@ -113,6 +120,10 @@ class DropZoneOverlay(QWidget):
 
         self._input_t      = 0.0
         self._input_open   = False
+
+        # Smooth scrolling — tracks only the sessions list (not the pinned card)
+        self._scroll_offset      = 0.0   # current rendered offset (animated)
+        self._scroll_target      = 0.0   # target offset from wheel events
 
         self._anim_timer = QTimer(self)
         self._anim_timer.setInterval(16)
@@ -126,6 +137,7 @@ class DropZoneOverlay(QWidget):
         self._build_slide_anim()
         self._build_input_anim()
         self._build_confirm_anim()
+        self._build_scroll_anim()
 
         self._new_sess_input = QLineEdit(self)
         self._new_sess_input.setPlaceholderText("Session name…")
@@ -150,6 +162,8 @@ class DropZoneOverlay(QWidget):
         _ref.timeout.connect(self._refresh_sessions)
         _ref.start(5000)
 
+    # ── Glow helpers ──────────────────────────────────────────────────────────
+
     def _glow_angle(self, i: int) -> float:
         return self._card_glow_angles.get(i, 83.0)
 
@@ -165,10 +179,9 @@ class DropZoneOverlay(QWidget):
             self._card_glow_targets[i] = round(cur / 360) * 360 + 83.0
 
     def _tick_glow(self):
-        # Skip work when widget is fully hidden
         if self._is_fully_hidden and not self._folder_hovered:
             return
-            
+
         changed = False
         total = len(self._sessions) + 1
 
@@ -186,11 +199,20 @@ class DropZoneOverlay(QWidget):
             self._plus_hue = (self._plus_hue + 0.6) % 360
             changed = True
 
+        # Smooth scroll interpolation (lerp toward target)
+        diff = self._scroll_target - self._scroll_offset
+        if abs(diff) > 0.3:
+            self._scroll_offset += diff * 0.15
+            changed = True
+        else:
+            self._scroll_offset = self._scroll_target
+
         if changed:
             self.update()
 
+    # ── Confirm animation ─────────────────────────────────────────────────────
+
     def _build_confirm_anim(self):
-        """Builds the confirmation text fade animation"""
         self._confirm_anim = QPropertyAnimation(self, b"confirmAlpha", self)
         self._confirm_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
         self._confirm_anim.setDuration(400)
@@ -205,31 +227,30 @@ class DropZoneOverlay(QWidget):
     confirmAlpha = pyqtProperty(float, getConfirmAlpha, setConfirmAlpha)
 
     def _trigger_confirm_animation(self):
-        """Triggers the fade in -> hold -> fade out sequence"""
         self._confirm_anim.stop()
-        
+
         seq = QSequentialAnimationGroup(self)
-        
+
         fade_in = QPropertyAnimation(self, b"confirmAlpha", self)
         fade_in.setDuration(300)
         fade_in.setStartValue(0.0)
         fade_in.setEndValue(1.0)
         fade_in.setEasingCurve(QEasingCurve.Type.OutCubic)
-        
+
         pause = QPauseAnimation(800, self)
-        
+
         fade_out = QPropertyAnimation(self, b"confirmAlpha", self)
         fade_out.setDuration(400)
         fade_out.setStartValue(1.0)
         fade_out.setEndValue(0.0)
         fade_out.setEasingCurve(QEasingCurve.Type.InCubic)
-        
+
         seq.addAnimation(fade_in)
         seq.addAnimation(pause)
         seq.addAnimation(fade_out)
         seq.finished.connect(self._on_confirm_anim_finished)
         seq.start()
-        
+
         self._current_confirm_seq = seq
 
     def _on_confirm_anim_finished(self):
@@ -237,6 +258,21 @@ class DropZoneOverlay(QWidget):
         self._confirmed_card_i = -1
         self._confirm_alpha = 0.0
         self.update()
+
+    # ── Scroll animation ──────────────────────────────────────────────────────
+
+    def _build_scroll_anim(self):
+        """Scroll is now lerp-based in _tick_glow; this is a no-op placeholder."""
+        pass
+
+    def _max_scroll(self) -> float:
+        """Maximum scroll distance for the sessions list."""
+        n = len(self._sessions)
+        total_h = n * (CARD_H + CARD_GAP) - CARD_GAP
+        excess  = total_h - SESSIONS_VIEWPORT_H
+        return max(0.0, float(excess))
+
+    # ── Input animation ───────────────────────────────────────────────────────
 
     def _build_input_anim(self):
         self._input_anim = QPropertyAnimation(self, b"inputT", self)
@@ -258,8 +294,8 @@ class DropZoneOverlay(QWidget):
             self._new_sess_input.hide()
             return
 
-        n_cards  = len(self._sessions)
-        card_y   = self._new_card_y(n_cards)
+        # Input lives inside the pinned New Session card
+        card_y   = NEW_CARD_PINNED_Y
         cur_h    = self._new_card_current_h()
 
         input_y = card_y + int(cur_h * 0.52)
@@ -275,17 +311,10 @@ class DropZoneOverlay(QWidget):
         else:
             self._new_sess_input.hide()
 
-    def _new_card_y(self, card_index: int) -> int:
-        drop_frac = (
-            self._card_drops[card_index]
-            if card_index < len(self._card_drops) else 0.0
-        )
-        base_y    = CARDS_START_Y + card_index * (CARD_H + CARD_GAP)
-        slide_off = int((1.0 - drop_frac) * (NEW_CARD_H + 50))
-        return base_y - slide_off
-
     def _new_card_current_h(self) -> int:
         return int(NEW_CARD_H + (NEW_CARD_EXPANDED_H - NEW_CARD_H) * self._input_t)
+
+    # ── Window setup ──────────────────────────────────────────────────────────
 
     def _setup_window(self):
         self.setWindowFlags(
@@ -310,6 +339,8 @@ class DropZoneOverlay(QWidget):
             WIDGET_H,
         )
         self._apply_slide(1.0)
+
+    # ── Slide animation ───────────────────────────────────────────────────────
 
     def _build_slide_anim(self):
         self._slide_anim = QPropertyAnimation(self, b"slideX", self)
@@ -364,7 +395,6 @@ class DropZoneOverlay(QWidget):
             pass
 
     def _on_fully_hidden(self):
-        """Stop 60fps glow timer once fully off-screen."""
         if self._slide_x >= 0.99:
             self._is_fully_hidden = True
             self._anim_timer.stop()
@@ -372,6 +402,8 @@ class DropZoneOverlay(QWidget):
             self._slide_anim.finished.disconnect(self._on_fully_hidden)
         except Exception:
             pass
+
+    # ── Fan animation ─────────────────────────────────────────────────────────
 
     def getFan(self) -> float:
         return self._fan
@@ -402,8 +434,10 @@ class DropZoneOverlay(QWidget):
         self._fan_anim.setEndValue(0.0)
         self._fan_anim.start()
 
+    # ── Card drop animations ──────────────────────────────────────────────────
+
     def _drop_cards(self):
-        n = len(self._sessions) + 1
+        n = len(self._sessions) + 1   # +1 for pinned new-session card
         while len(self._card_drops) < n:
             self._card_drops.append(0.0)
         while len(self._card_scales) < n:
@@ -449,6 +483,8 @@ class DropZoneOverlay(QWidget):
         self._card_scales = []
         self.update()
 
+    # ── Public API ────────────────────────────────────────────────────────────
+
     def drop_zone_final_rect(self) -> tuple[int, int, int, int]:
         if not hasattr(self, "_screen_geo"):
             s = QApplication.primaryScreen()
@@ -469,6 +505,8 @@ class DropZoneOverlay(QWidget):
         self._cards_visible       = False
         self._cards_dropped_once  = False
         self._folder_hovered      = False
+        self._scroll_offset       = 0.0
+        self._scroll_target       = 0.0
         self._close_inline_input()
         self._hide_cards()
         self._fan = 0.0
@@ -481,12 +519,12 @@ class DropZoneOverlay(QWidget):
         cx, cy = cursor_local.x(), cursor_local.y()
         card_i = self._card_at(cx, cy)
         if card_i is not None:
-            if card_i == len(self._sessions):
+            if card_i == 0:
                 self._open_inline_input(app_info)
             else:
                 self._pending_app       = app_info
                 self._picker_mode       = True
-                self._active_session_id = self._sessions[card_i]["id"]
+                self._active_session_id = self._sessions[card_i - 1]["id"]
                 self.update()
             return
         self._pending_app = app_info
@@ -509,6 +547,8 @@ class DropZoneOverlay(QWidget):
         self._active_session_id = session_id
         self._refresh_sessions()
         self.update()
+
+    # ── Inline input ──────────────────────────────────────────────────────────
 
     def _open_inline_input(self, app_info: dict):
         self._pending_app  = app_info
@@ -540,6 +580,8 @@ class DropZoneOverlay(QWidget):
             self._active_session_id = self._sessions[0]["id"]
         self.update()
 
+    # ── Save / confirm ────────────────────────────────────────────────────────
+
     def _save_to_session(self, app_info: dict, confirmed_card: int = 0):
         self._confirm_timer.stop()
         self._picker_mode = False
@@ -563,7 +605,7 @@ class DropZoneOverlay(QWidget):
         self._pending_app      = None
         self._refresh_sessions()
         self.update()
-        
+
         self._trigger_confirm_animation()
         self._confirm_timer.start(1500)
 
@@ -575,7 +617,7 @@ class DropZoneOverlay(QWidget):
         self._refresh_sessions()
         if self._pending_app:
             idx = next((i for i, s in enumerate(self._sessions) if s["id"] == sid), 0)
-            self._save_to_session(self._pending_app, confirmed_card=idx)
+            self._save_to_session(self._pending_app, confirmed_card=idx + 1)
 
     def _finish_confirm(self):
         self._drop_confirmed     = False
@@ -592,30 +634,53 @@ class DropZoneOverlay(QWidget):
         self._close_inline_input()
         self._slide_out()
 
+    # ── Geometry helpers ──────────────────────────────────────────────────────
+
     def _folder_rect(self) -> QRect:
         return QRect(WIDGET_W - FOLDER_W - 4, 0, FOLDER_W, FOLDER_H)
 
     def _card_rect(self, index: int) -> QRect:
-        y = CARDS_START_Y + index * (CARD_H + CARD_GAP)
+        """Logical rect (ignores scroll/drop animation). index 0 = new-session."""
+        if index == 0:
+            return QRect(CARD_X, NEW_CARD_PINNED_Y, CARD_W, NEW_CARD_H)
+        sess_i = index - 1
+        y = SESSIONS_START_Y + sess_i * (CARD_H + CARD_GAP)
         return QRect(CARD_X, y, CARD_W, CARD_H)
 
+    def _session_card_y(self, sess_index: int) -> int:
+        """Actual painted Y for session card (sess_index 0-based), accounting for scroll."""
+        base_y    = SESSIONS_START_Y + sess_index * (CARD_H + CARD_GAP)
+        drop_frac = self._card_drops[sess_index + 1] if (sess_index + 1) < len(self._card_drops) else 0.0
+        slide_off = int((1.0 - drop_frac) * (CARD_H + 50))
+        return base_y - slide_off - int(self._scroll_offset)
+
     def _card_at(self, x: int, y: int) -> int | None:
-        total = len(self._sessions) + 1
-        for i in range(total):
-            if i >= len(self._card_drops):
-                continue
-            drop_frac = self._card_drops[i]
+        """Returns card index (0 = new-session, 1..N = sessions). None if no hit."""
+        # Check pinned New Session card first
+        if len(self._card_drops) > 0 and self._card_drops[0] > 0.05:
+            cur_h = self._new_card_current_h()
+            nr = QRect(CARD_X, NEW_CARD_PINNED_Y, CARD_W, cur_h)
+            if nr.contains(x, y):
+                return 0
+
+        # Check session cards (clipped to viewport)
+        clip_top    = SESSIONS_START_Y
+        clip_bottom = SESSIONS_START_Y + SESSIONS_VIEWPORT_H
+        if not (clip_top <= y <= clip_bottom):
+            return None
+
+        for sess_i in range(len(self._sessions)):
+            card_i    = sess_i + 1
+            drop_frac = self._card_drops[card_i] if card_i < len(self._card_drops) else 0.0
             if drop_frac < 0.05:
                 continue
-            is_new   = (i == len(self._sessions))
-            card_h   = self._new_card_current_h() if is_new else CARD_H
-            base_y   = CARDS_START_Y + i * (CARD_H + CARD_GAP)
-            slide_off = int((1.0 - drop_frac) * (card_h + 40))
-            actual_y = base_y - slide_off
-            r = QRect(CARD_X, actual_y, CARD_W, card_h)
+            cy = self._session_card_y(sess_i)
+            r  = QRect(CARD_X, cy, CARD_W, CARD_H)
             if r.contains(x, y):
-                return i
+                return card_i
         return None
+
+    # ── Events ────────────────────────────────────────────────────────────────
 
     def mouseMoveEvent(self, event):
         x, y = int(event.position().x()), int(event.position().y())
@@ -638,15 +703,25 @@ class DropZoneOverlay(QWidget):
         while len(self._card_scales) < total:
             self._card_scales.append(1.0)
 
+        clip_top    = SESSIONS_START_Y
+        clip_bottom = SESSIONS_START_Y + SESSIONS_VIEWPORT_H
+
         for i in range(total):
-            is_new    = (i == len(self._sessions))
-            card_h    = self._new_card_current_h() if is_new else CARD_H
-            base_y    = CARDS_START_Y + i * (CARD_H + CARD_GAP)
-            drop_frac = self._card_drops[i] if i < len(self._card_drops) else 0.0
-            actual_y  = base_y - int((1.0 - drop_frac) * (card_h + 40))
-            r         = QRect(CARD_X, actual_y, CARD_W, card_h)
-            hover     = r.contains(x, y) and drop_frac > 0.5
-            want      = 1.05 if hover else 1.0
+            if i == 0:
+                # Pinned new-session card
+                drop_frac = self._card_drops[0] if self._card_drops else 0.0
+                cur_h     = self._new_card_current_h()
+                r         = QRect(CARD_X, NEW_CARD_PINNED_Y, CARD_W, cur_h)
+                hover     = r.contains(x, y) and drop_frac > 0.5
+            else:
+                sess_i    = i - 1
+                drop_frac = self._card_drops[i] if i < len(self._card_drops) else 0.0
+                cy        = self._session_card_y(sess_i)
+                r         = QRect(CARD_X, cy, CARD_W, CARD_H)
+                in_clip   = (cy + CARD_H > clip_top) and (cy < clip_bottom)
+                hover     = r.contains(x, y) and drop_frac > 0.5 and in_clip
+
+            want = 1.05 if hover else 1.0
             if abs(self._card_scales[i] - want) > 0.001:
                 self._card_scales[i] = want
                 changed = True
@@ -659,10 +734,11 @@ class DropZoneOverlay(QWidget):
         x, y = int(event.position().x()), int(event.position().y())
         card_i = self._card_at(x, y)
         if card_i is not None:
-            if card_i == len(self._sessions):
+            if card_i == 0:
                 self._open_inline_input(self._pending_app)
             else:
-                self._active_session_id = self._sessions[card_i]["id"]
+                session_idx = card_i - 1
+                self._active_session_id = self._sessions[session_idx]["id"]
                 if self._pending_app or self._picker_mode:
                     app = self._pending_app
                     self._pending_app = None
@@ -698,16 +774,35 @@ class DropZoneOverlay(QWidget):
             self._set_card_glow_hover(i, False)
         self.update()
 
+    def wheelEvent(self, event):
+        """Smooth-scroll the sessions list (pinned New Session stays fixed)."""
+        if not (self._cards_visible or self._picker_mode):
+            return
+
+        scroll_amount = 40
+        delta = event.angleDelta().y()
+
+        if delta > 0:
+            self._scroll_target = max(0.0, self._scroll_target - scroll_amount)
+        else:
+            self._scroll_target = min(self._max_scroll(), self._scroll_target + scroll_amount)
+
+        # Ensure tick loop is running so the lerp fires
+        if not self._anim_timer.isActive():
+            self._anim_timer.start()
+
+    # ── Paint ─────────────────────────────────────────────────────────────────
+
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
 
         self._paint_folder(p)
-        
+
         if self._cards_visible or self._picker_mode or self._drop_confirmed:
             self._paint_cards(p)
-            
+
         if self._picker_mode and not self._drop_confirmed:
             self._paint_picker_hint(p)
 
@@ -845,36 +940,84 @@ class DropZoneOverlay(QWidget):
         while len(self._card_scales) < total:
             self._card_scales.append(1.0)
 
-        for i in range(total):
-            drop_frac = self._card_drops[i] if i < len(self._card_drops) else 0.0
+        # ── 1. Paint the pinned "New Session" card (index 0) ──────────────────
+        drop_frac_0 = self._card_drops[0]
+        if drop_frac_0 > 0.01:
+            scale_0  = self._card_scales[0]
+            cur_h    = self._new_card_current_h()
+            cx_c     = CARD_X + CARD_W / 2
+            cy_c     = NEW_CARD_PINNED_Y + cur_h / 2
+            p.save()
+            p.translate(cx_c, cy_c)
+            p.scale(scale_0, scale_0)
+            p.translate(-cx_c, -cy_c)
+            self._paint_new_session_card(p, CARD_X, NEW_CARD_PINNED_Y, CARD_W, cur_h, scale_0, 0)
+            p.restore()
+
+        # ── 2. Clip the sessions viewport ─────────────────────────────────────
+        clip_rect = QRectF(0, SESSIONS_START_Y, WIDGET_W, SESSIONS_VIEWPORT_H)
+        p.save()
+        clip_path = QPainterPath()
+        clip_path.addRect(clip_rect)
+        p.setClipPath(clip_path)
+
+        for sess_i, sess in enumerate(self._sessions):
+            card_i    = sess_i + 1
+            drop_frac = self._card_drops[card_i] if card_i < len(self._card_drops) else 0.0
             if drop_frac < 0.01:
                 continue
-            scale    = self._card_scales[i] if i < len(self._card_scales) else 1.0
-            is_new   = (i == len(self._sessions))
-            sess     = self._sessions[i] if not is_new else None
-            is_active      = not is_new and sess and sess["id"] == self._active_session_id
-            is_confirmed   = (i == self._confirmed_card_i and self._drop_confirmed)
 
-            card_h    = self._new_card_current_h() if is_new else CARD_H
-            base_y    = CARDS_START_Y + i * (CARD_H + CARD_GAP)
-            slide_off = int((1.0 - drop_frac) * (card_h + 50))
-            cy        = base_y - slide_off
+            scale      = self._card_scales[card_i] if card_i < len(self._card_scales) else 1.0
+            is_active  = sess["id"] == self._active_session_id
+            is_confirmed = (card_i == self._confirmed_card_i and self._drop_confirmed)
+
+            cy        = self._session_card_y(sess_i)
+
+            # Skip cards fully outside clip
+            if cy + CARD_H < SESSIONS_START_Y or cy > SESSIONS_START_Y + SESSIONS_VIEWPORT_H:
+                continue
 
             cx_centre = CARD_X + CARD_W / 2
-            cy_centre = cy + card_h / 2
+            cy_centre = cy + CARD_H / 2
             p.save()
             p.translate(cx_centre, cy_centre)
             p.scale(scale, scale)
             p.translate(-cx_centre, -cy_centre)
-
-            if is_new:
-                self._paint_new_session_card(p, CARD_X, cy, CARD_W, card_h, scale, i)
-            else:
-                self._paint_session_card(
-                    p, CARD_X, cy, CARD_W, CARD_H,
-                    sess, is_active, is_confirmed, scale, i,
-                )
+            self._paint_session_card(
+                p, CARD_X, cy, CARD_W, CARD_H,
+                sess, is_active, is_confirmed, scale, card_i,
+            )
             p.restore()
+
+        p.restore()  # remove clip
+
+        # ── 3. Fade edges to hint scrollability ───────────────────────────────
+        if len(self._sessions) > VISIBLE_SESSIONS:
+            self._paint_scroll_fades(p)
+
+    def _paint_scroll_fades(self, p: QPainter):
+        """Subtle gradient fades at top/bottom of sessions viewport."""
+        fade_h = 24
+        bg = QColor(15, 14, 20)  # approximate widget bg
+
+        # Top fade (visible when scrolled down)
+        if self._scroll_offset > 2:
+            grad = QLinearGradient(0, SESSIONS_START_Y, 0, SESSIONS_START_Y + fade_h)
+            c = QColor(bg); c.setAlpha(200)
+            grad.setColorAt(0.0, c)
+            c2 = QColor(bg); c2.setAlpha(0)
+            grad.setColorAt(1.0, c2)
+            p.fillRect(QRectF(CARD_X, SESSIONS_START_Y, CARD_W, fade_h), grad)
+
+        # Bottom fade (visible when more cards below)
+        if self._scroll_offset < self._max_scroll() - 2:
+            bot_y = SESSIONS_START_Y + SESSIONS_VIEWPORT_H
+            grad = QLinearGradient(0, bot_y - fade_h, 0, bot_y)
+            c2 = QColor(bg); c2.setAlpha(0)
+            grad.setColorAt(0.0, c2)
+            c = QColor(bg); c.setAlpha(220)
+            grad.setColorAt(1.0, c)
+            p.fillRect(QRectF(CARD_X, bot_y - fade_h, CARD_W, fade_h), grad)
 
     def _paint_glow_border(
         self,
@@ -1014,11 +1157,11 @@ class DropZoneOverlay(QWidget):
 
         tx = cx + 70
         tw = cw - 80
-        
-        name = sess.get("name", "Session") if sess else "Session"
-        items = db.get_items(sess["id"]) if sess else []
+
+        name    = sess.get("name", "Session") if sess else "Session"
+        items   = db.get_items(sess["id"]) if sess else []
         n_items = len(items)
-        
+
         p.setPen(TEXT_WHITE)
         p.setFont(QFont("Inter", 11, QFont.Weight.Bold))
         fm = QFontMetrics(p.font())
@@ -1031,7 +1174,7 @@ class DropZoneOverlay(QWidget):
             slide_offset = int((1.0 - self._confirm_alpha) * 20)
             badge_x = cx + cw - 60 - slide_offset
             badge_rect = QRect(badge_x, cy + 10, 50, 20)
-            
+
             p.setOpacity(self._confirm_alpha)
             p.setPen(CONFIRM_GREEN)
             p.setFont(QFont("Inter", 10, QFont.Weight.Bold))
@@ -1039,7 +1182,7 @@ class DropZoneOverlay(QWidget):
                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
                        "Saved!")
             p.setOpacity(1.0)
-            
+
             if self._confirm_alpha > 0.1:
                 glow_rect = QRectF(badge_x - 5, cy + 8, 60, 24)
                 glow_color = QColor(66, 215, 120, int(40 * self._confirm_alpha))
@@ -1055,14 +1198,14 @@ class DropZoneOverlay(QWidget):
         p.setPen(TEXT_DIM)
         p.setFont(QFont("Inter", 9))
         if is_confirmed and self._confirm_alpha > 0.01 and self._confirmed_label:
-            subtitle_text = f"{n_items} item{'s' if n_items != 1 else ''} saved"
-            confirmed_text = self._confirmed_label
-            
+            subtitle_text   = f"{n_items} item{'s' if n_items != 1 else ''} saved"
+            confirmed_text  = self._confirmed_label
+
             p.setOpacity(1.0 - self._confirm_alpha * 0.8)
             p.drawText(QRect(tx, cy + 36, tw, 20),
                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                        subtitle_text)
-            
+
             p.setOpacity(self._confirm_alpha)
             p.setPen(QColor(100, 200, 140))
             elided = QFontMetrics(p.font()).elidedText(

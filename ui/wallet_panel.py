@@ -417,6 +417,83 @@ class SessionCard(QWidget):
         p.end()
 
 
+# ── New Session Button ────────────────────────────────────────────────────────
+class _NewSessionButton(QWidget):
+    """Fixed 'New Session' button that appears at the top of the list"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(CARD_H_COLL)
+        self.setStyleSheet("background: transparent;")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMouseTracking(True)
+        self._hovered = False
+
+    def enterEvent(self, e):
+        self._hovered = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hovered = False
+        self.update()
+
+    def mousePressEvent(self, e):
+        # Trigger the new session creation in drop_zone
+        # This would need to be connected from WalletPanel
+        pass
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        w = self.width()
+        h = self.height()
+        r = 18.0
+
+        # Background - hover effect
+        bg_color = GRAY_HOVER if self._hovered else GRAY_BASE
+        card_path = QPainterPath()
+        card_path.addRoundedRect(QRectF(0, 0, w, h), r, r)
+        p.fillPath(card_path, bg_color)
+
+        # Border
+        p.setPen(QPen(BORDER_CARD, 1.0))
+        p.drawPath(card_path)
+
+        # Icon (plus symbol) on the left
+        icon_x, icon_y, icon_w, icon_h = 10, (h - 40) // 2, 40, 40
+        icon_path = QPainterPath()
+        icon_path.addRoundedRect(icon_x, icon_y, icon_w, icon_h, 9, 9)
+        
+        icon_bg = QLinearGradient(icon_x, icon_y, icon_x, icon_y + icon_h)
+        icon_bg.setColorAt(0.0, QColor("#5c4ba8"))
+        icon_bg.setColorAt(1.0, QColor("#3d2d6b"))
+        p.fillPath(icon_path, icon_bg)
+        
+        p.setPen(TEXT_PRIMARY)
+        p.setFont(_font(18, bold=True))
+        p.drawText(QRect(icon_x, icon_y, icon_w, icon_h),
+                   Qt.AlignmentFlag.AlignCenter, "+")
+
+        # Text on the right
+        tx = icon_x + icon_w + 14
+        tw = w - tx - 10
+
+        p.setPen(TEXT_PRIMARY)
+        p.setFont(_font(11, bold=True))
+        p.drawText(QRect(tx, 8, tw, 20),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   "New Session")
+        
+        p.setPen(TEXT_DIM)
+        p.setFont(_font(9))
+        p.drawText(QRect(tx, 30, tw, 18),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   "Create a new workspace")
+        
+        p.end()
+
+
 # ── Main Panel ────────────────────────────────────────────────────────────────
 class WalletPanel(QWidget):
     def __init__(self, parent=None):
@@ -471,6 +548,7 @@ class WalletPanel(QWidget):
         self._header = _PanelHeader(self)
         outer.addWidget(self._header)
 
+        # Scrollable area containing both new session button and existing sessions
         self._scroll_area = QScrollArea(self)
         self._scroll_area.setWidgetResizable(True)
         self._scroll_area.setFrameShape(QFrame.Shape.NoFrame)
@@ -495,7 +573,10 @@ class WalletPanel(QWidget):
         self._list_layout = QVBoxLayout(self._list_widget)
         self._list_layout.setContentsMargins(10, 10, 10, 20)
         self._list_layout.setSpacing(8)
-        self._list_layout.addStretch()
+
+        # Add "New Session" button at the very top
+        self._new_session_btn = _NewSessionButton(self)
+        self._list_layout.addWidget(self._new_session_btn)
 
         self._scroll_area.setWidget(self._list_widget)
         outer.addWidget(self._scroll_area, 1)
@@ -543,6 +624,7 @@ class WalletPanel(QWidget):
             self._list_layout.addStretch()
             return
 
+        # Add all sessions - scrollbar will appear if needed
         for i, sess in enumerate(self._sessions):
             card = SessionCard(sess, i, self._list_widget)
             card.restore_requested.connect(self._on_restore)
@@ -551,6 +633,7 @@ class WalletPanel(QWidget):
             self._session_cards.append(card)
             self._list_layout.addWidget(card)
 
+        # Add stretch at end to push cards to top
         self._list_layout.addStretch()
 
     def _on_delete(self, sid: int):
