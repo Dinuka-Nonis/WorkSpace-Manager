@@ -16,7 +16,24 @@ import threading
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# ── Frozen-safe project root resolution ───────────────────────────────────────
+# When frozen as workspace_host.exe by PyInstaller, __file__ is inside the
+# temporary extraction directory and the relative-path trick breaks.
+# When frozen, db.py is already bundled and importable — nothing to add.
+# When running from source, we walk up from native_host/ to the project root.
+
+def _setup_path():
+    if getattr(sys, "frozen", False):
+        # Frozen EXE: all modules are bundled, sys.path is already correct.
+        return
+    # Source mode: add the project root (parent of native_host/) to sys.path.
+    root = Path(__file__).parent.parent
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+
+_setup_path()
+
 
 try:
     import db
@@ -24,9 +41,11 @@ try:
 except ImportError:
     DB_AVAILABLE = False
 
-APPDATA = Path(os.getenv("APPDATA", ".")) / "WorkSpaceManager"
+_appdata     = os.getenv("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+APPDATA      = Path(_appdata) / "WorkSpaceManager"
 TAB_REQUEST_FILE  = APPDATA / "tab_request.json"
 TAB_RESPONSE_FILE = APPDATA / "tab_response.json"
+
 
 # ── Message I/O ───────────────────────────────────────────────────────────────
 
@@ -51,7 +70,7 @@ _stdout_lock = threading.Lock()
 
 
 def send_message(stream, data: dict):
-    """Thread-safe message send — overrides the earlier definition."""
+    """Thread-safe message send."""
     try:
         encoded = json.dumps(data).encode("utf-8")
         with _stdout_lock:
@@ -69,7 +88,8 @@ def log(msg: str):
 def _load_local_state_names() -> dict[str, str]:
     """Return profile_dir → display_name from Chrome Local State."""
     local_appdata = os.getenv("LOCALAPPDATA", "")
-    local_state   = os.path.join(local_appdata, "Google", "Chrome", "User Data", "Local State")
+    local_state   = os.path.join(local_appdata, "Google", "Chrome",
+                                 "User Data", "Local State")
     if not os.path.exists(local_state):
         return {}
     try:
@@ -91,10 +111,7 @@ def _resolve_profile_for_extension(extension_id: str) -> tuple[str, str]:
     whether <user_data_dir>/<profile_dir>/Extensions/<extension_id> exists
     on disk. The first match is the correct profile.
 
-    This is the ONLY reliable method when multiple profiles are open or
-    when profiles have no Google account (so identity email is empty).
-
-    Returns (profile_dir, profile_name) e.g. ("Profile 2", "Work").
+    Returns (profile_dir, profile_name) or ("", "").
     """
     try:
         import psutil
@@ -159,7 +176,8 @@ def _detect_chrome_profile(profile_email_hint: str = "") -> tuple[str, str]:
         return "", ""
 
     local_appdata = os.getenv("LOCALAPPDATA", "")
-    local_state   = os.path.join(local_appdata, "Google", "Chrome", "User Data", "Local State")
+    local_state   = os.path.join(local_appdata, "Google", "Chrome",
+                                 "User Data", "Local State")
 
     profile_names:  dict[str, str] = {}
     profile_emails: dict[str, str] = {}
@@ -192,7 +210,6 @@ def _detect_chrome_profile(profile_email_hint: str = "") -> tuple[str, str]:
                 if "chrome.exe" not in (proc.info.get("exe") or "").lower():
                     continue
                 chrome_running = True
-                # Only count browser processes (no --type=)
                 cmdline = proc.info.get("cmdline") or []
                 if any(a.startswith("--type=") for a in cmdline):
                     continue
@@ -210,7 +227,6 @@ def _detect_chrome_profile(profile_email_hint: str = "") -> tuple[str, str]:
     if len(profile_counts) == 1:
         best = next(iter(profile_counts))
         return best, profile_names.get(best, best)
-    # Multiple profiles running and no email hint — cannot guess safely
     log("Multiple Chrome profiles running and no email hint — cannot determine profile")
     return "", ""
 
@@ -231,18 +247,14 @@ def _poll_side_channel():
     while True:
         try:
             if TAB_REQUEST_FILE.exists():
-                payload = json.loads(TAB_REQUEST_FILE.read_text(encoding="utf-8"))
-                sid = payload.get("session_id")
+                payload    = json.loads(TAB_REQUEST_FILE.read_text(encoding="utf-8"))
+                sid        = payload.get("session_id")
                 is_prewarm = payload.get("prewarm", False)
                 TAB_REQUEST_FILE.unlink(missing_ok=True)
 
                 if is_prewarm:
-                    # Explicit pre-warm ping — stay alive, nothing to do
                     log("Pre-warm ping received — host is ready")
                 elif sid == 0:
-                    # session_id=0 from picker scan — preview request.
-                    # We still ask the extension for tabs, but handle_tabs_snapshot
-                    # will skip the DB write (preview_only=True path).
                     log("Preview tab request received — will respond without saving to DB")
                     with _snapshot_lock:
                         _pending_snapshot_session = 0
@@ -308,8 +320,6 @@ def handle_tabs_snapshot(session_id: int, tabs: list[dict],
     if not DB_AVAILABLE:
         return
     try:
-        # Determine profile from the first tab's fields.
-        # The extension sets profile_dir after the resolve_profile handshake.
         ext_profile_dir  = ""
         ext_profile_name = ""
         email_hint       = ""
@@ -320,12 +330,11 @@ def handle_tabs_snapshot(session_id: int, tabs: list[dict],
                                 tabs[0].get("profile_hint")  or "").strip()
 
         if ext_profile_dir:
-            # Best case: extension confirmed the profile via resolve_profile.
             profile_dir  = ext_profile_dir
-            profile_name = ext_profile_name or _load_local_state_names().get(ext_profile_dir, ext_profile_dir)
+            profile_name = (ext_profile_name or
+                            _load_local_state_names().get(ext_profile_dir, ext_profile_dir))
             log(f"Using extension-confirmed profile: {profile_dir!r} ({profile_name})")
         else:
-            # Fallback: try email hint then process scan.
             profile_dir, profile_name = _detect_chrome_profile(email_hint)
             if profile_dir:
                 log(f"Profile via fallback detection: {profile_dir!r} ({profile_name})")
@@ -394,7 +403,7 @@ def main():
                     "type":       "request_tabs",
                     "session_id": snap_sid,
                     "all_tabs":   False,
-                    "authorized": "drop_zone",   # extension ignores request_tabs without this
+                    "authorized": "drop_zone",
                 })
                 _awaiting_side_channel_tabs = True
 
@@ -429,13 +438,11 @@ def main():
             elif msg_type == "tabs_snapshot":
                 session_id = msg.get("session_id")
                 tabs       = msg.get("tabs", [])
-                all_tabs   = msg.get("all_tabs", True)   # extension sets False for drag-drop
-                # IMPORTANT: use `is not None` checks — session_id=0 is valid
-                # (preview request) and `if session_id` would skip it silently.
+                all_tabs   = msg.get("all_tabs", True)
+                # IMPORTANT: use `is not None` — session_id=0 is valid
                 if tabs is not None and session_id is not None:
-                    is_sc      = _awaiting_side_channel_tabs
-                    # preview_only when side-channel request had session_id=0
-                    preview    = is_sc and (session_id == 0)
+                    is_sc   = _awaiting_side_channel_tabs
+                    preview = is_sc and (session_id == 0)
                     handle_tabs_snapshot(
                         session_id, tabs,
                         is_side_channel=is_sc,
