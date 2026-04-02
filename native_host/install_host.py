@@ -2,11 +2,19 @@
 native_host/install_host.py — Registers the WorkSpace Native Messaging Host
 with Chrome on Windows by writing the manifest to the registry.
 
-Run once after installation:
+When running as a bundled EXE:
+    Called automatically by first_run_setup() in main.py on every launch.
+    Points Chrome directly at the extracted workspace_host.exe — no .bat needed.
+
+When running from source (development):
     python native_host/install_host.py
 
 To uninstall:
     python native_host/install_host.py --uninstall
+
+After publishing to the Chrome Web Store, hardcode your permanent extension ID
+into EXTENSION_ID below and rebuild the EXE. Users will never need to run
+--update-id manually.
 """
 
 import sys
@@ -15,76 +23,124 @@ import json
 import shutil
 from pathlib import Path
 
-HOST_NAME = "com.workspace.manager"
+HOST_NAME        = "com.workspace.manager"
 HOST_DESCRIPTION = "WorkSpace Manager Native Host"
 
+# ── Set this to your permanent Chrome Web Store extension ID once published. ──
+# Leave as empty string while still in developer mode — the app will work
+# without it for local testing (you set the ID via --update-id instead).
+EXTENSION_ID = ""
 
-def get_host_py_path() -> Path:
-    return Path(__file__).parent / "host.py"
+
+# ── Path helpers ──────────────────────────────────────────────────────────────
+
+def _is_frozen() -> bool:
+    """True when running as a PyInstaller-built EXE."""
+    return getattr(sys, "frozen", False)
+
+
+def _get_appdata_dir() -> Path:
+    appdata = os.getenv("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    return Path(appdata) / "WorkSpaceManager"
+
+
+def _get_host_exe_path() -> Path:
+    """
+    Return the path Chrome should call for native messaging.
+
+    Frozen EXE:   workspace_host.exe was extracted to %APPDATA%\\WorkSpaceManager\\
+                  by first_run_setup() in main.py before this function is called.
+
+    Source mode:  Fall back to looking next to this file (for dev use only).
+    """
+    extracted = _get_appdata_dir() / "workspace_host.exe"
+    if extracted.exists():
+        return extracted
+    # Source-mode fallback — only reached during development
+    return Path(__file__).parent / "workspace_host.exe"
 
 
 def get_manifest_dir() -> Path:
-    """Where to store the native host manifest JSON."""
-    appdata = Path(os.getenv("APPDATA", "."))
-    return appdata / "WorkSpaceManager" / "native_host"
+    return _get_appdata_dir() / "native_host"
 
 
 def get_manifest_path() -> Path:
     return get_manifest_dir() / f"{HOST_NAME}.json"
 
 
-def find_python() -> str:
-    """Find the path to the current Python interpreter."""
-    return sys.executable
+# ── Manifest writing ──────────────────────────────────────────────────────────
 
+def write_manifest() -> Path:
+    """
+    Write the native host manifest JSON.
 
-def write_manifest():
-    """Write the native host manifest JSON file."""
-    host_path = get_host_py_path().resolve()
-    python_path = find_python()
-    print(f"  host.py path : {host_path}")
-    print(f"  python path  : {python_path}")
+    In EXE mode:    points directly at workspace_host.exe — no .bat wrapper.
+    In source mode: writes a .bat wrapper that calls python host.py
+                    (same as the original behaviour for development).
 
-    # Create a wrapper .bat file that Chrome can call
-    bat_path = get_manifest_dir() / "workspace_host.bat"
-
-    manifest = {
-        "name": HOST_NAME,
-        "description": HOST_DESCRIPTION,
-        "path": str(bat_path),
-        "type": "stdio",
-        "allowed_origins": [
-            # Replace with your extension ID after loading unpacked
-            "chrome-extension://REPLACE_WITH_EXTENSION_ID/"
-        ]
-    }
-
+    Returns the path to the written manifest file.
+    """
     manifest_dir = get_manifest_dir()
     manifest_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write .bat wrapper
-    bat_content = f'@echo off\n"{python_path}" "{host_path}" %*\n'
-    bat_path.write_text(bat_content)
+    if _is_frozen():
+        # ── EXE mode: Chrome calls workspace_host.exe directly ────────────────
+        host_exe = _get_host_exe_path()
+        print(f"  [install_host] host exe : {host_exe}")
 
-    # Write manifest JSON
+        allowed = ([f"chrome-extension://{EXTENSION_ID}/"]
+                   if EXTENSION_ID else [])
+
+        manifest = {
+            "name":            HOST_NAME,
+            "description":     HOST_DESCRIPTION,
+            "path":            str(host_exe),
+            "type":            "stdio",
+            "allowed_origins": allowed,
+        }
+
+    else:
+        # ── Source mode: Chrome calls a .bat which calls python host.py ───────
+        host_py     = (Path(__file__).parent / "host.py").resolve()
+        python_path = sys.executable
+        bat_path    = manifest_dir / "workspace_host.bat"
+
+        print(f"  [install_host] host.py     : {host_py}")
+        print(f"  [install_host] python path : {python_path}")
+
+        bat_content = f'@echo off\n"{python_path}" "{host_py}" %*\n'
+        bat_path.write_text(bat_content, encoding="utf-8")
+
+        allowed = ([f"chrome-extension://{EXTENSION_ID}/"]
+                   if EXTENSION_ID else ["chrome-extension://REPLACE_WITH_EXTENSION_ID/"])
+
+        manifest = {
+            "name":            HOST_NAME,
+            "description":     HOST_DESCRIPTION,
+            "path":            str(bat_path),
+            "type":            "stdio",
+            "allowed_origins": allowed,
+        }
+
     manifest_path = get_manifest_path()
-    manifest_path.write_text(json.dumps(manifest, indent=2))
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return manifest_path
 
-    return manifest_path, bat_path
 
+# ── Registry helpers ──────────────────────────────────────────────────────────
 
 def register_in_registry(manifest_path: Path):
-    """Write the registry key pointing Chrome to our manifest."""
+    """Write the HKCU registry key pointing Chrome to our manifest."""
     try:
         import winreg
         reg_path = r"Software\Google\Chrome\NativeMessagingHosts" + "\\" + HOST_NAME
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, reg_path) as key:
             winreg.SetValueEx(key, "", 0, winreg.REG_SZ, str(manifest_path))
-        print(f"✓ Registry key written: HKCU\\{reg_path}")
+        print(f"[install_host] ✓ Registry key written: HKCU\\{reg_path}")
     except ImportError:
-        print("✗ winreg not available (not on Windows)")
+        print("[install_host] ✗ winreg not available (not on Windows)")
     except Exception as e:
-        print(f"✗ Registry error: {e}")
+        print(f"[install_host] ✗ Registry error: {e}")
 
 
 def unregister_from_registry():
@@ -92,19 +148,25 @@ def unregister_from_registry():
         import winreg
         reg_path = r"Software\Google\Chrome\NativeMessagingHosts" + "\\" + HOST_NAME
         winreg.DeleteKey(winreg.HKEY_CURRENT_USER, reg_path)
-        print(f"✓ Registry key removed: HKCU\\{reg_path}")
+        print(f"[install_host] ✓ Registry key removed: HKCU\\{reg_path}")
     except Exception as e:
-        print(f"✗ {e}")
+        print(f"[install_host] ✗ {e}")
 
+
+# ── Extension ID update (developer mode helper) ───────────────────────────────
 
 def update_extension_id(extension_id: str):
     """
-    Update the allowed_origins in the native host manifest with the real
-    extension ID, then re-register in the registry.
+    Patch the allowed_origins in the manifest on disk with a new extension ID,
+    then re-register. Used during developer-mode testing when the extension ID
+    changes each time you load the unpacked extension on a new machine.
+
+    Once you publish to the Web Store you get a permanent ID — hardcode it into
+    EXTENSION_ID at the top of this file and rebuild instead of using this.
     """
     manifest_path = get_manifest_path()
     if not manifest_path.exists():
-        print("✗ Manifest not found — run install first (without --update-id)")
+        print("✗ Manifest not found — make sure the app has been run at least once first.")
         return
 
     try:
@@ -118,31 +180,7 @@ def update_extension_id(extension_id: str):
         print(f"✗ Failed to update extension ID: {e}")
 
 
-def install():
-    print("\n=== WorkSpace Native Host Installer ===\n")
-
-    manifest_path, bat_path = write_manifest()
-    print(f"✓ Manifest written:  {manifest_path}")
-    print(f"✓ .bat wrapper:      {bat_path}")
-
-    register_in_registry(manifest_path)
-
-    print(f"""
-─────────────────────────────────────────────────────────
-  NEXT STEP — Load Chrome Extension & Set Extension ID
-─────────────────────────────────────────────────────────
-  1. In Chrome, go to:  chrome://extensions/
-  2. Enable "Developer mode" (toggle, top-right corner)
-  3. Click "Load unpacked" → select the  chrome_extension/  folder
-  4. Copy the Extension ID shown (32-character string, e.g. abcdefgh...)
-  5. Run this command with your extension ID:
-
-       python native_host/install_host.py --update-id YOUR_EXTENSION_ID
-
-  That's it — Chrome will pick up the change automatically.
-─────────────────────────────────────────────────────────
-""")
-
+# ── Uninstall ─────────────────────────────────────────────────────────────────
 
 def uninstall():
     print("\n=== WorkSpace Native Host Uninstaller ===\n")
@@ -153,6 +191,36 @@ def uninstall():
         print(f"✓ Removed: {manifest_dir}")
     print("✓ Uninstall complete.")
 
+
+# ── Source-mode installer (dev only) ─────────────────────────────────────────
+
+def install():
+    print("\n=== WorkSpace Native Host Installer (source mode) ===\n")
+    manifest_path = write_manifest()
+    print(f"✓ Manifest written: {manifest_path}")
+    register_in_registry(manifest_path)
+
+    if not EXTENSION_ID:
+        print("""
+─────────────────────────────────────────────────────────
+  NEXT STEP — set your Chrome extension ID
+─────────────────────────────────────────────────────────
+  1. Open Chrome → chrome://extensions/
+  2. Enable Developer mode (top-right toggle)
+  3. Click Load unpacked → select the chrome_extension/ folder
+  4. Copy the Extension ID (32-character string)
+  5. Run:
+       python native_host/install_host.py --update-id YOUR_EXTENSION_ID
+
+  Or hardcode it permanently in EXTENSION_ID at the top of this file.
+─────────────────────────────────────────────────────────
+""")
+    else:
+        print(f"\n✓ Extension ID already set: {EXTENSION_ID}")
+        print("✓ Ready — restart Chrome if it was already running.")
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     if "--uninstall" in sys.argv:
