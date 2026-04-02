@@ -59,11 +59,11 @@ DEL_W, DEL_H   = 26, 18
 DEL_MARGIN_R   = 10
 DEL_MARGIN_T   = 10
 
-_FONT_FAMILY = "'Helvetica Neue', Helvetica, Arial, sans-serif"
+_FONT_FAMILY = "'Inter', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', sans-serif"
 
 
 def _font(size: int, bold: bool = False) -> QFont:
-    f = QFont("Helvetica Neue", size)
+    f = QFont("Inter", size)
     if bold:
         f.setWeight(QFont.Weight.Bold)
     return f
